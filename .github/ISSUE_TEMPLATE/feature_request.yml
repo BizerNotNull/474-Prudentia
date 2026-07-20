@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose a capability or improvement for Prudentia
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What need does this address, and who benefits?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the desired behavior, API, or operator experience.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or other designs did you consider?
+  - type: textarea
+    id: impact
+    attributes:
+      label: Compatibility and operational impact
+      description: Note effects on clients, vLLM/SGLang backends, configuration, performance, or rollout.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I searched existing issues and discussions for similar requests.
+          required: true
+        - label: This request describes the problem separately from the proposed solution.
+          required: true
