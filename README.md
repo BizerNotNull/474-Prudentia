@@ -14,5 +14,7 @@ Pinned development and test versions live in `.github/versions.env`:
   register container cleanup with `testing.T`; Docker Compose is not part of
   the test path.
 
+CI rejects unformatted Go files, then runs `go test ./...` and `go vet ./...`.
+
 No protobuf generation command or integration-test dependency is added until
 the first protobuf or PostgreSQL-backed runnable slice needs it.
