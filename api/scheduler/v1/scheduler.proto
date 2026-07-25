@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package prudentia.scheduler.v1;
+
+option go_package = "github.com/BizerNotNull/474-Prudentia/api/scheduler/v1;schedulerv1";
+
+service SchedulerService {
+  rpc Schedule(ScheduleRequest) returns (ScheduleResponse);
+  rpc PrepareDispatch(PrepareDispatchRequest) returns (PrepareDispatchResponse);
+  rpc GiveUpBeforeDispatch(GiveUpBeforeDispatchRequest) returns (Empty);
+  rpc Finalize(FinalizeRequest) returns (Empty);
+  rpc MarkAmbiguous(MarkAmbiguousRequest) returns (Empty);
+}
+
+message ScheduleRequest {
+  string request_id = 1;
+  string attempt_id = 2;
+  bytes tenant_scope = 3;
+  string model = 4;
+  uint32 slot_cost = 5;
+  int64 execution_budget_ms = 6;
+}
+
+message ReservationRef {
+  string reservation_id = 1;
+  uint64 generation = 2;
+  bytes capability = 3;
+}
+
+message Reservation {
+  ReservationRef ref = 1;
+}
+
+message ScheduleResponse {
+  Reservation reservation = 1;
+}
+
+message PrepareDispatchRequest {
+  ReservationRef ref = 1;
+}
+
+message WorkloadIdentity {
+  string cluster = 1;
+  string namespace = 2;
+  string logical_engine = 3;
+  string pod_uid = 4;
+  uint64 endpoint_epoch = 5;
+  uint64 recovery_epoch = 6;
+}
+
+message DispatchTarget {
+  string endpoint = 1;
+  WorkloadIdentity identity = 2;
+}
+
+message PrepareDispatchResponse {
+  DispatchTarget target = 1;
+}
+
+enum GiveUpReason {
+  GIVE_UP_REASON_UNSPECIFIED = 0;
+  GIVE_UP_REASON_CANCELED = 1;
+  GIVE_UP_REASON_BUDGET_EXPIRED = 2;
+  GIVE_UP_REASON_RERANKS_EXHAUSTED = 3;
+}
+
+message GiveUpBeforeDispatchRequest {
+  ReservationRef ref = 1;
+  GiveUpReason reason = 2;
+}
+
+enum TerminalProof {
+  TERMINAL_PROOF_UNSPECIFIED = 0;
+  TERMINAL_PROOF_PROVIDER_FINISH = 1;
+  TERMINAL_PROOF_NOT_SENT = 2;
+}
+
+message FinalizeRequest {
+  ReservationRef ref = 1;
+  TerminalProof proof = 2;
+}
+
+enum AmbiguousCause {
+  AMBIGUOUS_CAUSE_UNSPECIFIED = 0;
+  AMBIGUOUS_CAUSE_TRANSPORT = 1;
+  AMBIGUOUS_CAUSE_CANCELED = 2;
+  AMBIGUOUS_CAUSE_PROTOCOL = 3;
+}
+
+message MarkAmbiguousRequest {
+  ReservationRef ref = 1;
+  AmbiguousCause cause = 2;
+}
+
+message Empty {}
