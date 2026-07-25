@@ -1,0 +1,110 @@
+package publichttp
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"net/http"
+
+	"github.com/BizerNotNull/474-Prudentia/internal/domain"
+)
+
+type Authenticator interface {
+	Authenticate(context.Context, *http.Request) (domain.Principal, error)
+}
+
+type Authorizer interface {
+	Authorize(context.Context, domain.Principal, domain.InferenceRequest) (domain.AuthorizedRequest, error)
+}
+
+type Inferer interface {
+	Infer(context.Context, domain.AuthorizedRequest, domain.ResponseMode, StreamSink) error
+}
+
+type Handler struct {
+	authenticator Authenticator
+	authorizer    Authorizer
+	inferer       Inferer
+	limits        Limits
+}
+
+func NewHandler(authenticator Authenticator, authorizer Authorizer, inferer Inferer, limits Limits) *Handler {
+	return &Handler{authenticator: authenticator, authorizer: authorizer, inferer: inferer, limits: limits}
+}
+
+func (h *Handler) Routes(health http.Handler) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/chat/completions", h.ChatCompletions)
+	mux.Handle("/livez", health)
+	mux.Handle("/readyz", health)
+	mux.Handle("/startupz", health)
+	return mux
+}
+
+func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
+	id, err := newRequestID()
+	if err != nil {
+		WritePublicError(w, "", domain.NewPublicError(domain.ErrorInternal))
+		return
+	}
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, h.limits.MaxBodyBytes)
+
+	principal, err := h.authenticator.Authenticate(r.Context(), r)
+	if err != nil {
+		WritePublicError(w, id, err)
+		return
+	}
+	request, mode, err := DecodeChat(r, h.limits)
+	if err != nil {
+		WritePublicError(w, id, err)
+		return
+	}
+	authorized, err := h.authorizer.Authorize(r.Context(), principal, request)
+	if err != nil {
+		WritePublicError(w, id, err)
+		return
+	}
+
+	if mode == domain.ResponseModeStreaming {
+		h.serveStreaming(w, r, id, authorized)
+		return
+	}
+	h.serveNonStreaming(w, r, id, authorized)
+}
+
+func (h *Handler) serveStreaming(w http.ResponseWriter, r *http.Request, id string, request domain.AuthorizedRequest) {
+	sink, err := NewSSESink(w, id)
+	if err != nil {
+		WritePublicError(w, id, err)
+		return
+	}
+	err = h.inferer.Infer(r.Context(), request, domain.ResponseModeStreaming, sink)
+	if err != nil && !sink.Started() {
+		WritePublicError(w, id, err)
+	}
+}
+
+func (h *Handler) serveNonStreaming(w http.ResponseWriter, r *http.Request, id string, request domain.AuthorizedRequest) {
+	collector := NewNonStreamingCollector(h.limits.MaxOutputBytes, h.limits.MaxStreamEvents)
+	if err := h.inferer.Infer(r.Context(), request, domain.ResponseModeNonStreaming, collector); err != nil {
+		WritePublicError(w, id, err)
+		return
+	}
+	result, err := collector.Result()
+	if err != nil {
+		WritePublicError(w, id, err)
+		return
+	}
+	if err := EncodeNonStreaming(w, id, request.Request().Model(), result); err != nil {
+		return
+	}
+}
+
+func newRequestID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return "req_" + hex.EncodeToString(raw[:]), nil
+}
