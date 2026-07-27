@@ -4,7 +4,7 @@
 
 Pinned development and test versions live in `.github/versions.env`:
 
-- PostgreSQL tests use the official `postgres:17.10-bookworm` image.
+- PostgreSQL tests use the official `postgres:18.4-trixie` image.
 - Protobuf generation uses `protoc` 35.1, `protoc-gen-go` v1.36.11, and
   `protoc-gen-go-grpc` v1.6.2.
 - Database migrations use `golang-migrate` v4.19.1 and ordered SQL files in
@@ -34,15 +34,17 @@ The runnable request path now includes:
   dispatch debt, and database-time expiry classification;
 - an exact-workload-identity HTTPS adapter for vLLM streaming responses.
 
-Apply the ledger schema before starting the scheduler:
+Apply the ordered ledger and controller schemas before starting the processes:
 
 ```text
 psql "$PRUDENTIA_DATABASE_URL" -f migrations/000001_scheduler_mvp.up.sql
+psql "$PRUDENTIA_DATABASE_URL" -f migrations/000002_controller_mvp.up.sql
 ```
 
-The scheduler intentionally does not invent capacity. A healthy, unexpired
-`scheduler_backends` row must be written by the controller/catalog path before
-it can reserve work. There is no static direct-to-vLLM fallback.
+The scheduler intentionally does not invent capacity. The controller is the
+only normal writer of healthy `scheduler_backends` projections; scheduler and
+gateway consume them through their existing application interfaces. There is
+no static direct-to-vLLM fallback.
 
 Scheduler configuration:
 
@@ -73,6 +75,41 @@ PRUDENTIA_PROVIDER_CA=<provider-proxy-ca.pem>
 PRUDENTIA_PROVIDER_TRUST_DOMAIN=<provider-spiffe-trust-domain>
 go run ./cmd/gateway
 ```
+
+Controller configuration:
+
+```text
+PRUDENTIA_DATABASE_URL=<postgres-connection-url>
+PRUDENTIA_CLUSTER=<stable-cluster-id>
+PRUDENTIA_CONTROLLER_NAMESPACE=<managed-pod-namespace>
+PRUDENTIA_CONTROLLER_LEASE_NAMESPACE=<lease-namespace>
+PRUDENTIA_CONTROLLER_LEASE_NAME=prudentia-controller
+PRUDENTIA_CONTROLLER_LABEL_SELECTOR=prudentia.io/managed=true
+PRUDENTIA_CONTROLLER_PROXY_PORT=8443
+PRUDENTIA_CONTROLLER_HEALTH_LISTEN=:8081
+HOSTNAME=<unique-controller-holder-id>
+go run ./cmd/controller
+```
+
+The controller runs in-cluster. Its ServiceAccount needs `get/list/watch` for
+Pods in the managed namespace and `get/create/update/patch` for the configured
+Lease. A schedulable Pod must be Ready, have a Pod IP, and carry:
+
+```text
+prudentia.io/managed=true
+prudentia.io/model=<model>
+prudentia.io/logical-engine=<stable-engine-id>
+prudentia.io/endpoint-epoch=<positive-integer>
+prudentia.io/recovery-epoch=<positive-integer>
+prudentia.io/configured-slots=<1..1024>
+prudentia.io/proxy-ready=true
+```
+
+Informer events only enqueue Pod keys. Each reconciliation reads current Pod
+level state, acquires or checks the PostgreSQL controller writer generation,
+and refreshes eligibility using database time. Missing, replaced, unready, or
+identity-incomplete Pods retire the old exact projection without releasing
+reserved or orphaned capacity.
 
 The gateway fails startup unless the scheduler health service is reachable over
 mTLS. `/readyz` reports ready only after that startup check. Before sending any
