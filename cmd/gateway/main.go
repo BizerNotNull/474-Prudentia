@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -11,17 +14,33 @@ import (
 	"syscall"
 	"time"
 
+	schedulerv1 "github.com/BizerNotNull/474-Prudentia/api/scheduler/v1"
+	"github.com/BizerNotNull/474-Prudentia/internal/adapter/schedulerclient"
+	"github.com/BizerNotNull/474-Prudentia/internal/adapter/vllm"
 	"github.com/BizerNotNull/474-Prudentia/internal/auth"
 	"github.com/BizerNotNull/474-Prudentia/internal/config"
-	"github.com/BizerNotNull/474-Prudentia/internal/domain"
 	"github.com/BizerNotNull/474-Prudentia/internal/health"
+	requestapp "github.com/BizerNotNull/474-Prudentia/internal/request"
 	"github.com/BizerNotNull/474-Prudentia/internal/transport/publichttp"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
-type closedInferenceService struct{}
-
-func (closedInferenceService) Infer(context.Context, domain.AuthorizedRequest, domain.ResponseMode, publichttp.StreamSink) error {
-	return domain.NewPublicError(domain.ErrorUnavailable)
+func clientTLSConfig(certFile, keyFile, caFile, serverName string) (*tls.Config, error) {
+	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load gateway TLS identity: %w", err)
+	}
+	data, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("load CA file: %w", err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(data) {
+		return nil, errors.New("CA file contains no certificate")
+	}
+	return &tls.Config{Certificates: []tls.Certificate{certificate}, RootCAs: roots, ServerName: serverName, MinVersion: tls.VersionTLS13}, nil
 }
 
 func main() {
@@ -40,9 +59,45 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	schedulerTLS, err := clientTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.SchedulerCAFile, cfg.SchedulerServerName)
+	if err != nil {
+		return err
+	}
+	connection, err := grpc.NewClient(
+		"dns:///"+cfg.SchedulerAddress,
+		grpc.WithTransportCredentials(credentials.NewTLS(schedulerTLS)),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64<<10), grpc.MaxCallSendMsgSize(64<<10)),
+	)
+	if err != nil {
+		return fmt.Errorf("create scheduler client: %w", err)
+	}
+	defer connection.Close()
+	scheduler, err := schedulerclient.New(schedulerv1.NewSchedulerServiceClient(connection))
+	if err != nil {
+		return err
+	}
+	providerTLS, err := clientTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ProviderCAFile, "provider.invalid")
+	if err != nil {
+		return err
+	}
+	provider, err := vllm.NewClient(providerTLS, cfg.ProviderTrustDomain, 15*time.Second, 1<<20, 65536)
+	if err != nil {
+		return err
+	}
+	inference, err := requestapp.NewService(scheduler, provider, 2*time.Minute, 5*time.Second)
+	if err != nil {
+		return err
+	}
 
 	state := &health.State{}
-	handler := publichttp.NewHandler(authenticator, auth.Authorizer{}, closedInferenceService{}, publichttp.DefaultLimits())
+	healthClient := healthpb.NewHealthClient(connection)
+	healthCtx, cancelHealth := context.WithTimeout(context.Background(), 5*time.Second)
+	healthResponse, err := healthClient.Check(healthCtx, &healthpb.HealthCheckRequest{})
+	cancelHealth()
+	if err != nil || healthResponse.Status != healthpb.HealthCheckResponse_SERVING {
+		return errors.New("scheduler is not ready")
+	}
+	handler := publichttp.NewHandler(authenticator, auth.Authorizer{}, inference, publichttp.DefaultLimits())
 	server := &http.Server{
 		Addr:              cfg.ListenAddress,
 		Handler:           handler.Routes(health.NewHandler(state)),
@@ -56,8 +111,7 @@ func run() error {
 		return err
 	}
 	state.SetStarted(true)
-	// Readiness remains closed until the scheduler and exact-identity provider path are composed.
-	state.SetReady(false)
+	state.SetReady(true)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
