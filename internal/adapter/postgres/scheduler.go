@@ -141,8 +141,9 @@ func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleComm
 	var generation uint64
 	err = tx.QueryRow(ctx, `SELECT reservation_id, request_generation
 		FROM scheduler_reservations
-		WHERE request_id=$1 AND state='abandoned_rerank'
-		FOR UPDATE`, cmd.RequestID()).Scan(&reservationID, &generation)
+		WHERE request_id=$1 AND tenant_hash=$2 AND command_hash=$3 AND attempt_id=$4
+		  AND state='abandoned_rerank'
+		FOR UPDATE`, cmd.RequestID(), tenantHash[:], commandHash[:], cmd.AttemptID()).Scan(&reservationID, &generation)
 	rerank := err == nil
 	if errors.Is(err, pgx.ErrNoRows) {
 		reservationID, err = randomID("res_")
@@ -408,16 +409,8 @@ func (s *SchedulerStore) AbandonBeforeDispatch(ctx context.Context, ref domain.R
 	if row.state != "reserved" {
 		return domain.ErrInvalidState
 	}
-	tag, err := tx.Exec(ctx, `UPDATE scheduler_backends
-		SET reserved_slots=reserved_slots-$7
-		WHERE cluster=$1 AND namespace=$2 AND logical_engine=$3 AND pod_uid=$4
-		  AND endpoint_epoch=$5 AND recovery_epoch=$6 AND reserved_slots >= $7`,
-		row.cluster, row.namespace, row.engine, row.podUID, row.endpointEpoch, row.recoveryEpoch, row.slotCost)
-	if err != nil {
-		return fmt.Errorf("release abandoned capacity: %w", err)
-	}
-	if tag.RowsAffected() != 1 {
-		return domain.ErrInvalidState
+	if err := updateBackendCapacity(ctx, tx, row, 0); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE scheduler_reservations
 		SET state='abandoned_rerank', updated_at=clock_timestamp()
@@ -450,16 +443,8 @@ func (s *SchedulerStore) GiveUpBeforeDispatch(ctx context.Context, ref domain.Re
 		return domain.ErrInvalidState
 	}
 	if row.state == "reserved" {
-		tag, err := tx.Exec(ctx, `UPDATE scheduler_backends
-			SET reserved_slots=reserved_slots-$7
-			WHERE cluster=$1 AND namespace=$2 AND logical_engine=$3 AND pod_uid=$4
-			  AND endpoint_epoch=$5 AND recovery_epoch=$6 AND reserved_slots >= $7`,
-			row.cluster, row.namespace, row.engine, row.podUID, row.endpointEpoch, row.recoveryEpoch, row.slotCost)
-		if err != nil {
-			return fmt.Errorf("release given-up capacity: %w", err)
-		}
-		if tag.RowsAffected() != 1 {
-			return domain.ErrInvalidState
+		if err := updateBackendCapacity(ctx, tx, row, 0); err != nil {
+			return err
 		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE scheduler_reservations
@@ -531,16 +516,8 @@ func (s *SchedulerStore) ClassifyExpired(ctx context.Context, limit int) (int, e
 			orphanDelta = item.row.slotCost
 		}
 		if item.row.state != "abandoned_rerank" {
-			tag, err := tx.Exec(ctx, `UPDATE scheduler_backends
-				SET reserved_slots=reserved_slots-$7, orphaned_slots=orphaned_slots+$8
-				WHERE cluster=$1 AND namespace=$2 AND logical_engine=$3 AND pod_uid=$4
-				AND endpoint_epoch=$5 AND recovery_epoch=$6 AND reserved_slots >= $7`,
-				item.row.cluster, item.row.namespace, item.row.engine, item.row.podUID, item.row.endpointEpoch, item.row.recoveryEpoch, item.row.slotCost, orphanDelta)
-			if err != nil {
-				return 0, fmt.Errorf("classify expired capacity: %w", err)
-			}
-			if tag.RowsAffected() != 1 {
-				return 0, domain.ErrInvalidState
+			if err := updateBackendCapacity(ctx, tx, item.row, orphanDelta); err != nil {
+				return 0, err
 			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE scheduler_reservations SET state=$2, updated_at=clock_timestamp() WHERE reservation_id=$1`, item.id, terminal); err != nil {
@@ -573,21 +550,29 @@ func (s *SchedulerStore) release(ctx context.Context, ref domain.ReservationRef,
 	if debt {
 		orphanDelta = row.slotCost
 	}
-	tag, err := tx.Exec(ctx, `UPDATE scheduler_backends
-		SET reserved_slots=reserved_slots-$7, orphaned_slots=orphaned_slots+$8
-		WHERE cluster=$1 AND namespace=$2 AND logical_engine=$3 AND pod_uid=$4 AND endpoint_epoch=$5 AND recovery_epoch=$6 AND reserved_slots >= $7`,
-		row.cluster, row.namespace, row.engine, row.podUID, row.endpointEpoch, row.recoveryEpoch, row.slotCost, orphanDelta)
-	if err != nil {
-		return fmt.Errorf("update capacity accounting: %w", err)
-	}
-	if tag.RowsAffected() != 1 {
-		return domain.ErrInvalidState
+	if err := updateBackendCapacity(ctx, tx, row, orphanDelta); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE scheduler_reservations SET state=$2, updated_at=clock_timestamp() WHERE reservation_id=$1`, ref.ID(), terminal); err != nil {
 		return fmt.Errorf("complete reservation transition: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit reservation transition: %w", err)
+	}
+	return nil
+}
+
+func updateBackendCapacity(ctx context.Context, tx pgx.Tx, row reservationRow, orphanDelta int) error {
+	tag, err := tx.Exec(ctx, `UPDATE scheduler_backends
+		SET reserved_slots=reserved_slots-$7, orphaned_slots=orphaned_slots+$8
+		WHERE cluster=$1 AND namespace=$2 AND logical_engine=$3 AND pod_uid=$4
+		  AND endpoint_epoch=$5 AND recovery_epoch=$6 AND reserved_slots >= $7`,
+		row.cluster, row.namespace, row.engine, row.podUID, row.endpointEpoch, row.recoveryEpoch, row.slotCost, orphanDelta)
+	if err != nil {
+		return fmt.Errorf("update backend capacity accounting: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return domain.ErrInvalidState
 	}
 	return nil
 }
