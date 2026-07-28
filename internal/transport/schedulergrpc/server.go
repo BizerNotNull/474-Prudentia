@@ -14,6 +14,8 @@ import (
 type Scheduler interface {
 	Schedule(context.Context, domain.ScheduleCommand) (domain.Reservation, error)
 	PrepareDispatch(context.Context, domain.ReservationRef) (domain.DispatchTarget, error)
+	AbandonBeforeDispatch(context.Context, domain.ReservationRef, domain.RerankReason) error
+
 	GiveUpBeforeDispatch(context.Context, domain.ReservationRef, domain.GiveUpReason) error
 	Finalize(context.Context, domain.ReservationRef, domain.TerminalProof) error
 	MarkAmbiguous(context.Context, domain.ReservationRef, domain.AmbiguousCause) error
@@ -87,6 +89,20 @@ func (s *Server) PrepareDispatch(ctx context.Context, request *schedulerv1.Prepa
 		Endpoint: target.Endpoint(),
 		Identity: &schedulerv1.WorkloadIdentity{Cluster: identity.Cluster(), Namespace: identity.Namespace(), LogicalEngine: identity.LogicalEngine(), PodUid: identity.PodUID(), EndpointEpoch: identity.EndpointEpoch(), RecoveryEpoch: identity.RecoveryEpoch()},
 	}}, nil
+}
+
+func (s *Server) AbandonBeforeDispatch(ctx context.Context, request *schedulerv1.AbandonBeforeDispatchRequest) (*schedulerv1.Empty, error) {
+	ref, err := decodeRef(request.GetRef())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid reservation reference")
+	}
+	if request.GetReason() != schedulerv1.RerankReason_RERANK_REASON_STALE_TARGET {
+		return nil, status.Error(codes.InvalidArgument, "invalid rerank reason")
+	}
+	if err := s.scheduler.AbandonBeforeDispatch(ctx, ref, domain.RerankStaleTarget); err != nil {
+		return nil, encodeError(err)
+	}
+	return &schedulerv1.Empty{}, nil
 }
 
 func (s *Server) GiveUpBeforeDispatch(ctx context.Context, request *schedulerv1.GiveUpBeforeDispatchRequest) (*schedulerv1.Empty, error) {
@@ -170,8 +186,11 @@ func encodeError(err error) error {
 		return status.Error(codes.ResourceExhausted, "no schedulable capacity")
 	case errors.Is(err, domain.ErrInvalidReference):
 		return status.Error(codes.PermissionDenied, "invalid reservation reference")
-	case errors.Is(err, domain.ErrInvalidState), errors.Is(err, domain.ErrStaleTarget):
+	case errors.Is(err, domain.ErrStaleTarget):
+		return status.Error(codes.OutOfRange, "dispatch target is stale")
+	case errors.Is(err, domain.ErrInvalidState):
 		return status.Error(codes.FailedPrecondition, "reservation cannot transition")
+
 	case errors.Is(err, context.Canceled):
 		return status.Error(codes.Canceled, "request canceled")
 	case errors.Is(err, context.DeadlineExceeded):

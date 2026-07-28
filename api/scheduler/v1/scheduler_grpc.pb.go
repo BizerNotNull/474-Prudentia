@@ -19,11 +19,12 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	SchedulerService_Schedule_FullMethodName             = "/prudentia.scheduler.v1.SchedulerService/Schedule"
-	SchedulerService_PrepareDispatch_FullMethodName      = "/prudentia.scheduler.v1.SchedulerService/PrepareDispatch"
-	SchedulerService_GiveUpBeforeDispatch_FullMethodName = "/prudentia.scheduler.v1.SchedulerService/GiveUpBeforeDispatch"
-	SchedulerService_Finalize_FullMethodName             = "/prudentia.scheduler.v1.SchedulerService/Finalize"
-	SchedulerService_MarkAmbiguous_FullMethodName        = "/prudentia.scheduler.v1.SchedulerService/MarkAmbiguous"
+	SchedulerService_Schedule_FullMethodName              = "/prudentia.scheduler.v1.SchedulerService/Schedule"
+	SchedulerService_PrepareDispatch_FullMethodName       = "/prudentia.scheduler.v1.SchedulerService/PrepareDispatch"
+	SchedulerService_AbandonBeforeDispatch_FullMethodName = "/prudentia.scheduler.v1.SchedulerService/AbandonBeforeDispatch"
+	SchedulerService_GiveUpBeforeDispatch_FullMethodName  = "/prudentia.scheduler.v1.SchedulerService/GiveUpBeforeDispatch"
+	SchedulerService_Finalize_FullMethodName              = "/prudentia.scheduler.v1.SchedulerService/Finalize"
+	SchedulerService_MarkAmbiguous_FullMethodName         = "/prudentia.scheduler.v1.SchedulerService/MarkAmbiguous"
 )
 
 // SchedulerServiceClient is the client API for SchedulerService service.
@@ -32,6 +33,7 @@ const (
 type SchedulerServiceClient interface {
 	Schedule(ctx context.Context, in *ScheduleRequest, opts ...grpc.CallOption) (*ScheduleResponse, error)
 	PrepareDispatch(ctx context.Context, in *PrepareDispatchRequest, opts ...grpc.CallOption) (*PrepareDispatchResponse, error)
+	AbandonBeforeDispatch(ctx context.Context, in *AbandonBeforeDispatchRequest, opts ...grpc.CallOption) (*Empty, error)
 	GiveUpBeforeDispatch(ctx context.Context, in *GiveUpBeforeDispatchRequest, opts ...grpc.CallOption) (*Empty, error)
 	Finalize(ctx context.Context, in *FinalizeRequest, opts ...grpc.CallOption) (*Empty, error)
 	MarkAmbiguous(ctx context.Context, in *MarkAmbiguousRequest, opts ...grpc.CallOption) (*Empty, error)
@@ -59,6 +61,16 @@ func (c *schedulerServiceClient) PrepareDispatch(ctx context.Context, in *Prepar
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PrepareDispatchResponse)
 	err := c.cc.Invoke(ctx, SchedulerService_PrepareDispatch_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerServiceClient) AbandonBeforeDispatch(ctx context.Context, in *AbandonBeforeDispatchRequest, opts ...grpc.CallOption) (*Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Empty)
+	err := c.cc.Invoke(ctx, SchedulerService_AbandonBeforeDispatch_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -101,6 +113,7 @@ func (c *schedulerServiceClient) MarkAmbiguous(ctx context.Context, in *MarkAmbi
 type SchedulerServiceServer interface {
 	Schedule(context.Context, *ScheduleRequest) (*ScheduleResponse, error)
 	PrepareDispatch(context.Context, *PrepareDispatchRequest) (*PrepareDispatchResponse, error)
+	AbandonBeforeDispatch(context.Context, *AbandonBeforeDispatchRequest) (*Empty, error)
 	GiveUpBeforeDispatch(context.Context, *GiveUpBeforeDispatchRequest) (*Empty, error)
 	Finalize(context.Context, *FinalizeRequest) (*Empty, error)
 	MarkAmbiguous(context.Context, *MarkAmbiguousRequest) (*Empty, error)
@@ -119,6 +132,9 @@ func (UnimplementedSchedulerServiceServer) Schedule(context.Context, *ScheduleRe
 }
 func (UnimplementedSchedulerServiceServer) PrepareDispatch(context.Context, *PrepareDispatchRequest) (*PrepareDispatchResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PrepareDispatch not implemented")
+}
+func (UnimplementedSchedulerServiceServer) AbandonBeforeDispatch(context.Context, *AbandonBeforeDispatchRequest) (*Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method AbandonBeforeDispatch not implemented")
 }
 func (UnimplementedSchedulerServiceServer) GiveUpBeforeDispatch(context.Context, *GiveUpBeforeDispatchRequest) (*Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method GiveUpBeforeDispatch not implemented")
@@ -182,6 +198,24 @@ func _SchedulerService_PrepareDispatch_Handler(srv interface{}, ctx context.Cont
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SchedulerServiceServer).PrepareDispatch(ctx, req.(*PrepareDispatchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SchedulerService_AbandonBeforeDispatch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AbandonBeforeDispatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServiceServer).AbandonBeforeDispatch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SchedulerService_AbandonBeforeDispatch_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServiceServer).AbandonBeforeDispatch(ctx, req.(*AbandonBeforeDispatchRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -254,6 +288,10 @@ var SchedulerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PrepareDispatch",
 			Handler:    _SchedulerService_PrepareDispatch_Handler,
+		},
+		{
+			MethodName: "AbandonBeforeDispatch",
+			Handler:    _SchedulerService_AbandonBeforeDispatch_Handler,
 		},
 		{
 			MethodName: "GiveUpBeforeDispatch",

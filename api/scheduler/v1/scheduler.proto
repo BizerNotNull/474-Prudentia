@@ -7,6 +7,8 @@ option go_package = "github.com/BizerNotNull/474-Prudentia/api/scheduler/v1;sche
 service SchedulerService {
   rpc Schedule(ScheduleRequest) returns (ScheduleResponse);
   rpc PrepareDispatch(PrepareDispatchRequest) returns (PrepareDispatchResponse);
+  rpc AbandonBeforeDispatch(AbandonBeforeDispatchRequest) returns (Empty);
+
   rpc GiveUpBeforeDispatch(GiveUpBeforeDispatchRequest) returns (Empty);
   rpc Finalize(FinalizeRequest) returns (Empty);
   rpc MarkAmbiguous(MarkAmbiguousRequest) returns (Empty);
@@ -69,6 +71,16 @@ message DispatchTarget {
 
 message PrepareDispatchResponse {
   DispatchTarget target = 1;
+}
+
+enum RerankReason {
+  RERANK_REASON_UNSPECIFIED = 0;
+  RERANK_REASON_STALE_TARGET = 1;
+}
+
+message AbandonBeforeDispatchRequest {
+  ReservationRef ref = 1;
+  RerankReason reason = 2;
 }
 
 enum GiveUpReason {

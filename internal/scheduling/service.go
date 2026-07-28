@@ -18,6 +18,8 @@ type Store interface {
 	LookupReservation(context.Context, domain.ScheduleCommand) (domain.Reservation, bool, error)
 	TryReserve(context.Context, domain.ScheduleCommand, domain.WorkloadIdentity) (domain.Reservation, error)
 	PrepareDispatch(context.Context, domain.ReservationRef) (domain.DispatchTarget, error)
+	AbandonBeforeDispatch(context.Context, domain.ReservationRef, domain.RerankReason) error
+
 	GiveUpBeforeDispatch(context.Context, domain.ReservationRef, domain.GiveUpReason) error
 	Finalize(context.Context, domain.ReservationRef, domain.TerminalProof) error
 	MarkAmbiguous(context.Context, domain.ReservationRef, domain.AmbiguousCause) error
@@ -91,6 +93,10 @@ func (s *Service) Schedule(ctx context.Context, cmd domain.ScheduleCommand) (dom
 
 func (s *Service) PrepareDispatch(ctx context.Context, ref domain.ReservationRef) (domain.DispatchTarget, error) {
 	return s.store.PrepareDispatch(ctx, ref)
+}
+
+func (s *Service) AbandonBeforeDispatch(ctx context.Context, ref domain.ReservationRef, reason domain.RerankReason) error {
+	return s.store.AbandonBeforeDispatch(ctx, ref, reason)
 }
 
 func (s *Service) GiveUpBeforeDispatch(ctx context.Context, ref domain.ReservationRef, reason domain.GiveUpReason) error {

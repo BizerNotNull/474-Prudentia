@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/BizerNotNull/474-Prudentia/internal/domain"
 	"github.com/BizerNotNull/474-Prudentia/internal/scheduling"
@@ -136,7 +137,25 @@ func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleComm
 		return domain.Reservation{}, domain.ErrNoCapacity
 	}
 
-	reservationID, err := randomID("res_")
+	var reservationID string
+	var generation uint64
+	err = tx.QueryRow(ctx, `SELECT reservation_id, request_generation
+		FROM scheduler_reservations
+		WHERE request_id=$1 AND tenant_hash=$2 AND command_hash=$3 AND attempt_id=$4
+		  AND state='abandoned_rerank'
+		FOR UPDATE`, cmd.RequestID(), tenantHash[:], commandHash[:], cmd.AttemptID()).Scan(&reservationID, &generation)
+	rerank := err == nil
+	if errors.Is(err, pgx.ErrNoRows) {
+		reservationID, err = randomID("res_")
+		generation = 1
+	} else if err != nil {
+		return domain.Reservation{}, fmt.Errorf("lock rerank reservation: %w", err)
+	} else {
+		if generation >= uint64(math.MaxInt64) {
+			return domain.Reservation{}, domain.ErrInvalidState
+		}
+		generation++
+	}
 	if err != nil {
 		return domain.Reservation{}, fmt.Errorf("create reservation ID: %w", err)
 	}
@@ -149,35 +168,54 @@ func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleComm
 		return domain.Reservation{}, err
 	}
 	capabilityHash := domain.CapabilityHash(capability)
-	var lookupVersion, digestVersion *uint32
-	var lookupHMAC, requestDigest []byte
-	if cmd.HasIdempotencyKey() {
-		lookupValue, digestValue := lookupWrite.Value(), digestWrite.Value()
-		lookupVersion, digestVersion = new(lookupWrite.Version()), new(digestWrite.Version())
-		lookupHMAC, requestDigest = lookupValue[:], digestValue[:]
-	}
-	_, err = tx.Exec(ctx, `
-		INSERT INTO scheduler_reservations (
-			reservation_id, request_id, attempt_id, command_hash, tenant_hash,
-			lookup_version, lookup_hmac, digest_version, request_digest,
-			model, slot_cost, request_generation, cluster, namespace, logical_engine, pod_uid,
-			endpoint_epoch, recovery_epoch, state, capability_ciphertext, capability_hash, execution_deadline)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,$12,$13,$14,$15,$16,$17,'reserved',$18,$19,clock_timestamp()+($20 * interval '1 millisecond'))`,
-		reservationID, cmd.RequestID(), cmd.AttemptID(), commandHash[:], tenantHash[:],
-		lookupVersion, lookupHMAC, digestVersion, requestDigest,
-		cmd.Model(), cmd.SlotCost(), identity.Cluster(), identity.Namespace(), identity.LogicalEngine(), identity.PodUID(),
-		identity.EndpointEpoch(), identity.RecoveryEpoch(), ciphertext, capabilityHash[:], cmd.ExecutionBudget().Milliseconds())
-	if err != nil {
-		return domain.Reservation{}, fmt.Errorf("persist reservation: %w", err)
+	if rerank {
+		tag, err := tx.Exec(ctx, `
+			UPDATE scheduler_reservations
+			SET request_generation=$2, cluster=$3, namespace=$4, logical_engine=$5, pod_uid=$6,
+			    endpoint_epoch=$7, recovery_epoch=$8, state='reserved',
+			    capability_ciphertext=$9, capability_hash=$10, updated_at=clock_timestamp()
+			WHERE reservation_id=$1 AND state='abandoned_rerank'
+			  AND execution_deadline > clock_timestamp()`,
+			reservationID, generation, identity.Cluster(), identity.Namespace(), identity.LogicalEngine(), identity.PodUID(),
+			identity.EndpointEpoch(), identity.RecoveryEpoch(), ciphertext, capabilityHash[:])
+		if err != nil {
+			return domain.Reservation{}, fmt.Errorf("persist rerank reservation: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return domain.Reservation{}, domain.ErrNoCapacity
+		}
+	} else {
+		var lookupVersion, digestVersion *uint32
+		var lookupHMAC, requestDigest []byte
+		if cmd.HasIdempotencyKey() {
+			lookupValue, digestValue := lookupWrite.Value(), digestWrite.Value()
+			lookupVersion, digestVersion = new(lookupWrite.Version()), new(digestWrite.Version())
+			lookupHMAC, requestDigest = lookupValue[:], digestValue[:]
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO scheduler_reservations (
+				reservation_id, request_id, attempt_id, command_hash, tenant_hash,
+				lookup_version, lookup_hmac, digest_version, request_digest,
+				model, slot_cost, request_generation, cluster, namespace, logical_engine, pod_uid,
+				endpoint_epoch, recovery_epoch, state, capability_ciphertext, capability_hash, execution_deadline)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,$12,$13,$14,$15,$16,$17,'reserved',$18,$19,clock_timestamp()+($20 * interval '1 millisecond'))`,
+			reservationID, cmd.RequestID(), cmd.AttemptID(), commandHash[:], tenantHash[:],
+			lookupVersion, lookupHMAC, digestVersion, requestDigest,
+			cmd.Model(), cmd.SlotCost(), identity.Cluster(), identity.Namespace(), identity.LogicalEngine(), identity.PodUID(),
+			identity.EndpointEpoch(), identity.RecoveryEpoch(), ciphertext, capabilityHash[:], cmd.ExecutionBudget().Milliseconds())
+		if err != nil {
+			return domain.Reservation{}, fmt.Errorf("persist reservation: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.Reservation{}, fmt.Errorf("commit reservation: %w", err)
 	}
-	ref, err := domain.NewReservationRef(reservationID, 1, capability)
+	ref, err := domain.NewReservationRef(reservationID, generation, capability)
 	if err != nil {
 		return domain.Reservation{}, err
 	}
 	return domain.NewReservation(ref), nil
+
 }
 
 func (s *SchedulerStore) existingReservation(ctx context.Context, tx pgx.Tx, cmd domain.ScheduleCommand, commandHash, tenantHash [32]byte) (domain.Reservation, bool, error) {
@@ -243,6 +281,10 @@ func (s *SchedulerStore) existingReservation(ctx context.Context, tx pgx.Tx, cmd
 			return domain.Reservation{}, false, domain.ErrInvalidState
 		}
 	}
+	if state == "abandoned_rerank" {
+		return domain.Reservation{}, false, nil
+	}
+
 	capability, err := s.decrypt(ciphertext, id)
 	if err != nil {
 		return domain.Reservation{}, false, err
@@ -348,11 +390,72 @@ func (s *SchedulerStore) PrepareDispatch(ctx context.Context, ref domain.Reserva
 	return target, nil
 }
 
+func (s *SchedulerStore) AbandonBeforeDispatch(ctx context.Context, ref domain.ReservationRef, reason domain.RerankReason) error {
+	if reason != domain.RerankStaleTarget {
+		return domain.ErrInvalidState
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return fmt.Errorf("begin rerank abandonment: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	row, err := lockReservation(ctx, tx, ref)
+	if err != nil {
+		return err
+	}
+	if row.state == "abandoned_rerank" {
+		return tx.Commit(ctx)
+	}
+	if row.state != "reserved" {
+		return domain.ErrInvalidState
+	}
+	if err := updateBackendCapacity(ctx, tx, row, 0); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE scheduler_reservations
+		SET state='abandoned_rerank', updated_at=clock_timestamp()
+		WHERE reservation_id=$1`, ref.ID()); err != nil {
+		return fmt.Errorf("persist rerank abandonment: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit rerank abandonment: %w", err)
+	}
+	return nil
+}
+
 func (s *SchedulerStore) GiveUpBeforeDispatch(ctx context.Context, ref domain.ReservationRef, reason domain.GiveUpReason) error {
 	if reason < domain.GiveUpCanceled || reason > domain.GiveUpReranksExhausted {
 		return domain.ErrInvalidState
 	}
-	return s.release(ctx, ref, "given_up", false, "reserved")
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return fmt.Errorf("begin pre-dispatch give-up: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	row, err := lockReservation(ctx, tx, ref)
+	if err != nil {
+		return err
+	}
+	if row.state == "given_up" {
+		return tx.Commit(ctx)
+	}
+	if row.state != "reserved" && row.state != "abandoned_rerank" {
+		return domain.ErrInvalidState
+	}
+	if row.state == "reserved" {
+		if err := updateBackendCapacity(ctx, tx, row, 0); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE scheduler_reservations
+		SET state='given_up', updated_at=clock_timestamp()
+		WHERE reservation_id=$1`, ref.ID()); err != nil {
+		return fmt.Errorf("persist pre-dispatch give-up: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit pre-dispatch give-up: %w", err)
+	}
+	return nil
 }
 
 func (s *SchedulerStore) Finalize(ctx context.Context, ref domain.ReservationRef, proof domain.TerminalProof) error {
@@ -380,9 +483,10 @@ func (s *SchedulerStore) ClassifyExpired(ctx context.Context, limit int) (int, e
 	defer tx.Rollback(ctx)
 	rows, err := tx.Query(ctx, `SELECT reservation_id, state, cluster, namespace, logical_engine, pod_uid, endpoint_epoch, recovery_epoch, slot_cost
 		FROM scheduler_reservations
-		WHERE state IN ('reserved','dispatch_authorized') AND execution_deadline <= clock_timestamp()
+		WHERE state IN ('reserved','abandoned_rerank','dispatch_authorized') AND execution_deadline <= clock_timestamp()
 		ORDER BY execution_deadline, reservation_id
 		FOR UPDATE SKIP LOCKED LIMIT $1`, limit)
+
 	if err != nil {
 		return 0, fmt.Errorf("select expired reservations: %w", err)
 	}
@@ -411,16 +515,10 @@ func (s *SchedulerStore) ClassifyExpired(ctx context.Context, limit int) (int, e
 			terminal = "orphaned"
 			orphanDelta = item.row.slotCost
 		}
-		tag, err := tx.Exec(ctx, `UPDATE scheduler_backends
-			SET reserved_slots=reserved_slots-$7, orphaned_slots=orphaned_slots+$8
-			WHERE cluster=$1 AND namespace=$2 AND logical_engine=$3 AND pod_uid=$4
-			AND endpoint_epoch=$5 AND recovery_epoch=$6 AND reserved_slots >= $7`,
-			item.row.cluster, item.row.namespace, item.row.engine, item.row.podUID, item.row.endpointEpoch, item.row.recoveryEpoch, item.row.slotCost, orphanDelta)
-		if err != nil {
-			return 0, fmt.Errorf("classify expired capacity: %w", err)
-		}
-		if tag.RowsAffected() != 1 {
-			return 0, domain.ErrInvalidState
+		if item.row.state != "abandoned_rerank" {
+			if err := updateBackendCapacity(ctx, tx, item.row, orphanDelta); err != nil {
+				return 0, err
+			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE scheduler_reservations SET state=$2, updated_at=clock_timestamp() WHERE reservation_id=$1`, item.id, terminal); err != nil {
 			return 0, fmt.Errorf("classify expired reservation: %w", err)
@@ -452,21 +550,29 @@ func (s *SchedulerStore) release(ctx context.Context, ref domain.ReservationRef,
 	if debt {
 		orphanDelta = row.slotCost
 	}
-	tag, err := tx.Exec(ctx, `UPDATE scheduler_backends
-		SET reserved_slots=reserved_slots-$7, orphaned_slots=orphaned_slots+$8
-		WHERE cluster=$1 AND namespace=$2 AND logical_engine=$3 AND pod_uid=$4 AND endpoint_epoch=$5 AND recovery_epoch=$6 AND reserved_slots >= $7`,
-		row.cluster, row.namespace, row.engine, row.podUID, row.endpointEpoch, row.recoveryEpoch, row.slotCost, orphanDelta)
-	if err != nil {
-		return fmt.Errorf("update capacity accounting: %w", err)
-	}
-	if tag.RowsAffected() != 1 {
-		return domain.ErrInvalidState
+	if err := updateBackendCapacity(ctx, tx, row, orphanDelta); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE scheduler_reservations SET state=$2, updated_at=clock_timestamp() WHERE reservation_id=$1`, ref.ID(), terminal); err != nil {
 		return fmt.Errorf("complete reservation transition: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit reservation transition: %w", err)
+	}
+	return nil
+}
+
+func updateBackendCapacity(ctx context.Context, tx pgx.Tx, row reservationRow, orphanDelta int) error {
+	tag, err := tx.Exec(ctx, `UPDATE scheduler_backends
+		SET reserved_slots=reserved_slots-$7, orphaned_slots=orphaned_slots+$8
+		WHERE cluster=$1 AND namespace=$2 AND logical_engine=$3 AND pod_uid=$4
+		  AND endpoint_epoch=$5 AND recovery_epoch=$6 AND reserved_slots >= $7`,
+		row.cluster, row.namespace, row.engine, row.podUID, row.endpointEpoch, row.recoveryEpoch, row.slotCost, orphanDelta)
+	if err != nil {
+		return fmt.Errorf("update backend capacity accounting: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return domain.ErrInvalidState
 	}
 	return nil
 }

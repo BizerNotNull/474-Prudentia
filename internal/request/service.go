@@ -14,6 +14,8 @@ import (
 type Scheduler interface {
 	Schedule(context.Context, domain.ScheduleCommand) (domain.Reservation, error)
 	PrepareDispatch(context.Context, domain.ReservationRef) (domain.DispatchTarget, error)
+	AbandonBeforeDispatch(context.Context, domain.ReservationRef, domain.RerankReason) error
+
 	GiveUpBeforeDispatch(context.Context, domain.ReservationRef, domain.GiveUpReason) error
 	Finalize(context.Context, domain.ReservationRef, domain.TerminalProof) error
 	MarkAmbiguous(context.Context, domain.ReservationRef, domain.AmbiguousCause) error
@@ -40,6 +42,8 @@ type Service struct {
 	executionBudget time.Duration
 	cleanupTimeout  time.Duration
 }
+
+const maxPreDispatchReranks = 3
 
 func NewService(scheduler Scheduler, provider Provider, idempotencyConfig IdempotencyConfig, executionBudget, cleanupTimeout time.Duration) (*Service, error) {
 	if scheduler == nil || provider == nil || executionBudget <= 0 || executionBudget > 30*time.Minute || cleanupTimeout <= 0 || cleanupTimeout > 30*time.Second {
@@ -76,16 +80,35 @@ func (s *Service) Infer(ctx context.Context, requestID string, idempotencyKey []
 		return domain.NewPublicError(domain.ErrorInternal)
 	}
 
-	reservation, err := s.scheduler.Schedule(ctx, command)
-	if err != nil {
-		return publicSchedulingError(err)
+	var ref domain.ReservationRef
+	for reranks := 0; ; {
+		reservation, scheduleErr := s.scheduler.Schedule(ctx, command)
+		if scheduleErr != nil {
+			if ref.ID() != "" {
+				s.cleanupGiveUp(ref, giveUpReason(ctx, scheduleErr))
+			}
+			return publicSchedulingError(scheduleErr)
+		}
+		ref = reservation.Ref()
+		target, prepareErr := s.scheduler.PrepareDispatch(ctx, ref)
+		if prepareErr == nil {
+			if err := s.dispatch(ctx, ref, target, request, sink); err != nil {
+				return err
+			}
+			return nil
+		}
+		if errors.Is(prepareErr, domain.ErrStaleTarget) && ctx.Err() == nil && reranks < maxPreDispatchReranks {
+			if err := s.cleanupAbandon(ref, domain.RerankStaleTarget); err == nil {
+				reranks++
+				continue
+			}
+		}
+		s.cleanupGiveUp(ref, giveUpReason(ctx, prepareErr))
+		return publicSchedulingError(prepareErr)
 	}
-	ref := reservation.Ref()
-	target, err := s.scheduler.PrepareDispatch(ctx, ref)
-	if err != nil {
-		s.cleanupGiveUp(ref, giveUpReason(ctx, err))
-		return publicSchedulingError(err)
-	}
+}
+
+func (s *Service) dispatch(ctx context.Context, ref domain.ReservationRef, target domain.DispatchTarget, request domain.AuthorizedRequest, sink publichttp.StreamSink) error {
 
 	if err := s.provider.Infer(ctx, target, request, sink); err != nil {
 		var dispatchErr *DispatchError
@@ -103,6 +126,13 @@ func (s *Service) Infer(ctx context.Context, requestID string, idempotencyKey []
 		return domain.NewPublicError(domain.ErrorInternal)
 	}
 	return nil
+
+}
+
+func (s *Service) cleanupAbandon(ref domain.ReservationRef, reason domain.RerankReason) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.cleanupTimeout)
+	defer cancel()
+	return s.scheduler.AbandonBeforeDispatch(ctx, ref, reason)
 }
 
 func (s *Service) cleanupGiveUp(ref domain.ReservationRef, reason domain.GiveUpReason) {
