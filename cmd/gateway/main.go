@@ -84,7 +84,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	inference, err := requestapp.NewService(scheduler, provider, 2*time.Minute, 5*time.Second)
+	inference, err := requestapp.NewService(scheduler, provider, cfg.IdempotencyConfig, 2*time.Minute, 5*time.Second)
 	if err != nil {
 		return err
 	}

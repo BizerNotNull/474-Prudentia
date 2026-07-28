@@ -30,6 +30,8 @@ The runnable request path now includes:
 - a mutually authenticated gRPC scheduler client and server;
 - deterministic capacity ranking and PostgreSQL-transactional reservation;
 - encrypted recoverable reservation capabilities;
+- tenant-scoped `Idempotency-Key` HMAC lookup, canonical request conflict
+  detection, and fail-closed in-progress/terminal replay handling;
 - dispatch authorization, terminal release, pre-dispatch give-up, ambiguous
   dispatch debt, and database-time expiry classification;
 - an exact-workload-identity HTTPS adapter for vLLM streaming responses.
@@ -39,6 +41,7 @@ Apply the ordered ledger and controller schemas before starting the processes:
 ```text
 psql "$PRUDENTIA_DATABASE_URL" -f migrations/000001_scheduler_mvp.up.sql
 psql "$PRUDENTIA_DATABASE_URL" -f migrations/000002_controller_mvp.up.sql
+psql "$PRUDENTIA_DATABASE_URL" -f migrations/000003_request_idempotency.up.sql
 ```
 
 The scheduler intentionally does not invent capacity. The controller is the
@@ -73,8 +76,21 @@ PRUDENTIA_GATEWAY_TLS_CERT=<gateway-client-certificate.pem>
 PRUDENTIA_GATEWAY_TLS_KEY=<gateway-client-private-key.pem>
 PRUDENTIA_PROVIDER_CA=<provider-proxy-ca.pem>
 PRUDENTIA_PROVIDER_TRUST_DOMAIN=<provider-spiffe-trust-domain>
+PRUDENTIA_GATEWAY_IDEMPOTENCY_LOOKUP_KEYS=1:<base64-encoded-32-byte-key>
+PRUDENTIA_GATEWAY_IDEMPOTENCY_LOOKUP_WRITE_VERSION=1
+PRUDENTIA_GATEWAY_REQUEST_DIGEST_KEYS=1:<base64-encoded-32-byte-key>
+PRUDENTIA_GATEWAY_REQUEST_DIGEST_WRITE_VERSION=1
 go run ./cmd/gateway
 ```
+
+Keyrings are comma-separated `version:base64-key` entries with at most four
+retained versions. The configured write versions must be present and must
+match the coordinated versions in `scheduler_crypto_versions`. Retain old
+lookup and digest keys through the idempotency window during rotation. Raw
+`Idempotency-Key` values remain gateway-only and are never persisted or sent
+over gRPC. Completed responses are not stored, so a repeated completed request
+returns `request_not_replayable`; a different canonical request under the same
+tenant/key returns `idempotency_conflict`.
 
 Controller configuration:
 

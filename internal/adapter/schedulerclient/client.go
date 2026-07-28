@@ -22,8 +22,22 @@ func New(rpc schedulerv1.SchedulerServiceClient) (*Client, error) {
 }
 
 func (c *Client) Schedule(ctx context.Context, command domain.ScheduleCommand) (domain.Reservation, error) {
+	lookupCandidates := command.IdempotencyCandidates()
+	wireLookups := make([]*schedulerv1.IdempotencyLookupCandidate, len(lookupCandidates))
+	for i, candidate := range lookupCandidates {
+		value := candidate.Value()
+		wireLookups[i] = &schedulerv1.IdempotencyLookupCandidate{PepperVersion: candidate.Version(), HmacSha256: value[:]}
+	}
+	digestCandidates := command.DigestCandidates()
+	wireDigests := make([]*schedulerv1.RequestDigestCandidate, len(digestCandidates))
+	for i, candidate := range digestCandidates {
+		value := candidate.Value()
+		wireDigests[i] = &schedulerv1.RequestDigestCandidate{DigestVersion: candidate.Version(), HmacSha256: value[:]}
+	}
 	response, err := c.rpc.Schedule(ctx, &schedulerv1.ScheduleRequest{
 		RequestId: command.RequestID(), AttemptId: command.AttemptID(), TenantScope: []byte(command.Tenant()),
+		IdempotencyLookupCandidates: wireLookups, LookupWriteVersion: command.LookupWriteVersion(),
+		DigestCandidates: wireDigests, DigestWriteVersion: command.DigestWriteVersion(),
 		Model: command.Model(), SlotCost: command.SlotCost(), ExecutionBudgetMs: command.ExecutionBudget().Milliseconds(),
 	})
 	if err != nil {
@@ -101,6 +115,12 @@ func decodeError(err error) error {
 		return nil
 	}
 	switch status.Code(err) {
+	case codes.AlreadyExists:
+		return domain.ErrIdempotencyConflict
+	case codes.Aborted:
+		return domain.ErrRequestInProgress
+	case codes.NotFound:
+		return domain.ErrRequestNotReplayable
 	case codes.ResourceExhausted:
 		return domain.ErrNoCapacity
 	case codes.PermissionDenied:

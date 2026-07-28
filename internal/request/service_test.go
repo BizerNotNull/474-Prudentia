@@ -16,6 +16,7 @@ type recordingScheduler struct {
 	target    domain.DispatchTarget
 	finalized domain.TerminalProof
 	ambiguous domain.AmbiguousCause
+	command   domain.ScheduleCommand
 }
 
 func newRecordingScheduler(t *testing.T) *recordingScheduler {
@@ -34,7 +35,8 @@ func newRecordingScheduler(t *testing.T) *recordingScheduler {
 	}
 	return &recordingScheduler{ref: ref, target: target}
 }
-func (s *recordingScheduler) Schedule(context.Context, domain.ScheduleCommand) (domain.Reservation, error) {
+func (s *recordingScheduler) Schedule(_ context.Context, command domain.ScheduleCommand) (domain.Reservation, error) {
+	s.command = command
 	return domain.NewReservation(s.ref), nil
 }
 func (s *recordingScheduler) PrepareDispatch(context.Context, domain.ReservationRef) (domain.DispatchTarget, error) {
@@ -75,13 +77,44 @@ func authorizedRequest(t *testing.T) domain.AuthorizedRequest {
 	return domain.NewAuthorizedRequest(principal, inference)
 }
 
+func idempotencyConfig() requestapp.IdempotencyConfig {
+	return requestapp.IdempotencyConfig{
+		LookupKeys:         []requestapp.VersionedKey{{Version: 1, Key: []byte("lookup-key-32-bytes-long-value!!")}},
+		LookupWriteVersion: 1,
+		DigestKeys:         []requestapp.VersionedKey{{Version: 1, Key: []byte("digest-key-32-bytes-long-value!!")}},
+		DigestWriteVersion: 1,
+	}
+}
+
+func TestValidateIdempotencyConfigUsesDomainCandidateBounds(t *testing.T) {
+	config := idempotencyConfig()
+	config.LookupKeys = make([]requestapp.VersionedKey, domain.MaxLookupCandidates)
+	for i := range config.LookupKeys {
+		config.LookupKeys[i] = requestapp.VersionedKey{
+			Version: uint32(i + 1),
+			Key:     []byte("lookup-key-32-bytes-long-value!!"),
+		}
+	}
+	config.LookupWriteVersion = uint32(domain.MaxLookupCandidates)
+	if _, err := requestapp.ValidateIdempotencyConfig(config); err != nil {
+		t.Fatalf("maximum-size keyring rejected: %v", err)
+	}
+	config.LookupKeys = append(config.LookupKeys, requestapp.VersionedKey{
+		Version: uint32(domain.MaxLookupCandidates + 1),
+		Key:     []byte("lookup-key-32-bytes-long-value!!"),
+	})
+	if _, err := requestapp.ValidateIdempotencyConfig(config); err == nil {
+		t.Fatal("oversize keyring accepted")
+	}
+}
+
 func TestTransportFailureAfterBodyMayBeSentCreatesAmbiguousDebt(t *testing.T) {
 	scheduler := newRecordingScheduler(t)
-	service, err := requestapp.NewService(scheduler, failingProvider{err: errors.New("connection reset")}, time.Minute, time.Second)
+	service, err := requestapp.NewService(scheduler, failingProvider{err: errors.New("connection reset")}, idempotencyConfig(), time.Minute, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Infer(context.Background(), authorizedRequest(t), domain.ResponseModeNonStreaming, discardSink{}); domain.ErrorKindOf(err) != domain.ErrorUnavailable {
+	if err := service.Infer(context.Background(), "req_test", nil, authorizedRequest(t), domain.ResponseModeNonStreaming, discardSink{}); domain.ErrorKindOf(err) != domain.ErrorUnavailable {
 		t.Fatalf("error = %v, want unavailable", err)
 	}
 	if scheduler.ambiguous != domain.AmbiguousTransport || scheduler.finalized != 0 {
@@ -91,12 +124,36 @@ func TestTransportFailureAfterBodyMayBeSentCreatesAmbiguousDebt(t *testing.T) {
 
 func TestDefinitiveNotSentFailureReleasesReservation(t *testing.T) {
 	scheduler := newRecordingScheduler(t)
-	service, err := requestapp.NewService(scheduler, failingProvider{err: requestapp.NewNotSentError(errors.New("identity mismatch"))}, time.Minute, time.Second)
+	service, err := requestapp.NewService(scheduler, failingProvider{err: requestapp.NewNotSentError(errors.New("identity mismatch"))}, idempotencyConfig(), time.Minute, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = service.Infer(context.Background(), authorizedRequest(t), domain.ResponseModeNonStreaming, discardSink{})
+	_ = service.Infer(context.Background(), "req_test", nil, authorizedRequest(t), domain.ResponseModeNonStreaming, discardSink{})
 	if scheduler.finalized != domain.TerminalProofNotSent || scheduler.ambiguous != 0 {
 		t.Fatalf("finalized = %v, ambiguous = %v", scheduler.finalized, scheduler.ambiguous)
+	}
+}
+
+func TestInferDerivesBoundedCandidatesAndZeroizesRawIdempotencyKey(t *testing.T) {
+	scheduler := newRecordingScheduler(t)
+	service, err := requestapp.NewService(scheduler, failingProvider{err: requestapp.NewNotSentError(errors.New("not sent"))}, idempotencyConfig(), time.Minute, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawKey := []byte("client-operation-1")
+	_ = service.Infer(context.Background(), "req_public", rawKey, authorizedRequest(t), domain.ResponseModeNonStreaming, discardSink{})
+	if scheduler.command.RequestID() != "req_public" {
+		t.Fatalf("request ID = %q", scheduler.command.RequestID())
+	}
+	if len(scheduler.command.IdempotencyCandidates()) != 1 || scheduler.command.LookupWriteVersion() != 1 {
+		t.Fatalf("unexpected lookup candidate set")
+	}
+	if len(scheduler.command.DigestCandidates()) != 1 || scheduler.command.DigestWriteVersion() != 1 {
+		t.Fatalf("unexpected digest candidate set")
+	}
+	for i, value := range rawKey {
+		if value != 0 {
+			t.Fatalf("raw key byte %d was not zeroized", i)
+		}
 	}
 }

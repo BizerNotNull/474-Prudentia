@@ -1,10 +1,15 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"net"
 	"os"
+	"strconv"
 	"strings"
+
+	"github.com/BizerNotNull/474-Prudentia/internal/domain"
+	requestapp "github.com/BizerNotNull/474-Prudentia/internal/request"
 )
 
 type Gateway struct {
@@ -19,9 +24,11 @@ type Gateway struct {
 	TLSKeyFile          string
 	ProviderCAFile      string
 	ProviderTrustDomain string
+	IdempotencyConfig   requestapp.IdempotencyConfig
 }
 
 func LoadGatewayFromEnv() (Gateway, error) {
+	var err error
 	cfg := Gateway{
 		ListenAddress: strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_LISTEN")),
 		APIKey:        os.Getenv("PRUDENTIA_GATEWAY_API_KEY"),
@@ -34,6 +41,29 @@ func LoadGatewayFromEnv() (Gateway, error) {
 	cfg.TLSKeyFile = strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_TLS_KEY"))
 	cfg.ProviderCAFile = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_CA"))
 	cfg.ProviderTrustDomain = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_TRUST_DOMAIN"))
+	lookupKeys, lookupWriteVersion, err := loadVersionedKeys(
+		"PRUDENTIA_GATEWAY_IDEMPOTENCY_LOOKUP_KEYS",
+		"PRUDENTIA_GATEWAY_IDEMPOTENCY_LOOKUP_WRITE_VERSION",
+		domain.MaxLookupCandidates,
+	)
+	if err != nil {
+		return Gateway{}, err
+	}
+	digestKeys, digestWriteVersion, err := loadVersionedKeys(
+		"PRUDENTIA_GATEWAY_REQUEST_DIGEST_KEYS",
+		"PRUDENTIA_GATEWAY_REQUEST_DIGEST_WRITE_VERSION",
+		domain.MaxDigestCandidates,
+	)
+	if err != nil {
+		return Gateway{}, err
+	}
+	cfg.IdempotencyConfig, err = requestapp.ValidateIdempotencyConfig(requestapp.IdempotencyConfig{
+		LookupKeys: lookupKeys, LookupWriteVersion: lookupWriteVersion,
+		DigestKeys: digestKeys, DigestWriteVersion: digestWriteVersion,
+	})
+	if err != nil {
+		return Gateway{}, err
+	}
 	if cfg.ListenAddress == "" {
 		cfg.ListenAddress = "127.0.0.1:8080"
 	}
@@ -61,4 +91,26 @@ func LoadGatewayFromEnv() (Gateway, error) {
 		return Gateway{}, errors.New("gateway scheduler and provider TLS configuration is required")
 	}
 	return cfg, nil
+}
+
+func loadVersionedKeys(keysEnv, writeVersionEnv string, maxCandidates int) ([]requestapp.VersionedKey, uint32, error) {
+	rawWriteVersion, err := strconv.ParseUint(strings.TrimSpace(os.Getenv(writeVersionEnv)), 10, 32)
+	if err != nil || rawWriteVersion == 0 {
+		return nil, 0, errors.New("invalid idempotency keyring write version")
+	}
+	parts := strings.Split(os.Getenv(keysEnv), ",")
+	if len(parts) == 0 || len(parts) > maxCandidates {
+		return nil, 0, errors.New("invalid idempotency keyring")
+	}
+	keys := make([]requestapp.VersionedKey, 0, len(parts))
+	for _, part := range parts {
+		versionText, encoded, ok := strings.Cut(strings.TrimSpace(part), ":")
+		version, versionErr := strconv.ParseUint(versionText, 10, 32)
+		key, keyErr := base64.StdEncoding.DecodeString(encoded)
+		if !ok || versionErr != nil || version == 0 || keyErr != nil || len(key) != 32 {
+			return nil, 0, errors.New("invalid idempotency keyring")
+		}
+		keys = append(keys, requestapp.VersionedKey{Version: uint32(version), Key: key})
+	}
+	return keys, uint32(rawWriteVersion), nil
 }

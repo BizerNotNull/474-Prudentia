@@ -19,6 +19,9 @@ const (
 	ErrorInvalidRequest ErrorKind = iota + 1
 	ErrorUnauthenticated
 	ErrorForbidden
+	ErrorIdempotencyConflict
+	ErrorRequestInProgress
+	ErrorRequestNotReplayable
 	ErrorUnavailable
 	ErrorInternal
 )

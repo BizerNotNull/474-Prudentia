@@ -12,13 +12,27 @@ service SchedulerService {
   rpc MarkAmbiguous(MarkAmbiguousRequest) returns (Empty);
 }
 
+message IdempotencyLookupCandidate {
+  uint32 pepper_version = 1;
+  bytes hmac_sha256 = 2;
+}
+
+message RequestDigestCandidate {
+  uint32 digest_version = 1;
+  bytes hmac_sha256 = 2;
+}
+
 message ScheduleRequest {
   string request_id = 1;
   string attempt_id = 2;
   bytes tenant_scope = 3;
-  string model = 4;
-  uint32 slot_cost = 5;
-  int64 execution_budget_ms = 6;
+  repeated IdempotencyLookupCandidate idempotency_lookup_candidates = 4;
+  uint32 lookup_write_version = 5;
+  repeated RequestDigestCandidate digest_candidates = 6;
+  uint32 digest_write_version = 7;
+  string model = 8;
+  uint32 slot_cost = 9;
+  int64 execution_budget_ms = 10;
 }
 
 message ReservationRef {

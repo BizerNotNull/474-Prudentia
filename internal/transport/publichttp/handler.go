@@ -18,7 +18,7 @@ type Authorizer interface {
 }
 
 type Inferer interface {
-	Infer(context.Context, domain.AuthorizedRequest, domain.ResponseMode, StreamSink) error
+	Infer(context.Context, string, []byte, domain.AuthorizedRequest, domain.ResponseMode, StreamSink) error
 }
 
 type Handler struct {
@@ -65,29 +65,35 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		WritePublicError(w, id, err)
 		return
 	}
-
-	if mode == domain.ResponseModeStreaming {
-		h.serveStreaming(w, r, id, authorized)
+	idempotencyKey, err := takeIdempotencyKey(r)
+	if err != nil {
+		WritePublicError(w, id, err)
 		return
 	}
-	h.serveNonStreaming(w, r, id, authorized)
+	defer clear(idempotencyKey)
+
+	if mode == domain.ResponseModeStreaming {
+		h.serveStreaming(w, r, id, idempotencyKey, authorized)
+		return
+	}
+	h.serveNonStreaming(w, r, id, idempotencyKey, authorized)
 }
 
-func (h *Handler) serveStreaming(w http.ResponseWriter, r *http.Request, id string, request domain.AuthorizedRequest) {
+func (h *Handler) serveStreaming(w http.ResponseWriter, r *http.Request, id string, idempotencyKey []byte, request domain.AuthorizedRequest) {
 	sink, err := NewSSESink(w, id)
 	if err != nil {
 		WritePublicError(w, id, err)
 		return
 	}
-	err = h.inferer.Infer(r.Context(), request, domain.ResponseModeStreaming, sink)
+	err = h.inferer.Infer(r.Context(), id, idempotencyKey, request, domain.ResponseModeStreaming, sink)
 	if err != nil && !sink.Started() {
 		WritePublicError(w, id, err)
 	}
 }
 
-func (h *Handler) serveNonStreaming(w http.ResponseWriter, r *http.Request, id string, request domain.AuthorizedRequest) {
+func (h *Handler) serveNonStreaming(w http.ResponseWriter, r *http.Request, id string, idempotencyKey []byte, request domain.AuthorizedRequest) {
 	collector := NewNonStreamingCollector(h.limits.MaxOutputBytes, h.limits.MaxStreamEvents)
-	if err := h.inferer.Infer(r.Context(), request, domain.ResponseModeNonStreaming, collector); err != nil {
+	if err := h.inferer.Infer(r.Context(), id, idempotencyKey, request, domain.ResponseModeNonStreaming, collector); err != nil {
 		WritePublicError(w, id, err)
 		return
 	}
@@ -99,6 +105,25 @@ func (h *Handler) serveNonStreaming(w http.ResponseWriter, r *http.Request, id s
 	if err := EncodeNonStreaming(w, id, request.Request().Model(), result); err != nil {
 		return
 	}
+}
+
+func takeIdempotencyKey(r *http.Request) ([]byte, error) {
+	values := r.Header.Values("Idempotency-Key")
+	r.Header.Del("Idempotency-Key")
+	if len(values) == 0 {
+		return nil, nil
+	}
+	if len(values) != 1 || len(values[0]) == 0 || len(values[0]) > 256 {
+		return nil, domain.NewPublicError(domain.ErrorInvalidRequest)
+	}
+	key := []byte(values[0])
+	for _, value := range key {
+		if value < 0x21 || value > 0x7e {
+			clear(key)
+			return nil, domain.NewPublicError(domain.ErrorInvalidRequest)
+		}
+	}
+	return key, nil
 }
 
 func newRequestID() (string, error) {
