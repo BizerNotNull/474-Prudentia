@@ -73,6 +73,15 @@ func (c *Client) PrepareDispatch(ctx context.Context, ref domain.ReservationRef)
 	return domain.NewDispatchTarget(target.Endpoint, identity)
 }
 
+func (c *Client) AbandonBeforeDispatch(ctx context.Context, ref domain.ReservationRef, reason domain.RerankReason) error {
+	wireReason := schedulerv1.RerankReason_RERANK_REASON_UNSPECIFIED
+	if reason == domain.RerankStaleTarget {
+		wireReason = schedulerv1.RerankReason_RERANK_REASON_STALE_TARGET
+	}
+	_, err := c.rpc.AbandonBeforeDispatch(ctx, &schedulerv1.AbandonBeforeDispatchRequest{Ref: encodeRef(ref), Reason: wireReason})
+	return decodeError(err)
+}
+
 func (c *Client) GiveUpBeforeDispatch(ctx context.Context, ref domain.ReservationRef, reason domain.GiveUpReason) error {
 	_, err := c.rpc.GiveUpBeforeDispatch(ctx, &schedulerv1.GiveUpBeforeDispatchRequest{Ref: encodeRef(ref), Reason: schedulerv1.GiveUpReason(reason)})
 	return decodeError(err)
@@ -125,6 +134,9 @@ func decodeError(err error) error {
 		return domain.ErrNoCapacity
 	case codes.PermissionDenied:
 		return domain.ErrInvalidReference
+	case codes.OutOfRange:
+		return domain.ErrStaleTarget
+
 	case codes.FailedPrecondition:
 		return domain.ErrInvalidState
 	case codes.Canceled:

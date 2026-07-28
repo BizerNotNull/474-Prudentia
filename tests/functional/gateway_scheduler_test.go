@@ -2,6 +2,8 @@ package functional_test
 
 import (
 	"context"
+	"errors"
+
 	"encoding/json"
 	"net"
 	"net/http"
@@ -24,13 +26,15 @@ import (
 )
 
 type ledgerScheduler struct {
-	mu     sync.Mutex
-	state  string
-	ref    domain.ReservationRef
-	target domain.DispatchTarget
-	hasKey bool
-	lookup [32]byte
-	digest [32]byte
+	mu           sync.Mutex
+	state        string
+	ref          domain.ReservationRef
+	target       domain.DispatchTarget
+	hasKey       bool
+	lookup       [32]byte
+	digest       [32]byte
+	staleOnce    bool
+	prepareCalls int
 }
 
 func newLedgerScheduler(t *testing.T) *ledgerScheduler {
@@ -53,6 +57,16 @@ func newLedgerScheduler(t *testing.T) *ledgerScheduler {
 func (s *ledgerScheduler) Schedule(_ context.Context, command domain.ScheduleCommand) (domain.Reservation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.state == "abandoned_rerank" {
+		ref, err := domain.NewReservationRef(s.ref.ID(), s.ref.Generation()+1, s.ref.Capability())
+		if err != nil {
+			return domain.Reservation{}, err
+		}
+		s.ref = ref
+		s.state = "reserved"
+		return domain.NewReservation(ref), nil
+	}
+
 	lookups, digests := command.IdempotencyCandidates(), command.DigestCandidates()
 	if s.state != "" {
 		if !s.hasKey || len(lookups) != 1 || len(digests) != 1 || lookups[0].Value() != s.lookup {
@@ -76,12 +90,27 @@ func (s *ledgerScheduler) Schedule(_ context.Context, command domain.ScheduleCom
 func (s *ledgerScheduler) PrepareDispatch(context.Context, domain.ReservationRef) (domain.DispatchTarget, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.prepareCalls++
+	if s.staleOnce && s.prepareCalls == 1 {
+		return domain.DispatchTarget{}, domain.ErrStaleTarget
+	}
+
 	if s.state != "reserved" {
 		return domain.DispatchTarget{}, domain.ErrInvalidState
 	}
 	s.state = "dispatch_authorized"
 	return s.target, nil
 }
+func (s *ledgerScheduler) AbandonBeforeDispatch(context.Context, domain.ReservationRef, domain.RerankReason) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != "reserved" {
+		return domain.ErrInvalidState
+	}
+	s.state = "abandoned_rerank"
+	return nil
+}
+
 func (s *ledgerScheduler) GiveUpBeforeDispatch(context.Context, domain.ReservationRef, domain.GiveUpReason) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -202,5 +231,57 @@ func TestGatewayCompletesRequestThroughSchedulerGRPC(t *testing.T) {
 	defer ledger.mu.Unlock()
 	if ledger.state != "released" {
 		t.Fatalf("ledger state = %q, want released", ledger.state)
+	}
+}
+
+func TestCandidateSwitchRoundTripsThroughSchedulerGRPC(t *testing.T) {
+	ledger := newLedgerScheduler(t)
+	ledger.staleOnce = true
+	serverBoundary, err := transport.NewServer(ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := bufconn.Listen(1 << 20)
+	grpcServer := grpc.NewServer()
+	schedulerv1.RegisterSchedulerServiceServer(grpcServer, serverBoundary)
+	go func() { _ = grpcServer.Serve(listener) }()
+	t.Cleanup(grpcServer.Stop)
+
+	connection, err := grpc.NewClient("passthrough:///scheduler", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	client, err := schedulerclient.New(schedulerv1.NewSchedulerServiceClient(connection))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := domain.NewScheduleCommand(domain.ScheduleParams{
+		RequestID: "req_switch", AttemptID: "att_switch", Tenant: "tenant-a",
+		Model: "model-a", SlotCost: 1, ExecutionBudget: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := client.Schedule(context.Background(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.PrepareDispatch(context.Background(), first.Ref()); !errors.Is(err, domain.ErrStaleTarget) {
+		t.Fatalf("prepare error = %v, want stale target", err)
+	}
+	if err := client.AbandonBeforeDispatch(context.Background(), first.Ref(), domain.RerankStaleTarget); err != nil {
+		t.Fatalf("abandon candidate: %v", err)
+	}
+	second, err := client.Schedule(context.Background(), command)
+	if err != nil {
+		t.Fatalf("schedule replacement candidate: %v", err)
+	}
+	if second.Ref().Generation() != first.Ref().Generation()+1 {
+		t.Fatalf("replacement generation = %d, first = %d", second.Ref().Generation(), first.Ref().Generation())
+	}
+	if _, err := client.PrepareDispatch(context.Background(), second.Ref()); err != nil {
+		t.Fatalf("prepare replacement candidate: %v", err)
 	}
 }

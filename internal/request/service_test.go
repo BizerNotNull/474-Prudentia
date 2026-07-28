@@ -42,6 +42,10 @@ func (s *recordingScheduler) Schedule(_ context.Context, command domain.Schedule
 func (s *recordingScheduler) PrepareDispatch(context.Context, domain.ReservationRef) (domain.DispatchTarget, error) {
 	return s.target, nil
 }
+func (s *recordingScheduler) AbandonBeforeDispatch(context.Context, domain.ReservationRef, domain.RerankReason) error {
+	return nil
+}
+
 func (s *recordingScheduler) GiveUpBeforeDispatch(context.Context, domain.ReservationRef, domain.GiveUpReason) error {
 	return nil
 }
@@ -58,6 +62,78 @@ type failingProvider struct{ err error }
 
 func (p failingProvider) Infer(context.Context, domain.DispatchTarget, domain.AuthorizedRequest, publichttp.StreamSink) error {
 	return p.err
+}
+
+type switchingScheduler struct {
+	refs          []domain.ReservationRef
+	target        domain.DispatchTarget
+	scheduleCalls int
+	prepareCalls  int
+	abandoned     []uint64
+	abandonReason domain.RerankReason
+	givenUp       uint64
+	giveUpReason  domain.GiveUpReason
+	finalized     uint64
+	alwaysStale   bool
+}
+
+func newSwitchingScheduler(t *testing.T, reservations int) *switchingScheduler {
+	t.Helper()
+	base := newRecordingScheduler(t)
+	refs := make([]domain.ReservationRef, reservations)
+	for i := range refs {
+		ref, err := domain.NewReservationRef("res_switch", uint64(i+1), []byte("abcdef0123456789abcdef0123456789"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		refs[i] = ref
+	}
+	return &switchingScheduler{refs: refs, target: base.target}
+}
+
+func (s *switchingScheduler) Schedule(context.Context, domain.ScheduleCommand) (domain.Reservation, error) {
+	if s.scheduleCalls >= len(s.refs) {
+		return domain.Reservation{}, domain.ErrNoCapacity
+	}
+	ref := s.refs[s.scheduleCalls]
+	s.scheduleCalls++
+	return domain.NewReservation(ref), nil
+}
+
+func (s *switchingScheduler) PrepareDispatch(context.Context, domain.ReservationRef) (domain.DispatchTarget, error) {
+	s.prepareCalls++
+	if s.alwaysStale || s.prepareCalls == 1 {
+		return domain.DispatchTarget{}, domain.ErrStaleTarget
+	}
+	return s.target, nil
+}
+
+func (s *switchingScheduler) AbandonBeforeDispatch(_ context.Context, ref domain.ReservationRef, reason domain.RerankReason) error {
+	s.abandoned = append(s.abandoned, ref.Generation())
+	s.abandonReason = reason
+	return nil
+}
+
+func (s *switchingScheduler) GiveUpBeforeDispatch(_ context.Context, ref domain.ReservationRef, reason domain.GiveUpReason) error {
+	s.givenUp = ref.Generation()
+	s.giveUpReason = reason
+	return nil
+}
+
+func (s *switchingScheduler) Finalize(_ context.Context, ref domain.ReservationRef, _ domain.TerminalProof) error {
+	s.finalized = ref.Generation()
+	return nil
+}
+
+func (*switchingScheduler) MarkAmbiguous(context.Context, domain.ReservationRef, domain.AmbiguousCause) error {
+	return nil
+}
+
+type countingProvider struct{ calls int }
+
+func (p *countingProvider) Infer(context.Context, domain.DispatchTarget, domain.AuthorizedRequest, publichttp.StreamSink) error {
+	p.calls++
+	return nil
 }
 
 type discardSink struct{}
@@ -155,5 +231,51 @@ func TestInferDerivesBoundedCandidatesAndZeroizesRawIdempotencyKey(t *testing.T)
 		if value != 0 {
 			t.Fatalf("raw key byte %d was not zeroized", i)
 		}
+	}
+}
+
+func TestInferAbandonsStaleCandidateAndDispatchesNextGeneration(t *testing.T) {
+	scheduler := newSwitchingScheduler(t, 2)
+	provider := &countingProvider{}
+	service, err := requestapp.NewService(scheduler, provider, idempotencyConfig(), time.Minute, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := service.Infer(context.Background(), "req_switch", nil, authorizedRequest(t), domain.ResponseModeNonStreaming, discardSink{}); err != nil {
+		t.Fatalf("infer after candidate switch: %v", err)
+	}
+	if scheduler.scheduleCalls != 2 || scheduler.prepareCalls != 2 {
+		t.Fatalf("schedule calls = %d, prepare calls = %d", scheduler.scheduleCalls, scheduler.prepareCalls)
+	}
+	if len(scheduler.abandoned) != 1 || scheduler.abandoned[0] != 1 || scheduler.abandonReason != domain.RerankStaleTarget {
+		t.Fatalf("abandonment = %v, reason = %v", scheduler.abandoned, scheduler.abandonReason)
+	}
+	if scheduler.givenUp != 0 || scheduler.finalized != 2 || provider.calls != 1 {
+		t.Fatalf("given up generation = %d, finalized generation = %d, provider calls = %d", scheduler.givenUp, scheduler.finalized, provider.calls)
+	}
+}
+
+func TestInferBoundsCandidateSwitchesAndTerminallyGivesUpLatestRef(t *testing.T) {
+	scheduler := newSwitchingScheduler(t, 4)
+	scheduler.alwaysStale = true
+	provider := &countingProvider{}
+	service, err := requestapp.NewService(scheduler, provider, idempotencyConfig(), time.Minute, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = service.Infer(context.Background(), "req_exhausted", nil, authorizedRequest(t), domain.ResponseModeNonStreaming, discardSink{})
+	if domain.ErrorKindOf(err) != domain.ErrorUnavailable {
+		t.Fatalf("error = %v, want unavailable", err)
+	}
+	if scheduler.scheduleCalls != 4 || scheduler.prepareCalls != 4 || len(scheduler.abandoned) != 3 {
+		t.Fatalf("schedule calls = %d, prepare calls = %d, abandonments = %v", scheduler.scheduleCalls, scheduler.prepareCalls, scheduler.abandoned)
+	}
+	if scheduler.givenUp != 4 || scheduler.giveUpReason != domain.GiveUpReranksExhausted {
+		t.Fatalf("given up generation = %d, reason = %v", scheduler.givenUp, scheduler.giveUpReason)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("provider calls = %d, want 0", provider.calls)
 	}
 }

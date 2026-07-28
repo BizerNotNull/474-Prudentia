@@ -242,6 +242,12 @@ const (
 	AmbiguousProtocol
 )
 
+type RerankReason uint8
+
+const (
+	RerankStaleTarget RerankReason = iota + 1
+)
+
 type GiveUpReason uint8
 
 const (
