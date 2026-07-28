@@ -20,7 +20,10 @@ var (
 	ErrRequestNotReplayable = errors.New("idempotent request is not replayable")
 )
 
-const maxCryptoCandidates = 4
+const (
+	MaxLookupCandidates = 4
+	MaxDigestCandidates = 4
+)
 
 type IdempotencyLookupCandidate struct {
 	version uint32
@@ -127,7 +130,7 @@ func validateCandidateSets(lookups []IdempotencyLookupCandidate, lookupWrite uin
 		}
 		return nil
 	}
-	if len(lookups) > maxCryptoCandidates || len(digests) == 0 || len(digests) > maxCryptoCandidates || lookupWrite == 0 || digestWrite == 0 {
+	if len(lookups) > MaxLookupCandidates || len(digests) == 0 || len(digests) > MaxDigestCandidates || lookupWrite == 0 || digestWrite == 0 {
 		return fmt.Errorf("invalid schedule command")
 	}
 	lookupWriteFound := false

@@ -86,6 +86,28 @@ func idempotencyConfig() requestapp.IdempotencyConfig {
 	}
 }
 
+func TestValidateIdempotencyConfigUsesDomainCandidateBounds(t *testing.T) {
+	config := idempotencyConfig()
+	config.LookupKeys = make([]requestapp.VersionedKey, domain.MaxLookupCandidates)
+	for i := range config.LookupKeys {
+		config.LookupKeys[i] = requestapp.VersionedKey{
+			Version: uint32(i + 1),
+			Key:     []byte("lookup-key-32-bytes-long-value!!"),
+		}
+	}
+	config.LookupWriteVersion = uint32(domain.MaxLookupCandidates)
+	if _, err := requestapp.ValidateIdempotencyConfig(config); err != nil {
+		t.Fatalf("maximum-size keyring rejected: %v", err)
+	}
+	config.LookupKeys = append(config.LookupKeys, requestapp.VersionedKey{
+		Version: uint32(domain.MaxLookupCandidates + 1),
+		Key:     []byte("lookup-key-32-bytes-long-value!!"),
+	})
+	if _, err := requestapp.ValidateIdempotencyConfig(config); err == nil {
+		t.Fatal("oversize keyring accepted")
+	}
+}
+
 func TestTransportFailureAfterBodyMayBeSentCreatesAmbiguousDebt(t *testing.T) {
 	scheduler := newRecordingScheduler(t)
 	service, err := requestapp.NewService(scheduler, failingProvider{err: errors.New("connection reset")}, idempotencyConfig(), time.Minute, time.Second)

@@ -38,22 +38,33 @@ type idempotencyDeriver struct {
 }
 
 func newIdempotencyDeriver(config IdempotencyConfig) (idempotencyDeriver, error) {
-	lookup, err := validatedKeys(config.LookupKeys, config.LookupWriteVersion)
-	if err != nil {
-		return idempotencyDeriver{}, err
-	}
-	digests, err := validatedKeys(config.DigestKeys, config.DigestWriteVersion)
+	validated, err := ValidateIdempotencyConfig(config)
 	if err != nil {
 		return idempotencyDeriver{}, err
 	}
 	return idempotencyDeriver{
-		lookupKeys: lookup, lookupWriteVersion: config.LookupWriteVersion,
-		digestKeys: digests, digestWriteVersion: config.DigestWriteVersion,
+		lookupKeys: validated.LookupKeys, lookupWriteVersion: validated.LookupWriteVersion,
+		digestKeys: validated.DigestKeys, digestWriteVersion: validated.DigestWriteVersion,
 	}, nil
 }
 
-func validatedKeys(input []VersionedKey, writeVersion uint32) ([]VersionedKey, error) {
-	if len(input) == 0 || len(input) > 4 || writeVersion == 0 {
+func ValidateIdempotencyConfig(config IdempotencyConfig) (IdempotencyConfig, error) {
+	lookup, err := validatedKeys(config.LookupKeys, config.LookupWriteVersion, domain.MaxLookupCandidates)
+	if err != nil {
+		return IdempotencyConfig{}, err
+	}
+	digests, err := validatedKeys(config.DigestKeys, config.DigestWriteVersion, domain.MaxDigestCandidates)
+	if err != nil {
+		return IdempotencyConfig{}, err
+	}
+	return IdempotencyConfig{
+		LookupKeys: lookup, LookupWriteVersion: config.LookupWriteVersion,
+		DigestKeys: digests, DigestWriteVersion: config.DigestWriteVersion,
+	}, nil
+}
+
+func validatedKeys(input []VersionedKey, writeVersion uint32, maxCandidates int) ([]VersionedKey, error) {
+	if len(input) == 0 || len(input) > maxCandidates || writeVersion == 0 {
 		return nil, errors.New("invalid idempotency keyring")
 	}
 	keys := make([]VersionedKey, len(input))

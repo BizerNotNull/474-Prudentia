@@ -185,6 +185,47 @@ func TestChatPassesBoundedIdempotencyKeyAndRemovesRawHeader(t *testing.T) {
 	}
 }
 
+func TestChatStreamingPassesBoundedIdempotencyKeyAndRemovesRawHeader(t *testing.T) {
+	inferer := &fakeInferer{}
+	handler := newTestHandler(t, inferer)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	request.Header.Set("Idempotency-Key", "client-operation-1")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if string(inferer.idempotencyKey) != "client-operation-1" || inferer.requestID == "" {
+		t.Fatalf("request ID = %q, idempotency key = %q", inferer.requestID, inferer.idempotencyKey)
+	}
+	if request.Header.Get("Idempotency-Key") != "" {
+		t.Fatal("raw idempotency header remained on request")
+	}
+}
+
+func TestChatRejectsInvalidIdempotencyKeys(t *testing.T) {
+	for name, key := range map[string]string{
+		"too long":           strings.Repeat("a", 257),
+		"invalid characters": "contains a space",
+	} {
+		t.Run(name, func(t *testing.T) {
+			inferer := &fakeInferer{}
+			handler := newTestHandler(t, inferer)
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[{"role":"user","content":"hi"}]}`))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+testToken)
+			request.Header.Set("Idempotency-Key", key)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest || inferer.calls != 0 {
+				t.Fatalf("status = %d, calls = %d, body = %s", response.Code, inferer.calls, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestChatRejectsMultipleIdempotencyKeys(t *testing.T) {
 	inferer := &fakeInferer{}
 	handler := newTestHandler(t, inferer)

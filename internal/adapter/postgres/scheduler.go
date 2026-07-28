@@ -108,6 +108,18 @@ func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleComm
 	if err != nil || found {
 		return reservation, err
 	}
+	var lookupWrite domain.IdempotencyLookupCandidate
+	var digestWrite domain.RequestDigestCandidate
+	if cmd.HasIdempotencyKey() {
+		lookupWrite, err = lookupWriteCandidate(cmd)
+		if err != nil {
+			return domain.Reservation{}, err
+		}
+		digestWrite, err = digestWriteCandidate(cmd)
+		if err != nil {
+			return domain.Reservation{}, err
+		}
+	}
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE scheduler_backends
@@ -140,10 +152,8 @@ func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleComm
 	var lookupVersion, digestVersion *uint32
 	var lookupHMAC, requestDigest []byte
 	if cmd.HasIdempotencyKey() {
-		lookup := lookupWriteCandidate(cmd)
-		digest := digestWriteCandidate(cmd)
-		lookupValue, digestValue := lookup.Value(), digest.Value()
-		lookupVersion, digestVersion = new(lookup.Version()), new(digest.Version())
+		lookupValue, digestValue := lookupWrite.Value(), digestWrite.Value()
+		lookupVersion, digestVersion = new(lookupWrite.Version()), new(digestWrite.Version())
 		lookupHMAC, requestDigest = lookupValue[:], digestValue[:]
 	}
 	_, err = tx.Exec(ctx, `
@@ -263,21 +273,21 @@ func lockAndValidateCryptoVersions(ctx context.Context, tx pgx.Tx, cmd domain.Sc
 	return nil
 }
 
-func lookupWriteCandidate(cmd domain.ScheduleCommand) domain.IdempotencyLookupCandidate {
+func lookupWriteCandidate(cmd domain.ScheduleCommand) (domain.IdempotencyLookupCandidate, error) {
 	for _, candidate := range cmd.IdempotencyCandidates() {
 		if candidate.Version() == cmd.LookupWriteVersion() {
-			return candidate
+			return candidate, nil
 		}
 	}
-	panic("validated schedule command has no lookup write candidate")
+	return domain.IdempotencyLookupCandidate{}, domain.ErrInvalidState
 }
 
-func digestWriteCandidate(cmd domain.ScheduleCommand) domain.RequestDigestCandidate {
+func digestWriteCandidate(cmd domain.ScheduleCommand) (domain.RequestDigestCandidate, error) {
 	candidate, ok := digestCandidate(cmd, cmd.DigestWriteVersion())
 	if !ok {
-		panic("validated schedule command has no digest write candidate")
+		return domain.RequestDigestCandidate{}, domain.ErrInvalidState
 	}
-	return candidate
+	return candidate, nil
 }
 
 func digestCandidate(cmd domain.ScheduleCommand, version uint32) (domain.RequestDigestCandidate, bool) {

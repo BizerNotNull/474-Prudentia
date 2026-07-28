@@ -84,19 +84,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	lookupKeys := make([]requestapp.VersionedKey, len(cfg.LookupKeys))
-	for i, key := range cfg.LookupKeys {
-		lookupKeys[i] = requestapp.VersionedKey{Version: key.Version, Key: key.Key}
-	}
-	digestKeys := make([]requestapp.VersionedKey, len(cfg.DigestKeys))
-	for i, key := range cfg.DigestKeys {
-		digestKeys[i] = requestapp.VersionedKey{Version: key.Version, Key: key.Key}
-	}
-	idempotencyConfig := requestapp.IdempotencyConfig{
-		LookupKeys: lookupKeys, LookupWriteVersion: cfg.LookupWriteVersion,
-		DigestKeys: digestKeys, DigestWriteVersion: cfg.DigestWriteVersion,
-	}
-	inference, err := requestapp.NewService(scheduler, provider, idempotencyConfig, 2*time.Minute, 5*time.Second)
+	inference, err := requestapp.NewService(scheduler, provider, cfg.IdempotencyConfig, 2*time.Minute, 5*time.Second)
 	if err != nil {
 		return err
 	}
