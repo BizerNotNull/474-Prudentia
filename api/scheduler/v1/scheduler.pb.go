@@ -174,21 +174,129 @@ func (AmbiguousCause) EnumDescriptor() ([]byte, []int) {
 	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{2}
 }
 
+type IdempotencyLookupCandidate struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PepperVersion uint32                 `protobuf:"varint,1,opt,name=pepper_version,json=pepperVersion,proto3" json:"pepper_version,omitempty"`
+	HmacSha256    []byte                 `protobuf:"bytes,2,opt,name=hmac_sha256,json=hmacSha256,proto3" json:"hmac_sha256,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *IdempotencyLookupCandidate) Reset() {
+	*x = IdempotencyLookupCandidate{}
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IdempotencyLookupCandidate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IdempotencyLookupCandidate) ProtoMessage() {}
+
+func (x *IdempotencyLookupCandidate) ProtoReflect() protoreflect.Message {
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IdempotencyLookupCandidate.ProtoReflect.Descriptor instead.
+func (*IdempotencyLookupCandidate) Descriptor() ([]byte, []int) {
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *IdempotencyLookupCandidate) GetPepperVersion() uint32 {
+	if x != nil {
+		return x.PepperVersion
+	}
+	return 0
+}
+
+func (x *IdempotencyLookupCandidate) GetHmacSha256() []byte {
+	if x != nil {
+		return x.HmacSha256
+	}
+	return nil
+}
+
+type RequestDigestCandidate struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	DigestVersion uint32                 `protobuf:"varint,1,opt,name=digest_version,json=digestVersion,proto3" json:"digest_version,omitempty"`
+	HmacSha256    []byte                 `protobuf:"bytes,2,opt,name=hmac_sha256,json=hmacSha256,proto3" json:"hmac_sha256,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RequestDigestCandidate) Reset() {
+	*x = RequestDigestCandidate{}
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RequestDigestCandidate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RequestDigestCandidate) ProtoMessage() {}
+
+func (x *RequestDigestCandidate) ProtoReflect() protoreflect.Message {
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RequestDigestCandidate.ProtoReflect.Descriptor instead.
+func (*RequestDigestCandidate) Descriptor() ([]byte, []int) {
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *RequestDigestCandidate) GetDigestVersion() uint32 {
+	if x != nil {
+		return x.DigestVersion
+	}
+	return 0
+}
+
+func (x *RequestDigestCandidate) GetHmacSha256() []byte {
+	if x != nil {
+		return x.HmacSha256
+	}
+	return nil
+}
+
 type ScheduleRequest struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	RequestId         string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	AttemptId         string                 `protobuf:"bytes,2,opt,name=attempt_id,json=attemptId,proto3" json:"attempt_id,omitempty"`
-	TenantScope       []byte                 `protobuf:"bytes,3,opt,name=tenant_scope,json=tenantScope,proto3" json:"tenant_scope,omitempty"`
-	Model             string                 `protobuf:"bytes,4,opt,name=model,proto3" json:"model,omitempty"`
-	SlotCost          uint32                 `protobuf:"varint,5,opt,name=slot_cost,json=slotCost,proto3" json:"slot_cost,omitempty"`
-	ExecutionBudgetMs int64                  `protobuf:"varint,6,opt,name=execution_budget_ms,json=executionBudgetMs,proto3" json:"execution_budget_ms,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state                       protoimpl.MessageState        `protogen:"open.v1"`
+	RequestId                   string                        `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	AttemptId                   string                        `protobuf:"bytes,2,opt,name=attempt_id,json=attemptId,proto3" json:"attempt_id,omitempty"`
+	TenantScope                 []byte                        `protobuf:"bytes,3,opt,name=tenant_scope,json=tenantScope,proto3" json:"tenant_scope,omitempty"`
+	IdempotencyLookupCandidates []*IdempotencyLookupCandidate `protobuf:"bytes,4,rep,name=idempotency_lookup_candidates,json=idempotencyLookupCandidates,proto3" json:"idempotency_lookup_candidates,omitempty"`
+	LookupWriteVersion          uint32                        `protobuf:"varint,5,opt,name=lookup_write_version,json=lookupWriteVersion,proto3" json:"lookup_write_version,omitempty"`
+	DigestCandidates            []*RequestDigestCandidate     `protobuf:"bytes,6,rep,name=digest_candidates,json=digestCandidates,proto3" json:"digest_candidates,omitempty"`
+	DigestWriteVersion          uint32                        `protobuf:"varint,7,opt,name=digest_write_version,json=digestWriteVersion,proto3" json:"digest_write_version,omitempty"`
+	Model                       string                        `protobuf:"bytes,8,opt,name=model,proto3" json:"model,omitempty"`
+	SlotCost                    uint32                        `protobuf:"varint,9,opt,name=slot_cost,json=slotCost,proto3" json:"slot_cost,omitempty"`
+	ExecutionBudgetMs           int64                         `protobuf:"varint,10,opt,name=execution_budget_ms,json=executionBudgetMs,proto3" json:"execution_budget_ms,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *ScheduleRequest) Reset() {
 	*x = ScheduleRequest{}
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[0]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -200,7 +308,7 @@ func (x *ScheduleRequest) String() string {
 func (*ScheduleRequest) ProtoMessage() {}
 
 func (x *ScheduleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[0]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -213,7 +321,7 @@ func (x *ScheduleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScheduleRequest.ProtoReflect.Descriptor instead.
 func (*ScheduleRequest) Descriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{0}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *ScheduleRequest) GetRequestId() string {
@@ -235,6 +343,34 @@ func (x *ScheduleRequest) GetTenantScope() []byte {
 		return x.TenantScope
 	}
 	return nil
+}
+
+func (x *ScheduleRequest) GetIdempotencyLookupCandidates() []*IdempotencyLookupCandidate {
+	if x != nil {
+		return x.IdempotencyLookupCandidates
+	}
+	return nil
+}
+
+func (x *ScheduleRequest) GetLookupWriteVersion() uint32 {
+	if x != nil {
+		return x.LookupWriteVersion
+	}
+	return 0
+}
+
+func (x *ScheduleRequest) GetDigestCandidates() []*RequestDigestCandidate {
+	if x != nil {
+		return x.DigestCandidates
+	}
+	return nil
+}
+
+func (x *ScheduleRequest) GetDigestWriteVersion() uint32 {
+	if x != nil {
+		return x.DigestWriteVersion
+	}
+	return 0
 }
 
 func (x *ScheduleRequest) GetModel() string {
@@ -269,7 +405,7 @@ type ReservationRef struct {
 
 func (x *ReservationRef) Reset() {
 	*x = ReservationRef{}
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[1]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -281,7 +417,7 @@ func (x *ReservationRef) String() string {
 func (*ReservationRef) ProtoMessage() {}
 
 func (x *ReservationRef) ProtoReflect() protoreflect.Message {
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[1]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -294,7 +430,7 @@ func (x *ReservationRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReservationRef.ProtoReflect.Descriptor instead.
 func (*ReservationRef) Descriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{1}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *ReservationRef) GetReservationId() string {
@@ -327,7 +463,7 @@ type Reservation struct {
 
 func (x *Reservation) Reset() {
 	*x = Reservation{}
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[2]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -339,7 +475,7 @@ func (x *Reservation) String() string {
 func (*Reservation) ProtoMessage() {}
 
 func (x *Reservation) ProtoReflect() protoreflect.Message {
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[2]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -352,7 +488,7 @@ func (x *Reservation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Reservation.ProtoReflect.Descriptor instead.
 func (*Reservation) Descriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{2}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *Reservation) GetRef() *ReservationRef {
@@ -371,7 +507,7 @@ type ScheduleResponse struct {
 
 func (x *ScheduleResponse) Reset() {
 	*x = ScheduleResponse{}
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[3]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -383,7 +519,7 @@ func (x *ScheduleResponse) String() string {
 func (*ScheduleResponse) ProtoMessage() {}
 
 func (x *ScheduleResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[3]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -396,7 +532,7 @@ func (x *ScheduleResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScheduleResponse.ProtoReflect.Descriptor instead.
 func (*ScheduleResponse) Descriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{3}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ScheduleResponse) GetReservation() *Reservation {
@@ -415,7 +551,7 @@ type PrepareDispatchRequest struct {
 
 func (x *PrepareDispatchRequest) Reset() {
 	*x = PrepareDispatchRequest{}
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[4]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -427,7 +563,7 @@ func (x *PrepareDispatchRequest) String() string {
 func (*PrepareDispatchRequest) ProtoMessage() {}
 
 func (x *PrepareDispatchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[4]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -440,7 +576,7 @@ func (x *PrepareDispatchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrepareDispatchRequest.ProtoReflect.Descriptor instead.
 func (*PrepareDispatchRequest) Descriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{4}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *PrepareDispatchRequest) GetRef() *ReservationRef {
@@ -464,7 +600,7 @@ type WorkloadIdentity struct {
 
 func (x *WorkloadIdentity) Reset() {
 	*x = WorkloadIdentity{}
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[5]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -476,7 +612,7 @@ func (x *WorkloadIdentity) String() string {
 func (*WorkloadIdentity) ProtoMessage() {}
 
 func (x *WorkloadIdentity) ProtoReflect() protoreflect.Message {
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[5]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -489,7 +625,7 @@ func (x *WorkloadIdentity) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkloadIdentity.ProtoReflect.Descriptor instead.
 func (*WorkloadIdentity) Descriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{5}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *WorkloadIdentity) GetCluster() string {
@@ -544,7 +680,7 @@ type DispatchTarget struct {
 
 func (x *DispatchTarget) Reset() {
 	*x = DispatchTarget{}
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[6]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -556,7 +692,7 @@ func (x *DispatchTarget) String() string {
 func (*DispatchTarget) ProtoMessage() {}
 
 func (x *DispatchTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[6]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -569,7 +705,7 @@ func (x *DispatchTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DispatchTarget.ProtoReflect.Descriptor instead.
 func (*DispatchTarget) Descriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{6}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *DispatchTarget) GetEndpoint() string {
@@ -595,7 +731,7 @@ type PrepareDispatchResponse struct {
 
 func (x *PrepareDispatchResponse) Reset() {
 	*x = PrepareDispatchResponse{}
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[7]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -607,7 +743,7 @@ func (x *PrepareDispatchResponse) String() string {
 func (*PrepareDispatchResponse) ProtoMessage() {}
 
 func (x *PrepareDispatchResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[7]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -620,7 +756,7 @@ func (x *PrepareDispatchResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrepareDispatchResponse.ProtoReflect.Descriptor instead.
 func (*PrepareDispatchResponse) Descriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{7}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *PrepareDispatchResponse) GetTarget() *DispatchTarget {
@@ -640,7 +776,7 @@ type GiveUpBeforeDispatchRequest struct {
 
 func (x *GiveUpBeforeDispatchRequest) Reset() {
 	*x = GiveUpBeforeDispatchRequest{}
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[8]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -652,7 +788,7 @@ func (x *GiveUpBeforeDispatchRequest) String() string {
 func (*GiveUpBeforeDispatchRequest) ProtoMessage() {}
 
 func (x *GiveUpBeforeDispatchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[8]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -665,7 +801,7 @@ func (x *GiveUpBeforeDispatchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GiveUpBeforeDispatchRequest.ProtoReflect.Descriptor instead.
 func (*GiveUpBeforeDispatchRequest) Descriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{8}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *GiveUpBeforeDispatchRequest) GetRef() *ReservationRef {
@@ -692,7 +828,7 @@ type FinalizeRequest struct {
 
 func (x *FinalizeRequest) Reset() {
 	*x = FinalizeRequest{}
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[9]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -704,7 +840,7 @@ func (x *FinalizeRequest) String() string {
 func (*FinalizeRequest) ProtoMessage() {}
 
 func (x *FinalizeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[9]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -717,7 +853,7 @@ func (x *FinalizeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FinalizeRequest.ProtoReflect.Descriptor instead.
 func (*FinalizeRequest) Descriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{9}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *FinalizeRequest) GetRef() *ReservationRef {
@@ -744,7 +880,7 @@ type MarkAmbiguousRequest struct {
 
 func (x *MarkAmbiguousRequest) Reset() {
 	*x = MarkAmbiguousRequest{}
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[10]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -756,7 +892,7 @@ func (x *MarkAmbiguousRequest) String() string {
 func (*MarkAmbiguousRequest) ProtoMessage() {}
 
 func (x *MarkAmbiguousRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[10]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -769,7 +905,7 @@ func (x *MarkAmbiguousRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MarkAmbiguousRequest.ProtoReflect.Descriptor instead.
 func (*MarkAmbiguousRequest) Descriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{10}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *MarkAmbiguousRequest) GetRef() *ReservationRef {
@@ -794,7 +930,7 @@ type Empty struct {
 
 func (x *Empty) Reset() {
 	*x = Empty{}
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[11]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -806,7 +942,7 @@ func (x *Empty) String() string {
 func (*Empty) ProtoMessage() {}
 
 func (x *Empty) ProtoReflect() protoreflect.Message {
-	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[11]
+	mi := &file_api_scheduler_v1_scheduler_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -819,23 +955,36 @@ func (x *Empty) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Empty.ProtoReflect.Descriptor instead.
 func (*Empty) Descriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{11}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{13}
 }
 
 var File_api_scheduler_v1_scheduler_proto protoreflect.FileDescriptor
 
 const file_api_scheduler_v1_scheduler_proto_rawDesc = "" +
 	"\n" +
-	" api/scheduler/v1/scheduler.proto\x12\x16prudentia.scheduler.v1\"\xd5\x01\n" +
+	" api/scheduler/v1/scheduler.proto\x12\x16prudentia.scheduler.v1\"d\n" +
+	"\x1aIdempotencyLookupCandidate\x12%\n" +
+	"\x0epepper_version\x18\x01 \x01(\rR\rpepperVersion\x12\x1f\n" +
+	"\vhmac_sha256\x18\x02 \x01(\fR\n" +
+	"hmacSha256\"`\n" +
+	"\x16RequestDigestCandidate\x12%\n" +
+	"\x0edigest_version\x18\x01 \x01(\rR\rdigestVersion\x12\x1f\n" +
+	"\vhmac_sha256\x18\x02 \x01(\fR\n" +
+	"hmacSha256\"\x8e\x04\n" +
 	"\x0fScheduleRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1d\n" +
 	"\n" +
 	"attempt_id\x18\x02 \x01(\tR\tattemptId\x12!\n" +
-	"\ftenant_scope\x18\x03 \x01(\fR\vtenantScope\x12\x14\n" +
-	"\x05model\x18\x04 \x01(\tR\x05model\x12\x1b\n" +
-	"\tslot_cost\x18\x05 \x01(\rR\bslotCost\x12.\n" +
-	"\x13execution_budget_ms\x18\x06 \x01(\x03R\x11executionBudgetMs\"w\n" +
+	"\ftenant_scope\x18\x03 \x01(\fR\vtenantScope\x12v\n" +
+	"\x1didempotency_lookup_candidates\x18\x04 \x03(\v22.prudentia.scheduler.v1.IdempotencyLookupCandidateR\x1bidempotencyLookupCandidates\x120\n" +
+	"\x14lookup_write_version\x18\x05 \x01(\rR\x12lookupWriteVersion\x12[\n" +
+	"\x11digest_candidates\x18\x06 \x03(\v2..prudentia.scheduler.v1.RequestDigestCandidateR\x10digestCandidates\x120\n" +
+	"\x14digest_write_version\x18\a \x01(\rR\x12digestWriteVersion\x12\x14\n" +
+	"\x05model\x18\b \x01(\tR\x05model\x12\x1b\n" +
+	"\tslot_cost\x18\t \x01(\rR\bslotCost\x12.\n" +
+	"\x13execution_budget_ms\x18\n" +
+	" \x01(\x03R\x11executionBudgetMs\"w\n" +
 	"\x0eReservationRef\x12%\n" +
 	"\x0ereservation_id\x18\x01 \x01(\tR\rreservationId\x12\x1e\n" +
 	"\n" +
@@ -906,51 +1055,55 @@ func file_api_scheduler_v1_scheduler_proto_rawDescGZIP() []byte {
 }
 
 var file_api_scheduler_v1_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_api_scheduler_v1_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_api_scheduler_v1_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_api_scheduler_v1_scheduler_proto_goTypes = []any{
 	(GiveUpReason)(0),                   // 0: prudentia.scheduler.v1.GiveUpReason
 	(TerminalProof)(0),                  // 1: prudentia.scheduler.v1.TerminalProof
 	(AmbiguousCause)(0),                 // 2: prudentia.scheduler.v1.AmbiguousCause
-	(*ScheduleRequest)(nil),             // 3: prudentia.scheduler.v1.ScheduleRequest
-	(*ReservationRef)(nil),              // 4: prudentia.scheduler.v1.ReservationRef
-	(*Reservation)(nil),                 // 5: prudentia.scheduler.v1.Reservation
-	(*ScheduleResponse)(nil),            // 6: prudentia.scheduler.v1.ScheduleResponse
-	(*PrepareDispatchRequest)(nil),      // 7: prudentia.scheduler.v1.PrepareDispatchRequest
-	(*WorkloadIdentity)(nil),            // 8: prudentia.scheduler.v1.WorkloadIdentity
-	(*DispatchTarget)(nil),              // 9: prudentia.scheduler.v1.DispatchTarget
-	(*PrepareDispatchResponse)(nil),     // 10: prudentia.scheduler.v1.PrepareDispatchResponse
-	(*GiveUpBeforeDispatchRequest)(nil), // 11: prudentia.scheduler.v1.GiveUpBeforeDispatchRequest
-	(*FinalizeRequest)(nil),             // 12: prudentia.scheduler.v1.FinalizeRequest
-	(*MarkAmbiguousRequest)(nil),        // 13: prudentia.scheduler.v1.MarkAmbiguousRequest
-	(*Empty)(nil),                       // 14: prudentia.scheduler.v1.Empty
+	(*IdempotencyLookupCandidate)(nil),  // 3: prudentia.scheduler.v1.IdempotencyLookupCandidate
+	(*RequestDigestCandidate)(nil),      // 4: prudentia.scheduler.v1.RequestDigestCandidate
+	(*ScheduleRequest)(nil),             // 5: prudentia.scheduler.v1.ScheduleRequest
+	(*ReservationRef)(nil),              // 6: prudentia.scheduler.v1.ReservationRef
+	(*Reservation)(nil),                 // 7: prudentia.scheduler.v1.Reservation
+	(*ScheduleResponse)(nil),            // 8: prudentia.scheduler.v1.ScheduleResponse
+	(*PrepareDispatchRequest)(nil),      // 9: prudentia.scheduler.v1.PrepareDispatchRequest
+	(*WorkloadIdentity)(nil),            // 10: prudentia.scheduler.v1.WorkloadIdentity
+	(*DispatchTarget)(nil),              // 11: prudentia.scheduler.v1.DispatchTarget
+	(*PrepareDispatchResponse)(nil),     // 12: prudentia.scheduler.v1.PrepareDispatchResponse
+	(*GiveUpBeforeDispatchRequest)(nil), // 13: prudentia.scheduler.v1.GiveUpBeforeDispatchRequest
+	(*FinalizeRequest)(nil),             // 14: prudentia.scheduler.v1.FinalizeRequest
+	(*MarkAmbiguousRequest)(nil),        // 15: prudentia.scheduler.v1.MarkAmbiguousRequest
+	(*Empty)(nil),                       // 16: prudentia.scheduler.v1.Empty
 }
 var file_api_scheduler_v1_scheduler_proto_depIdxs = []int32{
-	4,  // 0: prudentia.scheduler.v1.Reservation.ref:type_name -> prudentia.scheduler.v1.ReservationRef
-	5,  // 1: prudentia.scheduler.v1.ScheduleResponse.reservation:type_name -> prudentia.scheduler.v1.Reservation
-	4,  // 2: prudentia.scheduler.v1.PrepareDispatchRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
-	8,  // 3: prudentia.scheduler.v1.DispatchTarget.identity:type_name -> prudentia.scheduler.v1.WorkloadIdentity
-	9,  // 4: prudentia.scheduler.v1.PrepareDispatchResponse.target:type_name -> prudentia.scheduler.v1.DispatchTarget
-	4,  // 5: prudentia.scheduler.v1.GiveUpBeforeDispatchRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
-	0,  // 6: prudentia.scheduler.v1.GiveUpBeforeDispatchRequest.reason:type_name -> prudentia.scheduler.v1.GiveUpReason
-	4,  // 7: prudentia.scheduler.v1.FinalizeRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
-	1,  // 8: prudentia.scheduler.v1.FinalizeRequest.proof:type_name -> prudentia.scheduler.v1.TerminalProof
-	4,  // 9: prudentia.scheduler.v1.MarkAmbiguousRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
-	2,  // 10: prudentia.scheduler.v1.MarkAmbiguousRequest.cause:type_name -> prudentia.scheduler.v1.AmbiguousCause
-	3,  // 11: prudentia.scheduler.v1.SchedulerService.Schedule:input_type -> prudentia.scheduler.v1.ScheduleRequest
-	7,  // 12: prudentia.scheduler.v1.SchedulerService.PrepareDispatch:input_type -> prudentia.scheduler.v1.PrepareDispatchRequest
-	11, // 13: prudentia.scheduler.v1.SchedulerService.GiveUpBeforeDispatch:input_type -> prudentia.scheduler.v1.GiveUpBeforeDispatchRequest
-	12, // 14: prudentia.scheduler.v1.SchedulerService.Finalize:input_type -> prudentia.scheduler.v1.FinalizeRequest
-	13, // 15: prudentia.scheduler.v1.SchedulerService.MarkAmbiguous:input_type -> prudentia.scheduler.v1.MarkAmbiguousRequest
-	6,  // 16: prudentia.scheduler.v1.SchedulerService.Schedule:output_type -> prudentia.scheduler.v1.ScheduleResponse
-	10, // 17: prudentia.scheduler.v1.SchedulerService.PrepareDispatch:output_type -> prudentia.scheduler.v1.PrepareDispatchResponse
-	14, // 18: prudentia.scheduler.v1.SchedulerService.GiveUpBeforeDispatch:output_type -> prudentia.scheduler.v1.Empty
-	14, // 19: prudentia.scheduler.v1.SchedulerService.Finalize:output_type -> prudentia.scheduler.v1.Empty
-	14, // 20: prudentia.scheduler.v1.SchedulerService.MarkAmbiguous:output_type -> prudentia.scheduler.v1.Empty
-	16, // [16:21] is the sub-list for method output_type
-	11, // [11:16] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	3,  // 0: prudentia.scheduler.v1.ScheduleRequest.idempotency_lookup_candidates:type_name -> prudentia.scheduler.v1.IdempotencyLookupCandidate
+	4,  // 1: prudentia.scheduler.v1.ScheduleRequest.digest_candidates:type_name -> prudentia.scheduler.v1.RequestDigestCandidate
+	6,  // 2: prudentia.scheduler.v1.Reservation.ref:type_name -> prudentia.scheduler.v1.ReservationRef
+	7,  // 3: prudentia.scheduler.v1.ScheduleResponse.reservation:type_name -> prudentia.scheduler.v1.Reservation
+	6,  // 4: prudentia.scheduler.v1.PrepareDispatchRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
+	10, // 5: prudentia.scheduler.v1.DispatchTarget.identity:type_name -> prudentia.scheduler.v1.WorkloadIdentity
+	11, // 6: prudentia.scheduler.v1.PrepareDispatchResponse.target:type_name -> prudentia.scheduler.v1.DispatchTarget
+	6,  // 7: prudentia.scheduler.v1.GiveUpBeforeDispatchRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
+	0,  // 8: prudentia.scheduler.v1.GiveUpBeforeDispatchRequest.reason:type_name -> prudentia.scheduler.v1.GiveUpReason
+	6,  // 9: prudentia.scheduler.v1.FinalizeRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
+	1,  // 10: prudentia.scheduler.v1.FinalizeRequest.proof:type_name -> prudentia.scheduler.v1.TerminalProof
+	6,  // 11: prudentia.scheduler.v1.MarkAmbiguousRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
+	2,  // 12: prudentia.scheduler.v1.MarkAmbiguousRequest.cause:type_name -> prudentia.scheduler.v1.AmbiguousCause
+	5,  // 13: prudentia.scheduler.v1.SchedulerService.Schedule:input_type -> prudentia.scheduler.v1.ScheduleRequest
+	9,  // 14: prudentia.scheduler.v1.SchedulerService.PrepareDispatch:input_type -> prudentia.scheduler.v1.PrepareDispatchRequest
+	13, // 15: prudentia.scheduler.v1.SchedulerService.GiveUpBeforeDispatch:input_type -> prudentia.scheduler.v1.GiveUpBeforeDispatchRequest
+	14, // 16: prudentia.scheduler.v1.SchedulerService.Finalize:input_type -> prudentia.scheduler.v1.FinalizeRequest
+	15, // 17: prudentia.scheduler.v1.SchedulerService.MarkAmbiguous:input_type -> prudentia.scheduler.v1.MarkAmbiguousRequest
+	8,  // 18: prudentia.scheduler.v1.SchedulerService.Schedule:output_type -> prudentia.scheduler.v1.ScheduleResponse
+	12, // 19: prudentia.scheduler.v1.SchedulerService.PrepareDispatch:output_type -> prudentia.scheduler.v1.PrepareDispatchResponse
+	16, // 20: prudentia.scheduler.v1.SchedulerService.GiveUpBeforeDispatch:output_type -> prudentia.scheduler.v1.Empty
+	16, // 21: prudentia.scheduler.v1.SchedulerService.Finalize:output_type -> prudentia.scheduler.v1.Empty
+	16, // 22: prudentia.scheduler.v1.SchedulerService.MarkAmbiguous:output_type -> prudentia.scheduler.v1.Empty
+	18, // [18:23] is the sub-list for method output_type
+	13, // [13:18] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_api_scheduler_v1_scheduler_proto_init() }
@@ -964,7 +1117,7 @@ func file_api_scheduler_v1_scheduler_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_scheduler_v1_scheduler_proto_rawDesc), len(file_api_scheduler_v1_scheduler_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   12,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

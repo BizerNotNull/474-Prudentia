@@ -18,11 +18,15 @@ import (
 const testToken = "0123456789abcdef0123456789abcdef"
 
 type fakeInferer struct {
-	calls int
-	err   error
+	calls          int
+	err            error
+	requestID      string
+	idempotencyKey []byte
 }
 
-func (f *fakeInferer) Infer(ctx context.Context, _ domain.AuthorizedRequest, _ domain.ResponseMode, sink publichttp.StreamSink) error {
+func (f *fakeInferer) Infer(ctx context.Context, requestID string, idempotencyKey []byte, _ domain.AuthorizedRequest, _ domain.ResponseMode, sink publichttp.StreamSink) error {
+	f.requestID = requestID
+	f.idempotencyKey = append([]byte(nil), idempotencyKey...)
 	f.calls++
 	if f.err != nil {
 		return f.err
@@ -158,5 +162,40 @@ func TestHealthRoutesReflectState(t *testing.T) {
 		if response.Code != want {
 			t.Errorf("%s status = %d, want %d", path, response.Code, want)
 		}
+	}
+}
+
+func TestChatPassesBoundedIdempotencyKeyAndRemovesRawHeader(t *testing.T) {
+	inferer := &fakeInferer{}
+	handler := newTestHandler(t, inferer)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	request.Header.Set("Idempotency-Key", "client-operation-1")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if string(inferer.idempotencyKey) != "client-operation-1" || inferer.requestID == "" {
+		t.Fatalf("request ID = %q, idempotency key = %q", inferer.requestID, inferer.idempotencyKey)
+	}
+	if request.Header.Get("Idempotency-Key") != "" {
+		t.Fatal("raw idempotency header remained on request")
+	}
+}
+
+func TestChatRejectsMultipleIdempotencyKeys(t *testing.T) {
+	inferer := &fakeInferer{}
+	handler := newTestHandler(t, inferer)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	request.Header.Add("Idempotency-Key", "first")
+	request.Header.Add("Idempotency-Key", "second")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || inferer.calls != 0 {
+		t.Fatalf("status = %d, calls = %d, body = %s", response.Code, inferer.calls, response.Body.String())
 	}
 }

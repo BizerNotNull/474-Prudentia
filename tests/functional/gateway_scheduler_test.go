@@ -28,6 +28,9 @@ type ledgerScheduler struct {
 	state  string
 	ref    domain.ReservationRef
 	target domain.DispatchTarget
+	hasKey bool
+	lookup [32]byte
+	digest [32]byte
 }
 
 func newLedgerScheduler(t *testing.T) *ledgerScheduler {
@@ -47,11 +50,25 @@ func newLedgerScheduler(t *testing.T) *ledgerScheduler {
 	return &ledgerScheduler{ref: ref, target: target}
 }
 
-func (s *ledgerScheduler) Schedule(context.Context, domain.ScheduleCommand) (domain.Reservation, error) {
+func (s *ledgerScheduler) Schedule(_ context.Context, command domain.ScheduleCommand) (domain.Reservation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lookups, digests := command.IdempotencyCandidates(), command.DigestCandidates()
 	if s.state != "" {
-		return domain.Reservation{}, domain.ErrInvalidState
+		if !s.hasKey || len(lookups) != 1 || len(digests) != 1 || lookups[0].Value() != s.lookup {
+			return domain.Reservation{}, domain.ErrInvalidState
+		}
+		if digests[0].Value() != s.digest {
+			return domain.Reservation{}, domain.ErrIdempotencyConflict
+		}
+		if s.state == "reserved" || s.state == "dispatch_authorized" || s.state == "orphaned" {
+			return domain.Reservation{}, domain.ErrRequestInProgress
+		}
+		return domain.Reservation{}, domain.ErrRequestNotReplayable
+	}
+	if len(lookups) == 1 && len(digests) == 1 {
+		s.hasKey = true
+		s.lookup, s.digest = lookups[0].Value(), digests[0].Value()
 	}
 	s.state = "reserved"
 	return domain.NewReservation(s.ref), nil
@@ -87,9 +104,15 @@ func (s *ledgerScheduler) MarkAmbiguous(context.Context, domain.ReservationRef, 
 	return nil
 }
 
-type successfulProvider struct{}
+type successfulProvider struct {
+	mu    sync.Mutex
+	calls int
+}
 
-func (successfulProvider) Infer(ctx context.Context, _ domain.DispatchTarget, _ domain.AuthorizedRequest, sink publichttp.StreamSink) error {
+func (p *successfulProvider) Infer(ctx context.Context, _ domain.DispatchTarget, _ domain.AuthorizedRequest, sink publichttp.StreamSink) error {
+	p.mu.Lock()
+	p.calls++
+	p.mu.Unlock()
 	delta, _ := domain.NewDeltaEvent("scheduled response")
 	usage, _ := domain.NewUsageEvent(domain.Usage{PromptTokens: 2, CompletionTokens: 2, TotalTokens: 4})
 	for _, event := range []domain.StreamEvent{delta, usage, domain.NewTerminalEvent()} {
@@ -121,7 +144,11 @@ func TestGatewayCompletesRequestThroughSchedulerGRPC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inference, err := requestapp.NewService(client, successfulProvider{}, time.Minute, time.Second)
+	provider := &successfulProvider{}
+	inference, err := requestapp.NewService(client, provider, requestapp.IdempotencyConfig{
+		LookupKeys: []requestapp.VersionedKey{{Version: 1, Key: []byte("lookup-key-32-bytes-long-value!!")}}, LookupWriteVersion: 1,
+		DigestKeys: []requestapp.VersionedKey{{Version: 1, Key: []byte("digest-key-32-bytes-long-value!!")}}, DigestWriteVersion: 1,
+	}, time.Minute, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,11 +158,16 @@ func TestGatewayCompletesRequestThroughSchedulerGRPC(t *testing.T) {
 	}
 	handler := publichttp.NewHandler(authenticator, auth.Authorizer{}, inference, publichttp.DefaultLimits()).Routes(http.NotFoundHandler())
 
-	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[{"role":"user","content":"hello"}]}`))
-	request.Header.Set("Authorization", "Bearer 0123456789abcdef0123456789abcdef")
-	request.Header.Set("Content-Type", "application/json")
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
+	makeRequest := func(body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer 0123456789abcdef0123456789abcdef")
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "client-operation-1")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	response := makeRequest(`{"model":"model-a","messages":[{"role":"user","content":"hello"}]}`)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
@@ -151,6 +183,20 @@ func TestGatewayCompletesRequestThroughSchedulerGRPC(t *testing.T) {
 	}
 	if len(payload.Choices) != 1 || payload.Choices[0].Message.Content != "scheduled response" {
 		t.Fatalf("unexpected response: %s", response.Body.String())
+	}
+	replay := makeRequest(`{"model":"model-a","messages":[{"role":"user","content":"hello"}]}`)
+	if replay.Code != http.StatusConflict || !strings.Contains(replay.Body.String(), `"request_not_replayable"`) {
+		t.Fatalf("replay status = %d, body = %s", replay.Code, replay.Body.String())
+	}
+	conflict := makeRequest(`{"model":"model-a","messages":[{"role":"user","content":"different"}]}`)
+	if conflict.Code != http.StatusConflict || !strings.Contains(conflict.Body.String(), `"idempotency_conflict"`) {
+		t.Fatalf("conflict status = %d, body = %s", conflict.Code, conflict.Body.String())
+	}
+	provider.mu.Lock()
+	providerCalls := provider.calls
+	provider.mu.Unlock()
+	if providerCalls != 1 {
+		t.Fatalf("provider calls = %d, want 1", providerCalls)
 	}
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()

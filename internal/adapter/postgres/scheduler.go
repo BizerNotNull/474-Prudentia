@@ -67,15 +67,44 @@ func (s *SchedulerStore) Candidates(ctx context.Context, cmd domain.ScheduleComm
 	return candidates, nil
 }
 
+func (s *SchedulerStore) LookupReservation(ctx context.Context, cmd domain.ScheduleCommand) (domain.Reservation, bool, error) {
+	commandHash := hashCommand(cmd)
+	tenantHash := sha256.Sum256([]byte(cmd.Tenant()))
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return domain.Reservation{}, false, fmt.Errorf("begin idempotency lookup: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if cmd.HasIdempotencyKey() {
+		if err := lockAndValidateCryptoVersions(ctx, tx, cmd, tenantHash); err != nil {
+			return domain.Reservation{}, false, err
+		}
+	}
+	reservation, found, err := s.existingReservation(ctx, tx, cmd, commandHash, tenantHash)
+	if err != nil {
+		return domain.Reservation{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Reservation{}, false, fmt.Errorf("commit idempotency lookup: %w", err)
+	}
+	return reservation, found, nil
+}
+
 func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleCommand, identity domain.WorkloadIdentity) (domain.Reservation, error) {
 	commandHash := hashCommand(cmd)
+	tenantHash := sha256.Sum256([]byte(cmd.Tenant()))
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return domain.Reservation{}, fmt.Errorf("begin reservation: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	reservation, found, err := s.existingReservation(ctx, tx, cmd, commandHash)
+	if cmd.HasIdempotencyKey() {
+		if err := lockAndValidateCryptoVersions(ctx, tx, cmd, tenantHash); err != nil {
+			return domain.Reservation{}, err
+		}
+	}
+	reservation, found, err := s.existingReservation(ctx, tx, cmd, commandHash, tenantHash)
 	if err != nil || found {
 		return reservation, err
 	}
@@ -108,16 +137,26 @@ func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleComm
 		return domain.Reservation{}, err
 	}
 	capabilityHash := domain.CapabilityHash(capability)
-	tenantHash := sha256.Sum256([]byte(cmd.Tenant()))
+	var lookupVersion, digestVersion *uint32
+	var lookupHMAC, requestDigest []byte
+	if cmd.HasIdempotencyKey() {
+		lookup := lookupWriteCandidate(cmd)
+		digest := digestWriteCandidate(cmd)
+		lookupValue, digestValue := lookup.Value(), digest.Value()
+		lookupVersion, digestVersion = new(lookup.Version()), new(digest.Version())
+		lookupHMAC, requestDigest = lookupValue[:], digestValue[:]
+	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO scheduler_reservations (
-			reservation_id, request_id, attempt_id, command_hash, tenant_hash, model, slot_cost,
-			request_generation, cluster, namespace, logical_engine, pod_uid, endpoint_epoch,
-			recovery_epoch, state, capability_ciphertext, capability_hash, execution_deadline)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12,$13,'reserved',$14,$15,clock_timestamp()+($16 * interval '1 millisecond'))`,
-		reservationID, cmd.RequestID(), cmd.AttemptID(), commandHash[:], tenantHash[:], cmd.Model(), cmd.SlotCost(),
-		identity.Cluster(), identity.Namespace(), identity.LogicalEngine(), identity.PodUID(), identity.EndpointEpoch(), identity.RecoveryEpoch(),
-		ciphertext, capabilityHash[:], cmd.ExecutionBudget().Milliseconds())
+			reservation_id, request_id, attempt_id, command_hash, tenant_hash,
+			lookup_version, lookup_hmac, digest_version, request_digest,
+			model, slot_cost, request_generation, cluster, namespace, logical_engine, pod_uid,
+			endpoint_epoch, recovery_epoch, state, capability_ciphertext, capability_hash, execution_deadline)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,$12,$13,$14,$15,$16,$17,'reserved',$18,$19,clock_timestamp()+($20 * interval '1 millisecond'))`,
+		reservationID, cmd.RequestID(), cmd.AttemptID(), commandHash[:], tenantHash[:],
+		lookupVersion, lookupHMAC, digestVersion, requestDigest,
+		cmd.Model(), cmd.SlotCost(), identity.Cluster(), identity.Namespace(), identity.LogicalEngine(), identity.PodUID(),
+		identity.EndpointEpoch(), identity.RecoveryEpoch(), ciphertext, capabilityHash[:], cmd.ExecutionBudget().Milliseconds())
 	if err != nil {
 		return domain.Reservation{}, fmt.Errorf("persist reservation: %w", err)
 	}
@@ -131,20 +170,68 @@ func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleComm
 	return domain.NewReservation(ref), nil
 }
 
-func (s *SchedulerStore) existingReservation(ctx context.Context, tx pgx.Tx, cmd domain.ScheduleCommand, commandHash [32]byte) (domain.Reservation, bool, error) {
-	var id, attempt string
+func (s *SchedulerStore) existingReservation(ctx context.Context, tx pgx.Tx, cmd domain.ScheduleCommand, commandHash, tenantHash [32]byte) (domain.Reservation, bool, error) {
+	var id, attempt, state string
 	var generation uint64
-	var storedHash, ciphertext []byte
-	err := tx.QueryRow(ctx, `SELECT reservation_id, attempt_id, request_generation, command_hash, capability_ciphertext
-		FROM scheduler_reservations WHERE request_id=$1`, cmd.RequestID()).Scan(&id, &attempt, &generation, &storedHash, &ciphertext)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.Reservation{}, false, nil
-	}
-	if err != nil {
-		return domain.Reservation{}, false, fmt.Errorf("recover reservation: %w", err)
-	}
-	if attempt != cmd.AttemptID() || !equalBytes(storedHash, commandHash[:]) {
-		return domain.Reservation{}, false, domain.ErrInvalidState
+	var storedHash, ciphertext, storedDigest []byte
+	var storedDigestVersion *uint32
+	var err error
+	if cmd.HasIdempotencyKey() {
+		matches := 0
+		for _, candidate := range cmd.IdempotencyCandidates() {
+			value := candidate.Value()
+			rowErr := tx.QueryRow(ctx, `SELECT reservation_id, attempt_id, state, request_generation, command_hash,
+				capability_ciphertext, digest_version, request_digest
+				FROM scheduler_reservations
+				WHERE tenant_hash=$1 AND lookup_version=$2 AND lookup_hmac=$3 FOR UPDATE`,
+				tenantHash[:], candidate.Version(), value[:]).
+				Scan(&id, &attempt, &state, &generation, &storedHash, &ciphertext, &storedDigestVersion, &storedDigest)
+			if errors.Is(rowErr, pgx.ErrNoRows) {
+				continue
+			}
+			if rowErr != nil {
+				return domain.Reservation{}, false, fmt.Errorf("lookup idempotent reservation: %w", rowErr)
+			}
+			matches++
+		}
+		if matches == 0 {
+			return domain.Reservation{}, false, nil
+		}
+		if matches != 1 || storedDigestVersion == nil {
+			return domain.Reservation{}, false, domain.ErrInvalidState
+		}
+		digest, ok := digestCandidate(cmd, *storedDigestVersion)
+		if !ok {
+			return domain.Reservation{}, false, domain.ErrInvalidState
+		}
+		digestValue := digest.Value()
+		if !equalBytes(storedDigest, digestValue[:]) {
+			return domain.Reservation{}, false, domain.ErrIdempotencyConflict
+		}
+		if attempt != cmd.AttemptID() {
+			switch state {
+			case "reserved", "dispatch_authorized", "orphaned":
+				return domain.Reservation{}, false, domain.ErrRequestInProgress
+			default:
+				return domain.Reservation{}, false, domain.ErrRequestNotReplayable
+			}
+		}
+		if !equalBytes(storedHash, commandHash[:]) {
+			return domain.Reservation{}, false, domain.ErrInvalidState
+		}
+	} else {
+		err = tx.QueryRow(ctx, `SELECT reservation_id, attempt_id, state, request_generation, command_hash, capability_ciphertext
+			FROM scheduler_reservations WHERE request_id=$1 FOR UPDATE`, cmd.RequestID()).
+			Scan(&id, &attempt, &state, &generation, &storedHash, &ciphertext)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Reservation{}, false, nil
+		}
+		if err != nil {
+			return domain.Reservation{}, false, fmt.Errorf("recover reservation: %w", err)
+		}
+		if attempt != cmd.AttemptID() || !equalBytes(storedHash, commandHash[:]) {
+			return domain.Reservation{}, false, domain.ErrInvalidState
+		}
 	}
 	capability, err := s.decrypt(ciphertext, id)
 	if err != nil {
@@ -155,6 +242,51 @@ func (s *SchedulerStore) existingReservation(ctx context.Context, tx pgx.Tx, cmd
 		return domain.Reservation{}, false, err
 	}
 	return domain.NewReservation(ref), true, nil
+}
+
+func lockAndValidateCryptoVersions(ctx context.Context, tx pgx.Tx, cmd domain.ScheduleCommand, tenantHash [32]byte) error {
+	var lookupWriteVersion, digestWriteVersion uint32
+	if err := tx.QueryRow(ctx, `SELECT lookup_write_version, digest_write_version
+		FROM scheduler_crypto_versions WHERE singleton FOR SHARE`).
+		Scan(&lookupWriteVersion, &digestWriteVersion); err != nil {
+		return fmt.Errorf("read coordinated crypto versions: %w", err)
+	}
+	if lookupWriteVersion != cmd.LookupWriteVersion() || digestWriteVersion != cmd.DigestWriteVersion() {
+		return domain.ErrInvalidState
+	}
+	for _, candidate := range cmd.IdempotencyCandidates() {
+		value := candidate.Value()
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended(encode($1::bytea || $2::bytea, 'hex'), 0))`, tenantHash[:], value[:]); err != nil {
+			return fmt.Errorf("lock idempotency key: %w", err)
+		}
+	}
+	return nil
+}
+
+func lookupWriteCandidate(cmd domain.ScheduleCommand) domain.IdempotencyLookupCandidate {
+	for _, candidate := range cmd.IdempotencyCandidates() {
+		if candidate.Version() == cmd.LookupWriteVersion() {
+			return candidate
+		}
+	}
+	panic("validated schedule command has no lookup write candidate")
+}
+
+func digestWriteCandidate(cmd domain.ScheduleCommand) domain.RequestDigestCandidate {
+	candidate, ok := digestCandidate(cmd, cmd.DigestWriteVersion())
+	if !ok {
+		panic("validated schedule command has no digest write candidate")
+	}
+	return candidate
+}
+
+func digestCandidate(cmd domain.ScheduleCommand, version uint32) (domain.RequestDigestCandidate, bool) {
+	for _, candidate := range cmd.DigestCandidates() {
+		if candidate.Version() == version {
+			return candidate, true
+		}
+	}
+	return domain.RequestDigestCandidate{}, false
 }
 
 func (s *SchedulerStore) PrepareDispatch(ctx context.Context, ref domain.ReservationRef) (domain.DispatchTarget, error) {
@@ -375,7 +507,21 @@ func (s *SchedulerStore) decrypt(ciphertext []byte, reservationID string) ([]byt
 }
 
 func hashCommand(cmd domain.ScheduleCommand) [32]byte {
-	return sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%d\x00%d", cmd.RequestID(), cmd.AttemptID(), cmd.Tenant(), cmd.Model(), cmd.SlotCost(), cmd.ExecutionBudget())))
+	hash := sha256.New()
+	_, _ = fmt.Fprintf(hash, "%s\x00%s\x00%s\x00%s\x00%d\x00%d\x00%d\x00%d",
+		cmd.RequestID(), cmd.AttemptID(), cmd.Tenant(), cmd.Model(), cmd.SlotCost(), cmd.ExecutionBudget(),
+		cmd.LookupWriteVersion(), cmd.DigestWriteVersion())
+	for _, candidate := range cmd.IdempotencyCandidates() {
+		value := candidate.Value()
+		_, _ = fmt.Fprintf(hash, "\x00%d\x00%x", candidate.Version(), value)
+	}
+	for _, candidate := range cmd.DigestCandidates() {
+		value := candidate.Value()
+		_, _ = fmt.Fprintf(hash, "\x00%d\x00%x", candidate.Version(), value)
+	}
+	var result [sha256.Size]byte
+	copy(result[:], hash.Sum(nil))
+	return result
 }
 
 func randomID(prefix string) (string, error) {

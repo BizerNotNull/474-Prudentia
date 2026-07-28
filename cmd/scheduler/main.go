@@ -53,9 +53,10 @@ func run() error {
 	if err := pool.Ping(pingCtx); err != nil {
 		return fmt.Errorf("connect PostgreSQL: %w", err)
 	}
-	var ledgerTable *string
-	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.scheduler_reservations')::text`).Scan(&ledgerTable); err != nil || ledgerTable == nil {
-		return errors.New("scheduler database migration is not applied")
+	var ledgerTable, cryptoVersionTable *string
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.scheduler_reservations')::text,
+		to_regclass('public.scheduler_crypto_versions')::text`).Scan(&ledgerTable, &cryptoVersionTable); err != nil || ledgerTable == nil || cryptoVersionTable == nil {
+		return errors.New("scheduler database migrations are not applied")
 	}
 
 	store, err := postgresadapter.NewSchedulerStore(pool, cfg.CapabilityKey)

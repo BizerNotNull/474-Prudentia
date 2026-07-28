@@ -35,8 +35,32 @@ func (s *Server) Schedule(ctx context.Context, request *schedulerv1.ScheduleRequ
 	if request == nil || request.ExecutionBudgetMs <= 0 {
 		return nil, status.Error(codes.InvalidArgument, "invalid schedule request")
 	}
+	lookupCandidates := make([]domain.IdempotencyLookupCandidate, len(request.IdempotencyLookupCandidates))
+	for i, candidate := range request.IdempotencyLookupCandidates {
+		if candidate == nil {
+			return nil, status.Error(codes.InvalidArgument, "invalid schedule request")
+		}
+		decoded, err := domain.NewIdempotencyLookupCandidate(candidate.PepperVersion, candidate.HmacSha256)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "invalid schedule request")
+		}
+		lookupCandidates[i] = decoded
+	}
+	digestCandidates := make([]domain.RequestDigestCandidate, len(request.DigestCandidates))
+	for i, candidate := range request.DigestCandidates {
+		if candidate == nil {
+			return nil, status.Error(codes.InvalidArgument, "invalid schedule request")
+		}
+		decoded, err := domain.NewRequestDigestCandidate(candidate.DigestVersion, candidate.HmacSha256)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "invalid schedule request")
+		}
+		digestCandidates[i] = decoded
+	}
 	command, err := domain.NewScheduleCommand(domain.ScheduleParams{
 		RequestID: request.RequestId, AttemptID: request.AttemptId, Tenant: string(request.TenantScope),
+		IdempotencyCandidates: lookupCandidates, LookupWriteVersion: request.LookupWriteVersion,
+		DigestCandidates: digestCandidates, DigestWriteVersion: request.DigestWriteVersion,
 		Model: request.Model, SlotCost: request.SlotCost, ExecutionBudget: time.Duration(request.ExecutionBudgetMs) * time.Millisecond,
 	})
 	if err != nil {
@@ -136,6 +160,12 @@ func decodeRef(message *schedulerv1.ReservationRef) (domain.ReservationRef, erro
 
 func encodeError(err error) error {
 	switch {
+	case errors.Is(err, domain.ErrIdempotencyConflict):
+		return status.Error(codes.AlreadyExists, "idempotency key conflicts with request")
+	case errors.Is(err, domain.ErrRequestInProgress):
+		return status.Error(codes.Aborted, "idempotent request is in progress")
+	case errors.Is(err, domain.ErrRequestNotReplayable):
+		return status.Error(codes.NotFound, "idempotent request is not replayable")
 	case errors.Is(err, domain.ErrNoCapacity):
 		return status.Error(codes.ResourceExhausted, "no schedulable capacity")
 	case errors.Is(err, domain.ErrInvalidReference):

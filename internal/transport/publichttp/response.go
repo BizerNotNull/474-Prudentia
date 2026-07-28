@@ -167,6 +167,12 @@ func WritePublicError(w http.ResponseWriter, id string, err error) {
 		w.Header().Set("WWW-Authenticate", "Bearer")
 	case domain.ErrorForbidden:
 		status, code, message = http.StatusForbidden, "forbidden", "The request is not permitted."
+	case domain.ErrorIdempotencyConflict:
+		status, code, message = http.StatusConflict, "idempotency_conflict", "The idempotency key was already used for a different request."
+	case domain.ErrorRequestInProgress:
+		status, code, message = http.StatusConflict, "request_in_progress", "The idempotent request is still in progress."
+	case domain.ErrorRequestNotReplayable:
+		status, code, message = http.StatusConflict, "request_not_replayable", "The completed request has no replayable stored response."
 	case domain.ErrorUnavailable:
 		status, code, message = http.StatusServiceUnavailable, "service_unavailable", "Inference is temporarily unavailable."
 	}

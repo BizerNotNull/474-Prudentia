@@ -15,6 +15,7 @@ type Candidate struct {
 
 type Store interface {
 	Candidates(context.Context, domain.ScheduleCommand) ([]Candidate, error)
+	LookupReservation(context.Context, domain.ScheduleCommand) (domain.Reservation, bool, error)
 	TryReserve(context.Context, domain.ScheduleCommand, domain.WorkloadIdentity) (domain.Reservation, error)
 	PrepareDispatch(context.Context, domain.ReservationRef) (domain.DispatchTarget, error)
 	GiveUpBeforeDispatch(context.Context, domain.ReservationRef, domain.GiveUpReason) error
@@ -64,6 +65,9 @@ func Rank(candidates []Candidate, slotCost uint32) []Candidate {
 }
 
 func (s *Service) Schedule(ctx context.Context, cmd domain.ScheduleCommand) (domain.Reservation, error) {
+	if reservation, found, err := s.store.LookupReservation(ctx, cmd); err != nil || found {
+		return reservation, err
+	}
 	for range s.maxRerankRead {
 		candidates, err := s.store.Candidates(ctx, cmd)
 		if err != nil {
@@ -78,6 +82,9 @@ func (s *Service) Schedule(ctx context.Context, cmd domain.ScheduleCommand) (dom
 				return domain.Reservation{}, err
 			}
 		}
+	}
+	if reservation, found, err := s.store.LookupReservation(ctx, cmd); err != nil || found {
+		return reservation, err
 	}
 	return domain.Reservation{}, domain.ErrNoCapacity
 }

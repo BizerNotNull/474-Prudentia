@@ -36,30 +36,42 @@ func NewNotSentError(cause error) error { return &DispatchError{Cause: cause, No
 type Service struct {
 	scheduler       Scheduler
 	provider        Provider
+	idempotency     idempotencyDeriver
 	executionBudget time.Duration
 	cleanupTimeout  time.Duration
 }
 
-func NewService(scheduler Scheduler, provider Provider, executionBudget, cleanupTimeout time.Duration) (*Service, error) {
+func NewService(scheduler Scheduler, provider Provider, idempotencyConfig IdempotencyConfig, executionBudget, cleanupTimeout time.Duration) (*Service, error) {
 	if scheduler == nil || provider == nil || executionBudget <= 0 || executionBudget > 30*time.Minute || cleanupTimeout <= 0 || cleanupTimeout > 30*time.Second {
 		return nil, errors.New("invalid inference service configuration")
 	}
-	return &Service{scheduler: scheduler, provider: provider, executionBudget: executionBudget, cleanupTimeout: cleanupTimeout}, nil
+	idempotency, err := newIdempotencyDeriver(idempotencyConfig)
+	if err != nil {
+		return nil, err
+	}
+	return &Service{scheduler: scheduler, provider: provider, idempotency: idempotency, executionBudget: executionBudget, cleanupTimeout: cleanupTimeout}, nil
 }
 
-func (s *Service) Infer(ctx context.Context, request domain.AuthorizedRequest, _ domain.ResponseMode, sink publichttp.StreamSink) error {
-	requestID, err := randomID("req_")
+func (s *Service) Infer(ctx context.Context, requestID string, idempotencyKey []byte, request domain.AuthorizedRequest, _ domain.ResponseMode, sink publichttp.StreamSink) error {
+	lookupCandidates, digestCandidates, err := s.idempotency.derive(request, idempotencyKey)
 	if err != nil {
-		return domain.NewPublicError(domain.ErrorInternal)
+		return err
 	}
 	attemptID, err := randomID("att_")
 	if err != nil {
 		return domain.NewPublicError(domain.ErrorInternal)
 	}
-	command, err := domain.NewScheduleCommand(domain.ScheduleParams{
+	params := domain.ScheduleParams{
 		RequestID: requestID, AttemptID: attemptID, Tenant: request.Tenant(), Model: request.Request().Model(),
 		SlotCost: 1, ExecutionBudget: s.executionBudget,
-	})
+	}
+	if len(lookupCandidates) != 0 {
+		params.IdempotencyCandidates = lookupCandidates
+		params.LookupWriteVersion = s.idempotency.lookupWriteVersion
+		params.DigestCandidates = digestCandidates
+		params.DigestWriteVersion = s.idempotency.digestWriteVersion
+	}
+	command, err := domain.NewScheduleCommand(params)
 	if err != nil {
 		return domain.NewPublicError(domain.ErrorInternal)
 	}
@@ -112,6 +124,14 @@ func (s *Service) cleanupAmbiguous(ref domain.ReservationRef, cause domain.Ambig
 }
 
 func publicSchedulingError(err error) error {
+	switch {
+	case errors.Is(err, domain.ErrIdempotencyConflict):
+		return domain.NewPublicError(domain.ErrorIdempotencyConflict)
+	case errors.Is(err, domain.ErrRequestInProgress):
+		return domain.NewPublicError(domain.ErrorRequestInProgress)
+	case errors.Is(err, domain.ErrRequestNotReplayable):
+		return domain.NewPublicError(domain.ErrorRequestNotReplayable)
+	}
 	if errors.Is(err, domain.ErrNoCapacity) || errors.Is(err, domain.ErrStaleTarget) || errors.Is(err, domain.ErrInvalidState) {
 		return domain.NewPublicError(domain.ErrorUnavailable)
 	}
