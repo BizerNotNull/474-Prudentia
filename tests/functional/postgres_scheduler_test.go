@@ -3,6 +3,7 @@ package functional_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -317,6 +318,286 @@ func TestPreDispatchRerankTransactions(t *testing.T) {
 		assertCapacity(t, pool, abandonedBackend.PodUID(), backendCapacity{})
 		assertCapacity(t, pool, authorizedBackend.PodUID(), backendCapacity{orphaned: 2})
 	})
+
+	t.Run("tenant last grant is serialized across scheduler replicas", func(t *testing.T) {
+		resetSchedulerLedger(t, pool)
+		insertTenant(t, pool, "tenant-contended", 2)
+		backendA := testIdentity(t, "pod-tenant-contended-a", 1)
+		backendB := testIdentity(t, "pod-tenant-contended-b", 1)
+		insertBackend(t, pool, backendA)
+		insertBackend(t, pool, backendB)
+		replicaB, err := postgresadapter.NewSchedulerStore(pool, []byte(testCapabilityKey))
+		if err != nil {
+			t.Fatalf("create second scheduler store: %v", err)
+		}
+		commands := []domain.ScheduleCommand{
+			testScheduleCommand(t, "request-tenant-contended-a", "attempt-tenant-contended-a", "tenant-contended"),
+			testScheduleCommand(t, "request-tenant-contended-b", "attempt-tenant-contended-b", "tenant-contended"),
+		}
+		stores := []*postgresadapter.SchedulerStore{store, replicaB}
+		backends := []domain.WorkloadIdentity{backendA, backendB}
+		start := make(chan struct{})
+		results := make([]error, 2)
+		var calls sync.WaitGroup
+		calls.Add(2)
+		for call := range results {
+			go func(call int) {
+				defer calls.Done()
+				<-start
+				_, results[call] = stores[call].TryReserve(ctx, commands[call], backends[call])
+			}(call)
+		}
+		close(start)
+		calls.Wait()
+		successes := 0
+		for _, err := range results {
+			if err == nil {
+				successes++
+			}
+		}
+		if successes != 1 {
+			t.Fatalf("successful tenant grant contenders: got %d, want 1; errors=%v", successes, results)
+		}
+		assertTenantUsage(t, pool, "tenant-contended", 2, 0)
+		if count := admissionGrantCount(t, pool); count != 1 {
+			t.Fatalf("admission grant count: got %d, want 1", count)
+		}
+	})
+
+	t.Run("backend last slot is not oversold", func(t *testing.T) {
+		resetSchedulerLedger(t, pool)
+		backend := testIdentity(t, "pod-slot-contended", 1)
+		insertBackend(t, pool, backend)
+		if _, err := pool.Exec(ctx, `UPDATE scheduler_backends SET admission_limit=2 WHERE pod_uid=$1`, backend.PodUID()); err != nil {
+			t.Fatalf("set last-slot capacity: %v", err)
+		}
+		replicaB, err := postgresadapter.NewSchedulerStore(pool, []byte(testCapabilityKey))
+		if err != nil {
+			t.Fatalf("create second scheduler store: %v", err)
+		}
+		commands := []domain.ScheduleCommand{
+			testScheduleCommand(t, "request-slot-contended-a", "attempt-slot-contended-a", "tenant-a"),
+			testScheduleCommand(t, "request-slot-contended-b", "attempt-slot-contended-b", "tenant-b"),
+		}
+		stores := []*postgresadapter.SchedulerStore{store, replicaB}
+		start := make(chan struct{})
+		results := make([]error, 2)
+		var calls sync.WaitGroup
+		calls.Add(2)
+		for call := range results {
+			go func(call int) {
+				defer calls.Done()
+				<-start
+				_, results[call] = stores[call].TryReserve(ctx, commands[call], backend)
+			}(call)
+		}
+		close(start)
+		calls.Wait()
+		successes := 0
+		for _, err := range results {
+			if err == nil {
+				successes++
+			}
+		}
+		if successes != 1 {
+			t.Fatalf("successful backend contenders: got %d, want 1; errors=%v", successes, results)
+		}
+		assertCapacity(t, pool, backend.PodUID(), backendCapacity{reserved: 2})
+		if count := admissionGrantCount(t, pool); count != 1 {
+			t.Fatalf("admission grant count: got %d, want 1", count)
+		}
+	})
+
+	t.Run("rerank reuses one tenant grant across candidates", func(t *testing.T) {
+		resetSchedulerLedger(t, pool)
+		backends := []domain.WorkloadIdentity{
+			testIdentity(t, "pod-rerank-reuse-a", 1),
+			testIdentity(t, "pod-rerank-reuse-b", 1),
+			testIdentity(t, "pod-rerank-reuse-c", 1),
+		}
+		for _, backend := range backends {
+			insertBackend(t, pool, backend)
+		}
+		command := testScheduleCommand(t, "request-rerank-reuse", "attempt-rerank-reuse", "tenant-a")
+		reservation, err := store.TryReserve(ctx, command, backends[0])
+		if err != nil {
+			t.Fatalf("initial reserve: %v", err)
+		}
+		ref := reservation.Ref()
+		for index := 1; index < len(backends); index++ {
+			if err := store.AbandonBeforeDispatch(ctx, ref, domain.RerankStaleTarget); err != nil {
+				t.Fatalf("abandon candidate %d: %v", index, err)
+			}
+			assertTenantUsage(t, pool, "tenant-a", 2, 0)
+			next, err := store.TryReserve(ctx, command, backends[index])
+			if err != nil {
+				t.Fatalf("reserve candidate %d: %v", index, err)
+			}
+			ref = next.Ref()
+		}
+		assertTenantUsage(t, pool, "tenant-a", 2, 0)
+		if count := admissionGrantCount(t, pool); count != 1 {
+			t.Fatalf("admission grant count: got %d, want 1", count)
+		}
+		assertGrantState(t, pool, ref.ID(), "active_reserved")
+	})
+
+	t.Run("terminal give-up releases tenant and backend exactly once", func(t *testing.T) {
+		resetSchedulerLedger(t, pool)
+		backend := testIdentity(t, "pod-give-up-exact-once", 1)
+		insertBackend(t, pool, backend)
+		reservation, err := store.TryReserve(ctx,
+			testScheduleCommand(t, "request-give-up-exact-once", "attempt-give-up-exact-once", "tenant-a"), backend)
+		if err != nil {
+			t.Fatalf("reserve give-up fixture: %v", err)
+		}
+		ref := reservation.Ref()
+		start := make(chan struct{})
+		results := make([]error, 4)
+		var calls sync.WaitGroup
+		calls.Add(len(results))
+		for call := range results {
+			go func(call int) {
+				defer calls.Done()
+				<-start
+				results[call] = store.GiveUpBeforeDispatch(ctx, ref, domain.GiveUpCanceled)
+			}(call)
+		}
+		close(start)
+		calls.Wait()
+		for call, err := range results {
+			if err != nil {
+				t.Fatalf("give-up call %d: %v", call, err)
+			}
+		}
+		assertCapacity(t, pool, backend.PodUID(), backendCapacity{})
+		assertTenantUsage(t, pool, "tenant-a", 0, 0)
+		assertGrantState(t, pool, ref.ID(), "released")
+	})
+
+	t.Run("ambiguous dispatch moves both contributions to orphaned", func(t *testing.T) {
+		resetSchedulerLedger(t, pool)
+		backend := testIdentity(t, "pod-ambiguous-debt", 1)
+		insertBackend(t, pool, backend)
+		reservation, err := store.TryReserve(ctx,
+			testScheduleCommand(t, "request-ambiguous-debt", "attempt-ambiguous-debt", "tenant-a"), backend)
+		if err != nil {
+			t.Fatalf("reserve ambiguous fixture: %v", err)
+		}
+		ref := reservation.Ref()
+		if _, err := store.PrepareDispatch(ctx, ref); err != nil {
+			t.Fatalf("prepare ambiguous fixture: %v", err)
+		}
+		if err := store.MarkAmbiguous(ctx, ref, domain.AmbiguousTransport); err != nil {
+			t.Fatalf("mark ambiguous: %v", err)
+		}
+		if err := store.MarkAmbiguous(ctx, ref, domain.AmbiguousTransport); err != nil {
+			t.Fatalf("repeat mark ambiguous: %v", err)
+		}
+		assertCapacity(t, pool, backend.PodUID(), backendCapacity{orphaned: 2})
+		assertTenantUsage(t, pool, "tenant-a", 0, 2)
+		assertGrantState(t, pool, ref.ID(), "orphaned")
+	})
+
+	t.Run("another scheduler replica recovers capability and finalizes", func(t *testing.T) {
+		resetSchedulerLedger(t, pool)
+		backend := testIdentity(t, "pod-replica-recovery", 1)
+		insertBackend(t, pool, backend)
+		command := testScheduleCommand(t, "request-replica-recovery", "attempt-replica-recovery", "tenant-a")
+		reservation, err := store.TryReserve(ctx, command, backend)
+		if err != nil {
+			t.Fatalf("reserve on replica A: %v", err)
+		}
+		replicaB, err := postgresadapter.NewSchedulerStore(pool, []byte(testCapabilityKey))
+		if err != nil {
+			t.Fatalf("create replica B: %v", err)
+		}
+		recovered, found, err := replicaB.LookupReservation(ctx, command)
+		if err != nil || !found {
+			t.Fatalf("recover on replica B: found=%v err=%v", found, err)
+		}
+		if !bytes.Equal(recovered.Ref().Capability(), reservation.Ref().Capability()) {
+			t.Fatal("replica B recovered a different capability")
+		}
+		if _, err := replicaB.PrepareDispatch(ctx, recovered.Ref()); err != nil {
+			t.Fatalf("prepare on replica B: %v", err)
+		}
+		if err := replicaB.Finalize(ctx, recovered.Ref(), domain.TerminalProofProviderFinish); err != nil {
+			t.Fatalf("finalize on replica B: %v", err)
+		}
+		assertCapacity(t, pool, backend.PodUID(), backendCapacity{})
+		assertTenantUsage(t, pool, "tenant-a", 0, 0)
+		assertGrantState(t, pool, recovered.Ref().ID(), "released")
+	})
+
+	t.Run("failed reservation stages roll back every contribution", func(t *testing.T) {
+		t.Run("tenant limit", func(t *testing.T) {
+			resetSchedulerLedger(t, pool)
+			insertTenant(t, pool, "tenant-denied", 0)
+			backend := testIdentity(t, "pod-rollback-tenant", 1)
+			insertBackend(t, pool, backend)
+			_, err := store.TryReserve(ctx,
+				testScheduleCommand(t, "request-rollback-tenant", "attempt-rollback-tenant", "tenant-denied"), backend)
+			if !errors.Is(err, domain.ErrNoCapacity) {
+				t.Fatalf("tenant-limit reserve: got %v, want %v", err, domain.ErrNoCapacity)
+			}
+			assertEmptyContributions(t, pool, backend.PodUID(), "tenant-denied")
+		})
+
+		t.Run("backend capacity", func(t *testing.T) {
+			resetSchedulerLedger(t, pool)
+			backend := testIdentity(t, "pod-rollback-capacity", 1)
+			insertBackend(t, pool, backend)
+			if _, err := pool.Exec(ctx, `UPDATE scheduler_backends SET admission_limit=0 WHERE pod_uid=$1`, backend.PodUID()); err != nil {
+				t.Fatalf("close backend admission: %v", err)
+			}
+			_, err := store.TryReserve(ctx,
+				testScheduleCommand(t, "request-rollback-capacity", "attempt-rollback-capacity", "tenant-a"), backend)
+			if !errors.Is(err, domain.ErrNoCapacity) {
+				t.Fatalf("capacity reserve: got %v, want %v", err, domain.ErrNoCapacity)
+			}
+			assertEmptyContributions(t, pool, backend.PodUID(), "tenant-a")
+		})
+
+		for _, failure := range []struct {
+			name  string
+			table string
+		}{
+			{name: "reservation persistence", table: "scheduler_reservations"},
+			{name: "grant persistence", table: "admission_grants"},
+		} {
+			t.Run(failure.name, func(t *testing.T) {
+				resetSchedulerLedger(t, pool)
+				backend := testIdentity(t, "pod-rollback-"+strings.ReplaceAll(failure.name, " ", "-"), 1)
+				insertBackend(t, pool, backend)
+				if _, err := pool.Exec(ctx, `CREATE OR REPLACE FUNCTION fail_scheduler_insert() RETURNS trigger
+					LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected insert failure'; END $$`); err != nil {
+					t.Fatalf("create failure function: %v", err)
+				}
+				triggerName := "fail_" + strings.ReplaceAll(failure.table, "_", "")
+				if _, err := pool.Exec(ctx, fmt.Sprintf(`CREATE TRIGGER %s BEFORE INSERT ON %s
+					FOR EACH ROW EXECUTE FUNCTION fail_scheduler_insert()`, triggerName, failure.table)); err != nil {
+					t.Fatalf("create failure trigger: %v", err)
+				}
+				t.Cleanup(func() {
+					_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, triggerName, failure.table))
+					_, _ = pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS fail_scheduler_insert()`)
+				})
+				_, err := store.TryReserve(ctx,
+					testScheduleCommand(t, "request-"+triggerName, "attempt-"+triggerName, "tenant-a"), backend)
+				if err == nil {
+					t.Fatal("reserve unexpectedly succeeded with injected insert failure")
+				}
+				assertEmptyContributions(t, pool, backend.PodUID(), "tenant-a")
+				if _, err := pool.Exec(ctx, fmt.Sprintf(`DROP TRIGGER %s ON %s`, triggerName, failure.table)); err != nil {
+					t.Fatalf("drop failure trigger: %v", err)
+				}
+				if _, err := pool.Exec(ctx, `DROP FUNCTION fail_scheduler_insert()`); err != nil {
+					t.Fatalf("drop failure function: %v", err)
+				}
+			})
+		}
+	})
 }
 
 func repositoryRoot(t *testing.T) string {
@@ -376,8 +657,21 @@ func testIdentity(t *testing.T, podUID string, endpointEpoch uint64) domain.Work
 
 func resetSchedulerLedger(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	if _, err := pool.Exec(context.Background(), `TRUNCATE scheduler_reservations, scheduler_backends`); err != nil {
+	if _, err := pool.Exec(context.Background(), `TRUNCATE admission_grants, scheduler_reservations, scheduler_backends, tenant_counters`); err != nil {
 		t.Fatalf("reset scheduler ledger: %v", err)
+	}
+	for _, tenant := range []string{"tenant-a", "tenant-b", "tenant-retained"} {
+		insertTenant(t, pool, tenant, 100)
+	}
+}
+
+func insertTenant(t *testing.T, pool *pgxpool.Pool, tenant string, grantLimit int) {
+	t.Helper()
+	tenantHash := sha256.Sum256([]byte(tenant))
+	if _, err := pool.Exec(context.Background(), `INSERT INTO tenant_counters (tenant_hash, grant_limit)
+		VALUES ($1,$2) ON CONFLICT (tenant_hash) DO UPDATE SET grant_limit=EXCLUDED.grant_limit`,
+		tenantHash[:], grantLimit); err != nil {
+		t.Fatalf("insert tenant %q: %v", tenant, err)
 	}
 }
 
@@ -432,6 +726,66 @@ func assertCapacity(t *testing.T, pool *pgxpool.Pool, podUID string, want backen
 	if got := readCapacity(t, pool, podUID); got != want {
 		t.Fatalf("backend %q capacity: got reserved=%d orphaned=%d, want reserved=%d orphaned=%d",
 			podUID, got.reserved, got.orphaned, want.reserved, want.orphaned)
+	}
+}
+
+func assertTenantUsage(t *testing.T, pool *pgxpool.Pool, tenant string, active, orphaned int) {
+	t.Helper()
+	tenantHash := sha256.Sum256([]byte(tenant))
+	var gotActive, gotOrphaned int
+	if err := pool.QueryRow(context.Background(), `SELECT active_grants, orphaned_grants
+		FROM tenant_counters WHERE tenant_hash=$1`, tenantHash[:]).Scan(&gotActive, &gotOrphaned); err != nil {
+		t.Fatalf("read tenant %q usage: %v", tenant, err)
+	}
+	if gotActive != active || gotOrphaned != orphaned {
+		t.Fatalf("tenant %q usage: got active=%d orphaned=%d, want active=%d orphaned=%d",
+			tenant, gotActive, gotOrphaned, active, orphaned)
+	}
+}
+
+func assertGrantState(t *testing.T, pool *pgxpool.Pool, reservationID, want string) {
+	t.Helper()
+	var state string
+	var activeContribution, orphanedContribution int
+	if err := pool.QueryRow(context.Background(), `SELECT state, active_contribution, orphaned_contribution
+		FROM admission_grants WHERE reservation_id=$1`, reservationID).
+		Scan(&state, &activeContribution, &orphanedContribution); err != nil {
+		t.Fatalf("read admission grant for %q: %v", reservationID, err)
+	}
+	if state != want {
+		t.Fatalf("admission grant state: got %q, want %q", state, want)
+	}
+	contribution := activeContribution + orphanedContribution
+	if want == "released" && contribution != 0 {
+		t.Fatalf("released grant contribution: got %d, want 0", contribution)
+	}
+	if want != "released" && contribution != 2 {
+		t.Fatalf("contributing grant total: got %d, want 2", contribution)
+	}
+}
+
+func admissionGrantCount(t *testing.T, pool *pgxpool.Pool) int {
+	t.Helper()
+	var count int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM admission_grants`).Scan(&count); err != nil {
+		t.Fatalf("count admission grants: %v", err)
+	}
+	return count
+}
+
+func assertEmptyContributions(t *testing.T, pool *pgxpool.Pool, podUID, tenant string) {
+	t.Helper()
+	assertCapacity(t, pool, podUID, backendCapacity{})
+	assertTenantUsage(t, pool, tenant, 0, 0)
+	if count := admissionGrantCount(t, pool); count != 0 {
+		t.Fatalf("admission grant count after rollback: got %d, want 0", count)
+	}
+	var reservations int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM scheduler_reservations`).Scan(&reservations); err != nil {
+		t.Fatalf("count reservations after rollback: %v", err)
+	}
+	if reservations != 0 {
+		t.Fatalf("reservation count after rollback: got %d, want 0", reservations)
 	}
 }
 

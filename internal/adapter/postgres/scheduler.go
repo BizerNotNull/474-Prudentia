@@ -122,6 +122,45 @@ func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleComm
 		}
 	}
 
+	var reservationID string
+	var generation uint64
+	err = tx.QueryRow(ctx, `SELECT reservation_id, request_generation
+		FROM scheduler_reservations
+		WHERE request_id=$1 AND tenant_hash=$2 AND command_hash=$3 AND attempt_id=$4
+		  AND state='abandoned_rerank'
+		FOR UPDATE`, cmd.RequestID(), tenantHash[:], commandHash[:], cmd.AttemptID()).Scan(&reservationID, &generation)
+	rerank := err == nil
+	if errors.Is(err, pgx.ErrNoRows) {
+		reservationID, err = randomID("res_")
+		generation = 1
+	} else if err != nil {
+		return domain.Reservation{}, fmt.Errorf("lock rerank reservation: %w", err)
+	} else if generation >= uint64(math.MaxInt64) {
+		return domain.Reservation{}, domain.ErrInvalidState
+	} else {
+		generation++
+	}
+	if err != nil {
+		return domain.Reservation{}, fmt.Errorf("create reservation ID: %w", err)
+	}
+
+	if err := lockTenantCounter(ctx, tx, tenantHash, int(cmd.SlotCost()), !rerank); err != nil {
+		return domain.Reservation{}, err
+	}
+	if rerank {
+		var grantState string
+		var grantCost int
+		var grantTenant []byte
+		if err := tx.QueryRow(ctx, `SELECT state, slot_cost, tenant_hash
+			FROM admission_grants WHERE reservation_id=$1 FOR UPDATE`, reservationID).
+			Scan(&grantState, &grantCost, &grantTenant); err != nil {
+			return domain.Reservation{}, fmt.Errorf("lock retained admission grant: %w", err)
+		}
+		if grantState != "retained_rerank" || grantCost != int(cmd.SlotCost()) || !equalBytes(grantTenant, tenantHash[:]) {
+			return domain.Reservation{}, domain.ErrInvalidState
+		}
+	}
+
 	tag, err := tx.Exec(ctx, `
 		UPDATE scheduler_backends
 		SET reserved_slots = reserved_slots + $7
@@ -137,28 +176,6 @@ func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleComm
 		return domain.Reservation{}, domain.ErrNoCapacity
 	}
 
-	var reservationID string
-	var generation uint64
-	err = tx.QueryRow(ctx, `SELECT reservation_id, request_generation
-		FROM scheduler_reservations
-		WHERE request_id=$1 AND tenant_hash=$2 AND command_hash=$3 AND attempt_id=$4
-		  AND state='abandoned_rerank'
-		FOR UPDATE`, cmd.RequestID(), tenantHash[:], commandHash[:], cmd.AttemptID()).Scan(&reservationID, &generation)
-	rerank := err == nil
-	if errors.Is(err, pgx.ErrNoRows) {
-		reservationID, err = randomID("res_")
-		generation = 1
-	} else if err != nil {
-		return domain.Reservation{}, fmt.Errorf("lock rerank reservation: %w", err)
-	} else {
-		if generation >= uint64(math.MaxInt64) {
-			return domain.Reservation{}, domain.ErrInvalidState
-		}
-		generation++
-	}
-	if err != nil {
-		return domain.Reservation{}, fmt.Errorf("create reservation ID: %w", err)
-	}
 	capability := make([]byte, 32)
 	if _, err := rand.Read(capability); err != nil {
 		return domain.Reservation{}, fmt.Errorf("create reservation capability: %w", err)
@@ -184,6 +201,10 @@ func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleComm
 		if tag.RowsAffected() != 1 {
 			return domain.Reservation{}, domain.ErrNoCapacity
 		}
+		if _, err := tx.Exec(ctx, `UPDATE admission_grants SET state='active_reserved', updated_at=clock_timestamp()
+			WHERE reservation_id=$1 AND state='retained_rerank'`, reservationID); err != nil {
+			return domain.Reservation{}, fmt.Errorf("reactivate retained admission grant: %w", err)
+		}
 	} else {
 		var lookupVersion, digestVersion *uint32
 		var lookupHMAC, requestDigest []byte
@@ -206,6 +227,13 @@ func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleComm
 		if err != nil {
 			return domain.Reservation{}, fmt.Errorf("persist reservation: %w", err)
 		}
+		if _, err := tx.Exec(ctx, `INSERT INTO admission_grants (
+			grant_id, request_id, reservation_id, tenant_hash, slot_cost, state, execution_deadline, classification_after)
+			SELECT $1, request_id, reservation_id, tenant_hash, slot_cost, 'active_reserved',
+			       execution_deadline, execution_deadline
+			FROM scheduler_reservations WHERE reservation_id=$2`, "grant_"+reservationID, reservationID); err != nil {
+			return domain.Reservation{}, fmt.Errorf("persist admission grant: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.Reservation{}, fmt.Errorf("commit reservation: %w", err)
@@ -215,7 +243,6 @@ func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleComm
 		return domain.Reservation{}, err
 	}
 	return domain.NewReservation(ref), nil
-
 }
 
 func (s *SchedulerStore) existingReservation(ctx context.Context, tx pgx.Tx, cmd domain.ScheduleCommand, commandHash, tenantHash [32]byte) (domain.Reservation, bool, error) {
@@ -342,7 +369,7 @@ func digestCandidate(cmd domain.ScheduleCommand, version uint32) (domain.Request
 }
 
 func (s *SchedulerStore) PrepareDispatch(ctx context.Context, ref domain.ReservationRef) (domain.DispatchTarget, error) {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return domain.DispatchTarget{}, fmt.Errorf("begin dispatch authorization: %w", err)
 	}
@@ -394,7 +421,7 @@ func (s *SchedulerStore) AbandonBeforeDispatch(ctx context.Context, ref domain.R
 	if reason != domain.RerankStaleTarget {
 		return domain.ErrInvalidState
 	}
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("begin rerank abandonment: %w", err)
 	}
@@ -408,6 +435,9 @@ func (s *SchedulerStore) AbandonBeforeDispatch(ctx context.Context, ref domain.R
 	}
 	if row.state != "reserved" {
 		return domain.ErrInvalidState
+	}
+	if err := transitionGrant(ctx, tx, row, "active_reserved", "retained_rerank", grantCounterUnchanged); err != nil {
+		return err
 	}
 	if err := updateBackendCapacity(ctx, tx, row, 0); err != nil {
 		return err
@@ -427,7 +457,7 @@ func (s *SchedulerStore) GiveUpBeforeDispatch(ctx context.Context, ref domain.Re
 	if reason < domain.GiveUpCanceled || reason > domain.GiveUpReranksExhausted {
 		return domain.ErrInvalidState
 	}
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("begin pre-dispatch give-up: %w", err)
 	}
@@ -441,6 +471,13 @@ func (s *SchedulerStore) GiveUpBeforeDispatch(ctx context.Context, ref domain.Re
 	}
 	if row.state != "reserved" && row.state != "abandoned_rerank" {
 		return domain.ErrInvalidState
+	}
+	grantState := "active_reserved"
+	if row.state == "abandoned_rerank" {
+		grantState = "retained_rerank"
+	}
+	if err := transitionGrant(ctx, tx, row, grantState, "released", grantCounterRelease); err != nil {
+		return err
 	}
 	if row.state == "reserved" {
 		if err := updateBackendCapacity(ctx, tx, row, 0); err != nil {
@@ -481,12 +518,12 @@ func (s *SchedulerStore) ClassifyExpired(ctx context.Context, limit int) (int, e
 		return 0, fmt.Errorf("begin reservation classification: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `SELECT reservation_id, state, cluster, namespace, logical_engine, pod_uid, endpoint_epoch, recovery_epoch, slot_cost
+	rows, err := tx.Query(ctx, `SELECT reservation_id, state, cluster, namespace, logical_engine, pod_uid,
+		       endpoint_epoch, recovery_epoch, slot_cost, tenant_hash
 		FROM scheduler_reservations
 		WHERE state IN ('reserved','abandoned_rerank','dispatch_authorized') AND execution_deadline <= clock_timestamp()
 		ORDER BY execution_deadline, reservation_id
 		FOR UPDATE SKIP LOCKED LIMIT $1`, limit)
-
 	if err != nil {
 		return 0, fmt.Errorf("select expired reservations: %w", err)
 	}
@@ -497,10 +534,12 @@ func (s *SchedulerStore) ClassifyExpired(ctx context.Context, limit int) (int, e
 	expired := make([]expiredReservation, 0, limit)
 	for rows.Next() {
 		var item expiredReservation
-		if err := rows.Scan(&item.id, &item.row.state, &item.row.cluster, &item.row.namespace, &item.row.engine, &item.row.podUID, &item.row.endpointEpoch, &item.row.recoveryEpoch, &item.row.slotCost); err != nil {
+		if err := rows.Scan(&item.id, &item.row.state, &item.row.cluster, &item.row.namespace, &item.row.engine,
+			&item.row.podUID, &item.row.endpointEpoch, &item.row.recoveryEpoch, &item.row.slotCost, &item.row.tenantHash); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("scan expired reservation: %w", err)
 		}
+		item.row.reservationID = item.id
 		expired = append(expired, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -510,10 +549,22 @@ func (s *SchedulerStore) ClassifyExpired(ctx context.Context, limit int) (int, e
 	rows.Close()
 	for _, item := range expired {
 		terminal := "given_up"
+		grantFrom := "active_reserved"
+		counterEffect := grantCounterRelease
 		orphanDelta := 0
 		if item.row.state == "dispatch_authorized" {
 			terminal = "orphaned"
+			counterEffect = grantCounterOrphan
 			orphanDelta = item.row.slotCost
+		} else if item.row.state == "abandoned_rerank" {
+			grantFrom = "retained_rerank"
+		}
+		grantTo := "released"
+		if terminal == "orphaned" {
+			grantTo = "orphaned"
+		}
+		if err := transitionGrant(ctx, tx, item.row, grantFrom, grantTo, counterEffect); err != nil {
+			return 0, err
 		}
 		if item.row.state != "abandoned_rerank" {
 			if err := updateBackendCapacity(ctx, tx, item.row, orphanDelta); err != nil {
@@ -531,7 +582,7 @@ func (s *SchedulerStore) ClassifyExpired(ctx context.Context, limit int) (int, e
 }
 
 func (s *SchedulerStore) release(ctx context.Context, ref domain.ReservationRef, terminal string, debt bool, allowed string) error {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("begin reservation transition: %w", err)
 	}
@@ -547,8 +598,15 @@ func (s *SchedulerStore) release(ctx context.Context, ref domain.ReservationRef,
 		return domain.ErrInvalidState
 	}
 	orphanDelta := 0
+	grantState := "released"
+	counterEffect := grantCounterRelease
 	if debt {
 		orphanDelta = row.slotCost
+		grantState = "orphaned"
+		counterEffect = grantCounterOrphan
+	}
+	if err := transitionGrant(ctx, tx, row, "active_reserved", grantState, counterEffect); err != nil {
+		return err
 	}
 	if err := updateBackendCapacity(ctx, tx, row, orphanDelta); err != nil {
 		return err
@@ -558,6 +616,91 @@ func (s *SchedulerStore) release(ctx context.Context, ref domain.ReservationRef,
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit reservation transition: %w", err)
+	}
+	return nil
+}
+
+type grantCounterEffect uint8
+
+const (
+	grantCounterUnchanged grantCounterEffect = iota
+	grantCounterRelease
+	grantCounterOrphan
+)
+
+func lockTenantCounter(ctx context.Context, tx pgx.Tx, tenantHash [32]byte, slotCost int, increment bool) error {
+	var grantLimit, activeGrants, orphanedGrants int
+	err := tx.QueryRow(ctx, `SELECT grant_limit, active_grants, orphaned_grants
+		FROM tenant_counters WHERE tenant_hash=$1 FOR UPDATE`, tenantHash[:]).
+		Scan(&grantLimit, &activeGrants, &orphanedGrants)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrNoCapacity
+	}
+	if err != nil {
+		return fmt.Errorf("lock tenant counter: %w", err)
+	}
+	if !increment {
+		return nil
+	}
+	if slotCost > grantLimit-activeGrants-orphanedGrants {
+		return domain.ErrNoCapacity
+	}
+	if _, err := tx.Exec(ctx, `UPDATE tenant_counters
+		SET active_grants=active_grants+$2, version=version+1 WHERE tenant_hash=$1`,
+		tenantHash[:], slotCost); err != nil {
+		return fmt.Errorf("reserve tenant admission grant: %w", err)
+	}
+	return nil
+}
+
+func transitionGrant(ctx context.Context, tx pgx.Tx, row reservationRow, from, to string, effect grantCounterEffect) error {
+	var activeGrants, orphanedGrants int
+	if err := tx.QueryRow(ctx, `SELECT active_grants, orphaned_grants
+		FROM tenant_counters WHERE tenant_hash=$1 FOR UPDATE`, row.tenantHash).
+		Scan(&activeGrants, &orphanedGrants); err != nil {
+		return fmt.Errorf("lock tenant contribution: %w", err)
+	}
+	var state string
+	var slotCost int
+	var tenantHash []byte
+	if err := tx.QueryRow(ctx, `SELECT state, slot_cost, tenant_hash
+		FROM admission_grants WHERE reservation_id=$1 FOR UPDATE`, row.reservationID).
+		Scan(&state, &slotCost, &tenantHash); err != nil {
+		return fmt.Errorf("lock admission grant: %w", err)
+	}
+	if state != from || slotCost != row.slotCost || !equalBytes(tenantHash, row.tenantHash) {
+		return domain.ErrInvalidState
+	}
+	switch effect {
+	case grantCounterUnchanged:
+	case grantCounterRelease:
+		if activeGrants < slotCost {
+			return domain.ErrInvalidState
+		}
+		if _, err := tx.Exec(ctx, `UPDATE tenant_counters
+			SET active_grants=active_grants-$2, version=version+1 WHERE tenant_hash=$1`,
+			row.tenantHash, slotCost); err != nil {
+			return fmt.Errorf("release tenant contribution: %w", err)
+		}
+	case grantCounterOrphan:
+		if activeGrants < slotCost {
+			return domain.ErrInvalidState
+		}
+		if _, err := tx.Exec(ctx, `UPDATE tenant_counters
+			SET active_grants=active_grants-$2, orphaned_grants=orphaned_grants+$2, version=version+1
+			WHERE tenant_hash=$1`, row.tenantHash, slotCost); err != nil {
+			return fmt.Errorf("orphan tenant contribution: %w", err)
+		}
+	default:
+		return domain.ErrInvalidState
+	}
+	tag, err := tx.Exec(ctx, `UPDATE admission_grants SET state=$2, updated_at=clock_timestamp()
+		WHERE reservation_id=$1 AND state=$3`, row.reservationID, to, from)
+	if err != nil {
+		return fmt.Errorf("transition admission grant: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return domain.ErrInvalidState
 	}
 	return nil
 }
@@ -579,6 +722,8 @@ func updateBackendCapacity(ctx context.Context, tx pgx.Tx, row reservationRow, o
 
 type reservationRow struct {
 	state, cluster, namespace, engine, podUID string
+	reservationID                             string
+	tenantHash                                []byte
 	endpointEpoch, recoveryEpoch              uint64
 	slotCost                                  int
 	beforeDeadline                            bool
@@ -588,8 +733,12 @@ func lockReservation(ctx context.Context, tx pgx.Tx, ref domain.ReservationRef) 
 	var row reservationRow
 	var generation uint64
 	var capabilityHash []byte
-	err := tx.QueryRow(ctx, `SELECT state, request_generation, capability_hash, cluster, namespace, logical_engine, pod_uid, endpoint_epoch, recovery_epoch, slot_cost, execution_deadline > clock_timestamp()
-		FROM scheduler_reservations WHERE reservation_id=$1 FOR UPDATE`, ref.ID()).Scan(&row.state, &generation, &capabilityHash, &row.cluster, &row.namespace, &row.engine, &row.podUID, &row.endpointEpoch, &row.recoveryEpoch, &row.slotCost, &row.beforeDeadline)
+	err := tx.QueryRow(ctx, `SELECT state, request_generation, capability_hash, cluster, namespace, logical_engine,
+		       pod_uid, endpoint_epoch, recovery_epoch, slot_cost, execution_deadline > clock_timestamp(), tenant_hash
+		FROM scheduler_reservations WHERE reservation_id=$1 FOR UPDATE`, ref.ID()).
+		Scan(&row.state, &generation, &capabilityHash, &row.cluster, &row.namespace, &row.engine, &row.podUID,
+			&row.endpointEpoch, &row.recoveryEpoch, &row.slotCost, &row.beforeDeadline, &row.tenantHash)
+	row.reservationID = ref.ID()
 	if errors.Is(err, pgx.ErrNoRows) {
 		return reservationRow{}, domain.ErrInvalidReference
 	}
