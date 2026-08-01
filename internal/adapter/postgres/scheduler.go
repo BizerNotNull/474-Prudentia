@@ -94,7 +94,10 @@ func (s *SchedulerStore) LookupReservation(ctx context.Context, cmd domain.Sched
 func (s *SchedulerStore) TryReserve(ctx context.Context, cmd domain.ScheduleCommand, identity domain.WorkloadIdentity) (domain.Reservation, error) {
 	commandHash := hashCommand(cmd)
 	tenantHash := sha256.Sum256([]byte(cmd.Tenant()))
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	// Read Committed is deliberate: the request row, tenant counter/grant, and exact backend row
+	// are locked in that order, so every accounting invariant has a single serialization point.
+	// This prevents write skew and lost updates without surfacing serialization failures to losers.
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return domain.Reservation{}, fmt.Errorf("begin reservation: %w", err)
 	}
@@ -367,6 +370,10 @@ func digestCandidate(cmd domain.ScheduleCommand, version uint32) (domain.Request
 	}
 	return domain.RequestDigestCandidate{}, false
 }
+
+// The mutation methods use Read Committed deliberately. The reservation row serializes state
+// transitions, followed by FOR UPDATE locks on every changed tenant/grant and exact backend row.
+// Conditional counter updates then make duplicate calls exact-once without Serializable retries.
 
 func (s *SchedulerStore) PrepareDispatch(ctx context.Context, ref domain.ReservationRef) (domain.DispatchTarget, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -654,11 +661,13 @@ func lockTenantCounter(ctx context.Context, tx pgx.Tx, tenantHash [32]byte, slot
 }
 
 func transitionGrant(ctx context.Context, tx pgx.Tx, row reservationRow, from, to string, effect grantCounterEffect) error {
-	var activeGrants, orphanedGrants int
-	if err := tx.QueryRow(ctx, `SELECT active_grants, orphaned_grants
-		FROM tenant_counters WHERE tenant_hash=$1 FOR UPDATE`, row.tenantHash).
-		Scan(&activeGrants, &orphanedGrants); err != nil {
-		return fmt.Errorf("lock tenant contribution: %w", err)
+	var activeGrants int
+	if effect != grantCounterUnchanged {
+		if err := tx.QueryRow(ctx, `SELECT active_grants
+			FROM tenant_counters WHERE tenant_hash=$1 FOR UPDATE`, row.tenantHash).
+			Scan(&activeGrants); err != nil {
+			return fmt.Errorf("lock tenant contribution: %w", err)
+		}
 	}
 	var state string
 	var slotCost int

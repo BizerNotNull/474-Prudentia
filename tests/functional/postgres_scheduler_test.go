@@ -350,13 +350,19 @@ func TestPreDispatchRerankTransactions(t *testing.T) {
 		close(start)
 		calls.Wait()
 		successes := 0
-		for _, err := range results {
+		losers := 0
+		for call, err := range results {
 			if err == nil {
 				successes++
+				continue
+			}
+			losers++
+			if !errors.Is(err, domain.ErrNoCapacity) {
+				t.Fatalf("tenant grant contender %d: got %v, want %v", call, err, domain.ErrNoCapacity)
 			}
 		}
-		if successes != 1 {
-			t.Fatalf("successful tenant grant contenders: got %d, want 1; errors=%v", successes, results)
+		if successes != 1 || losers != 1 {
+			t.Fatalf("tenant grant contenders: got successes=%d losers=%d, want 1 each; errors=%v", successes, losers, results)
 		}
 		assertTenantUsage(t, pool, "tenant-contended", 2, 0)
 		if count := admissionGrantCount(t, pool); count != 1 {
@@ -394,17 +400,31 @@ func TestPreDispatchRerankTransactions(t *testing.T) {
 		close(start)
 		calls.Wait()
 		successes := 0
-		for _, err := range results {
+		losers := 0
+		for call, err := range results {
 			if err == nil {
 				successes++
+				continue
+			}
+			losers++
+			if !errors.Is(err, domain.ErrNoCapacity) {
+				t.Fatalf("backend contender %d: got %v, want %v", call, err, domain.ErrNoCapacity)
 			}
 		}
-		if successes != 1 {
-			t.Fatalf("successful backend contenders: got %d, want 1; errors=%v", successes, results)
+		if successes != 1 || losers != 1 {
+			t.Fatalf("backend contenders: got successes=%d losers=%d, want 1 each; errors=%v", successes, losers, results)
 		}
 		assertCapacity(t, pool, backend.PodUID(), backendCapacity{reserved: 2})
 		if count := admissionGrantCount(t, pool); count != 1 {
 			t.Fatalf("admission grant count: got %d, want 1", count)
+		}
+		tenants := []string{"tenant-a", "tenant-b"}
+		for contender, tenant := range tenants {
+			wantActive := 0
+			if results[contender] == nil {
+				wantActive = 2
+			}
+			assertTenantUsage(t, pool, tenant, wantActive, 0)
 		}
 	})
 
