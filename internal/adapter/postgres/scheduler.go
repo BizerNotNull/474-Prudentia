@@ -776,13 +776,23 @@ func lockTenantCounter(ctx context.Context, tx pgx.Tx, tenantHash [32]byte, slot
 }
 
 func transitionGrant(ctx context.Context, tx pgx.Tx, row reservationRow, from, to string, effect grantCounterEffect) error {
-	var activeGrants, orphanedGrants int
-	if effect != grantCounterUnchanged {
-		if err := tx.QueryRow(ctx, `SELECT active_grants, orphaned_grants
+	var contribution int
+	switch effect {
+	case grantCounterUnchanged:
+	case grantCounterRelease, grantCounterOrphan:
+		if err := tx.QueryRow(ctx, `SELECT active_grants
 			FROM tenant_counters WHERE tenant_hash=$1 FOR UPDATE`, row.tenantHash).
-			Scan(&activeGrants, &orphanedGrants); err != nil {
-			return fmt.Errorf("lock tenant contribution: %w", err)
+			Scan(&contribution); err != nil {
+			return fmt.Errorf("lock active tenant contribution: %w", err)
 		}
+	case grantCounterResolveOrphan:
+		if err := tx.QueryRow(ctx, `SELECT orphaned_grants
+			FROM tenant_counters WHERE tenant_hash=$1 FOR UPDATE`, row.tenantHash).
+			Scan(&contribution); err != nil {
+			return fmt.Errorf("lock orphaned tenant contribution: %w", err)
+		}
+	default:
+		return domain.ErrInvalidState
 	}
 	var state string
 	var slotCost int
@@ -801,21 +811,21 @@ func transitionGrant(ctx context.Context, tx pgx.Tx, row reservationRow, from, t
 	switch effect {
 	case grantCounterUnchanged:
 	case grantCounterRelease:
-		if activeGrants < slotCost {
+		if contribution < slotCost {
 			return domain.ErrInvalidState
 		}
 		tag, err = tx.Exec(ctx, `UPDATE tenant_counters
 			SET active_grants=active_grants-$2, version=version+1
 			WHERE tenant_hash=$1 AND active_grants >= $2`, row.tenantHash, slotCost)
 	case grantCounterOrphan:
-		if activeGrants < slotCost {
+		if contribution < slotCost {
 			return domain.ErrInvalidState
 		}
 		tag, err = tx.Exec(ctx, `UPDATE tenant_counters
 			SET active_grants=active_grants-$2, orphaned_grants=orphaned_grants+$2, version=version+1
 			WHERE tenant_hash=$1 AND active_grants >= $2`, row.tenantHash, slotCost)
 	case grantCounterResolveOrphan:
-		if orphanedGrants < slotCost {
+		if contribution < slotCost {
 			return domain.ErrInvalidState
 		}
 		tag, err = tx.Exec(ctx, `UPDATE tenant_counters

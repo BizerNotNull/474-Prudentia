@@ -103,6 +103,45 @@ func TestIdentityGoneDebtResolution(t *testing.T) {
 	}
 }
 
+func TestWorkloadIdentityEqual(t *testing.T) {
+	base := WorkloadIdentityParams{
+		Cluster: "cluster-a", Namespace: "namespace-a", LogicalEngine: "engine-a",
+		PodUID: "pod-uid-a", EndpointEpoch: 3, RecoveryEpoch: 4,
+	}
+	identity, err := NewWorkloadIdentity(base)
+	if err != nil {
+		t.Fatalf("NewWorkloadIdentity: %v", err)
+	}
+	same, err := NewWorkloadIdentity(base)
+	if err != nil {
+		t.Fatalf("NewWorkloadIdentity duplicate: %v", err)
+	}
+	if !identity.Equal(same) {
+		t.Fatal("equal identities did not compare equal")
+	}
+
+	for name, mutate := range map[string]func(*WorkloadIdentityParams){
+		"cluster":        func(p *WorkloadIdentityParams) { p.Cluster = "cluster-b" },
+		"namespace":      func(p *WorkloadIdentityParams) { p.Namespace = "namespace-b" },
+		"logical engine": func(p *WorkloadIdentityParams) { p.LogicalEngine = "engine-b" },
+		"pod uid":        func(p *WorkloadIdentityParams) { p.PodUID = "pod-uid-b" },
+		"endpoint epoch": func(p *WorkloadIdentityParams) { p.EndpointEpoch++ },
+		"recovery epoch": func(p *WorkloadIdentityParams) { p.RecoveryEpoch++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := base
+			mutate(&changed)
+			other, err := NewWorkloadIdentity(changed)
+			if err != nil {
+				t.Fatalf("NewWorkloadIdentity changed: %v", err)
+			}
+			if identity.Equal(other) {
+				t.Fatal("different identities compared equal")
+			}
+		})
+	}
+}
+
 func debtTestIdentity(t *testing.T) WorkloadIdentity {
 	t.Helper()
 	identity, err := NewWorkloadIdentity(WorkloadIdentityParams{

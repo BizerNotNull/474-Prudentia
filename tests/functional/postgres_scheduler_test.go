@@ -1127,26 +1127,28 @@ func assertGrantState(t *testing.T, pool *pgxpool.Pool, reservationID, want stri
 func assertActiveDebt(t *testing.T, pool *pgxpool.Pool, reservationID string, identity domain.WorkloadIdentity, tenant, cause string, slotCost int) {
 	t.Helper()
 	var (
-		debtID, state, gotCause            string
-		tenantHash                         []byte
-		cluster, namespace, engine, podUID string
-		endpointEpoch, recoveryEpoch       uint64
-		gotSlotCost                        int
+		debtID, state, gotCause string
+		tenantHash              []byte
+		identityParams          domain.WorkloadIdentityParams
+		gotSlotCost             int
 	)
 	err := pool.QueryRow(context.Background(), `SELECT debt_id, state, cause, tenant_hash,
 		cluster, namespace, logical_engine, pod_uid, endpoint_epoch, recovery_epoch, slot_cost
 		FROM capacity_debts WHERE reservation_id=$1`, reservationID).
-		Scan(&debtID, &state, &gotCause, &tenantHash, &cluster, &namespace, &engine, &podUID,
-			&endpointEpoch, &recoveryEpoch, &gotSlotCost)
+		Scan(&debtID, &state, &gotCause, &tenantHash, &identityParams.Cluster,
+			&identityParams.Namespace, &identityParams.LogicalEngine, &identityParams.PodUID,
+			&identityParams.EndpointEpoch, &identityParams.RecoveryEpoch, &gotSlotCost)
 	if err != nil {
 		t.Fatalf("read debt for reservation %q: %v", reservationID, err)
 	}
+	gotIdentity, err := domain.NewWorkloadIdentity(identityParams)
+	if err != nil {
+		t.Fatalf("decode debt identity for reservation %q: %v", reservationID, err)
+	}
 	wantTenantHash := sha256.Sum256([]byte(tenant))
 	if debtID != "debt_"+reservationID || state != "active" || gotCause != cause ||
-		!bytes.Equal(tenantHash, wantTenantHash[:]) || cluster != identity.Cluster() ||
-		namespace != identity.Namespace() || engine != identity.LogicalEngine() ||
-		podUID != identity.PodUID() || endpointEpoch != identity.EndpointEpoch() ||
-		recoveryEpoch != identity.RecoveryEpoch() || gotSlotCost != slotCost {
+		!bytes.Equal(tenantHash, wantTenantHash[:]) || !gotIdentity.Equal(identity) ||
+		gotSlotCost != slotCost {
 		t.Fatalf("capacity debt binding mismatch for reservation %q", reservationID)
 	}
 }

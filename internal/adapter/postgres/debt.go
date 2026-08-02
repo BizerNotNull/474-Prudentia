@@ -32,7 +32,7 @@ func (c *ControllerCatalog) ResolveCapacityDebt(ctx context.Context, cmd domain.
 	if err != nil {
 		return err
 	}
-	if debt.reservationID != cmd.ReservationID() || !sameIdentity(debt.identity, identity) {
+	if debt.reservationID != cmd.ReservationID() || !debt.identity.Equal(identity) {
 		return domain.ErrInvalidReference
 	}
 	evidenceHash := proof.EvidenceHash()
@@ -53,8 +53,10 @@ func (c *ControllerCatalog) ResolveCapacityDebt(ctx context.Context, cmd domain.
 	if err != nil {
 		return err
 	}
-	if reservation.state != "orphaned" || !equalBytes(reservation.tenantHash, debt.tenantHash) ||
-		reservation.slotCost != debt.slotCost || !sameReservationIdentity(reservation, debt.identity) {
+	reservationIdentity, err := workloadIdentityFromReservation(reservation)
+	if err != nil || reservation.state != "orphaned" ||
+		!equalBytes(reservation.tenantHash, debt.tenantHash) ||
+		reservation.slotCost != debt.slotCost || !reservationIdentity.Equal(debt.identity) {
 		return domain.ErrInvalidState
 	}
 	if err := transitionGrant(ctx, tx, reservation, "orphaned", "released", grantCounterResolveOrphan); err != nil {
@@ -142,14 +144,13 @@ func decrementBackendOrphanedCapacity(ctx context.Context, tx pgx.Tx, row reserv
 	return nil
 }
 
-func sameIdentity(left, right domain.WorkloadIdentity) bool {
-	return left.Cluster() == right.Cluster() && left.Namespace() == right.Namespace() &&
-		left.LogicalEngine() == right.LogicalEngine() && left.PodUID() == right.PodUID() &&
-		left.EndpointEpoch() == right.EndpointEpoch() && left.RecoveryEpoch() == right.RecoveryEpoch()
-}
-
-func sameReservationIdentity(row reservationRow, identity domain.WorkloadIdentity) bool {
-	return row.cluster == identity.Cluster() && row.namespace == identity.Namespace() &&
-		row.engine == identity.LogicalEngine() && row.podUID == identity.PodUID() &&
-		row.endpointEpoch == identity.EndpointEpoch() && row.recoveryEpoch == identity.RecoveryEpoch()
+func workloadIdentityFromReservation(row reservationRow) (domain.WorkloadIdentity, error) {
+	return domain.NewWorkloadIdentity(domain.WorkloadIdentityParams{
+		Cluster:       row.cluster,
+		Namespace:     row.namespace,
+		LogicalEngine: row.engine,
+		PodUID:        row.podUID,
+		EndpointEpoch: row.endpointEpoch,
+		RecoveryEpoch: row.recoveryEpoch,
+	})
 }
