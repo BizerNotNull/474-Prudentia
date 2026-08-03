@@ -3,7 +3,6 @@ package publichttp
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -38,9 +37,10 @@ func (s *SSESink) Write(ctx context.Context, event domain.StreamEvent) error {
 		return err
 	}
 	if s.terminal {
-		return errors.New("stream already terminated")
+		return domain.NewPublicError(domain.ErrorUnavailable)
 	}
 	var payload any
+	terminal := false
 	switch event.Kind() {
 	case domain.StreamEventDelta:
 		payload = map[string]any{
@@ -49,6 +49,9 @@ func (s *SSESink) Write(ctx context.Context, event domain.StreamEvent) error {
 			"choices": []any{map[string]any{"index": 0, "delta": map[string]string{"content": event.Delta()}, "finish_reason": nil}},
 		}
 	case domain.StreamEventUsage:
+		if !event.HasUsage() {
+			return domain.NewPublicError(domain.ErrorInternal)
+		}
 		payload = map[string]any{
 			"id":      s.id,
 			"object":  "chat.completion.chunk",
@@ -56,16 +59,23 @@ func (s *SSESink) Write(ctx context.Context, event domain.StreamEvent) error {
 			"usage":   event.Usage(),
 		}
 	case domain.StreamEventTerminal:
+		proof, ok := event.TerminalProof()
+		if !ok || proof == domain.TerminalProofNotSent || proof == domain.TerminalProofCompleteNonStreaming {
+			return domain.NewPublicError(domain.ErrorUnavailable)
+		}
 		payload = map[string]any{
 			"id":      s.id,
 			"object":  "chat.completion.chunk",
 			"choices": []any{map[string]any{"index": 0, "delta": map[string]string{}, "finish_reason": "stop"}},
 		}
-		s.terminal = true
+		terminal = true
 	default:
-		return errors.New("unknown stream event")
+		return domain.NewPublicError(domain.ErrorInternal)
 	}
-
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return domain.NewPublicError(domain.ErrorInternal)
+	}
 	if !s.started {
 		s.writer.Header().Set("Content-Type", "text/event-stream")
 		s.writer.Header().Set("Cache-Control", "no-cache")
@@ -73,20 +83,17 @@ func (s *SSESink) Write(ctx context.Context, event domain.StreamEvent) error {
 		s.writer.WriteHeader(http.StatusOK)
 		s.started = true
 	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
 	if _, err := fmt.Fprintf(s.writer, "data: %s\n\n", encoded); err != nil {
 		return err
 	}
-	if s.terminal {
+	if terminal {
 		if _, err := fmt.Fprint(s.writer, "data: [DONE]\n\n"); err != nil {
 			return err
 		}
+		s.terminal = true
 	}
 	s.flusher.Flush()
-	return nil
+	return ctx.Err()
 }
 
 type NonStreamingCollector struct {
@@ -94,8 +101,10 @@ type NonStreamingCollector struct {
 	maxEvents int
 	content   strings.Builder
 	usage     domain.Usage
+	hasUsage  bool
 	events    int
 	terminal  bool
+	proof     domain.TerminalProof
 }
 
 func NewNonStreamingCollector(maxBytes, maxEvents int) *NonStreamingCollector {
@@ -106,20 +115,28 @@ func (c *NonStreamingCollector) Write(ctx context.Context, event domain.StreamEv
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if c.terminal || c.events >= c.maxEvents {
+	if c == nil || c.maxBytes < 0 || c.maxEvents <= 0 || c.terminal || c.events >= c.maxEvents {
 		return domain.NewPublicError(domain.ErrorUnavailable)
 	}
 	c.events++
 	switch event.Kind() {
 	case domain.StreamEventDelta:
-		if len(event.Delta()) > c.maxBytes-c.content.Len() {
+		delta := event.Delta()
+		if len(delta) > c.maxBytes-c.content.Len() {
 			return domain.NewPublicError(domain.ErrorUnavailable)
 		}
-		_, _ = c.content.WriteString(event.Delta())
+		_, _ = c.content.WriteString(delta)
 	case domain.StreamEventUsage:
-		c.usage = event.Usage()
+		if c.hasUsage || !event.HasUsage() {
+			return domain.NewPublicError(domain.ErrorUnavailable)
+		}
+		c.usage, c.hasUsage = event.Usage(), true
 	case domain.StreamEventTerminal:
-		c.terminal = true
+		proof, ok := event.TerminalProof()
+		if !ok || proof == domain.TerminalProofNotSent {
+			return domain.NewPublicError(domain.ErrorUnavailable)
+		}
+		c.proof, c.terminal = proof, true
 	default:
 		return domain.NewPublicError(domain.ErrorInternal)
 	}
@@ -127,18 +144,23 @@ func (c *NonStreamingCollector) Write(ctx context.Context, event domain.StreamEv
 }
 
 type CompletionResult struct {
-	Content string
-	Usage   domain.Usage
+	Content       string
+	Usage         domain.Usage
+	HasUsage      bool
+	TerminalProof domain.TerminalProof
 }
 
 func (c *NonStreamingCollector) Result() (CompletionResult, error) {
-	if !c.terminal {
+	if c == nil || !c.terminal {
 		return CompletionResult{}, domain.NewPublicError(domain.ErrorUnavailable)
 	}
-	return CompletionResult{Content: c.content.String(), Usage: c.usage}, nil
+	return CompletionResult{Content: c.content.String(), Usage: c.usage, HasUsage: c.hasUsage, TerminalProof: c.proof}, nil
 }
 
 func EncodeNonStreaming(w http.ResponseWriter, id, model string, result CompletionResult) error {
+	if w == nil || id == "" || model == "" || result.TerminalProof == domain.TerminalProofNotSent || !result.TerminalProof.Valid() {
+		return domain.NewPublicError(domain.ErrorInternal)
+	}
 	response := map[string]any{
 		"id":     id,
 		"object": "chat.completion",
@@ -148,12 +170,19 @@ func EncodeNonStreaming(w http.ResponseWriter, id, model string, result Completi
 			"message":       map[string]string{"role": "assistant", "content": result.Content},
 			"finish_reason": "stop",
 		}},
-		"usage": result.Usage,
+	}
+	if result.HasUsage {
+		response["usage"] = result.Usage
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return domain.NewPublicError(domain.ErrorInternal)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Request-Id", id)
 	w.WriteHeader(http.StatusOK)
-	return json.NewEncoder(w).Encode(response)
+	_, err = w.Write(append(encoded, '\n'))
+	return err
 }
 
 func WritePublicError(w http.ResponseWriter, id string, err error) {

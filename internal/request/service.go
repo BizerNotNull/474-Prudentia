@@ -25,15 +25,30 @@ type Provider interface {
 	Infer(context.Context, domain.DispatchTarget, domain.AuthorizedRequest, publichttp.StreamSink) error
 }
 
+type DispatchEvidence uint8
+
+const (
+	DispatchEvidenceUnknown DispatchEvidence = iota
+	DispatchEvidenceNotSent
+	DispatchEvidencePossiblySent
+)
+
 type DispatchError struct {
-	Cause   error
-	NotSent bool
+	Cause    error
+	Evidence DispatchEvidence
+	NotSent  bool // retained for source compatibility
 }
 
 func (e *DispatchError) Error() string { return "provider dispatch failed" }
 func (e *DispatchError) Unwrap() error { return e.Cause }
 
-func NewNotSentError(cause error) error { return &DispatchError{Cause: cause, NotSent: true} }
+func NewDispatchError(cause error, evidence DispatchEvidence) error {
+	return &DispatchError{Cause: cause, Evidence: evidence, NotSent: evidence == DispatchEvidenceNotSent}
+}
+
+func NewNotSentError(cause error) error {
+	return NewDispatchError(cause, DispatchEvidenceNotSent)
+}
 
 type Service struct {
 	scheduler       Scheduler
@@ -57,6 +72,13 @@ func NewService(scheduler Scheduler, provider Provider, idempotencyConfig Idempo
 }
 
 func (s *Service) Infer(ctx context.Context, requestID string, idempotencyKey []byte, request domain.AuthorizedRequest, _ domain.ResponseMode, sink publichttp.StreamSink) error {
+	budget := request.Request().ExecutionBudget()
+	if budget <= 0 || budget > s.executionBudget {
+		budget = s.executionBudget
+	}
+	inferCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
 	lookupCandidates, digestCandidates, err := s.idempotency.derive(request, idempotencyKey)
 	if err != nil {
 		return err
@@ -67,13 +89,12 @@ func (s *Service) Infer(ctx context.Context, requestID string, idempotencyKey []
 	}
 	params := domain.ScheduleParams{
 		RequestID: requestID, AttemptID: attemptID, Tenant: request.Tenant(), Model: request.Request().Model(),
-		SlotCost: 1, ExecutionBudget: s.executionBudget,
+		SlotCost: 1, Features: request.Request().Features(), ExecutionBudget: budget,
+		DigestCandidates: digestCandidates, DigestWriteVersion: s.idempotency.digestWriteVersion,
 	}
 	if len(lookupCandidates) != 0 {
 		params.IdempotencyCandidates = lookupCandidates
 		params.LookupWriteVersion = s.idempotency.lookupWriteVersion
-		params.DigestCandidates = digestCandidates
-		params.DigestWriteVersion = s.idempotency.digestWriteVersion
 	}
 	command, err := domain.NewScheduleCommand(params)
 	if err != nil {
@@ -82,38 +103,34 @@ func (s *Service) Infer(ctx context.Context, requestID string, idempotencyKey []
 
 	var ref domain.ReservationRef
 	for reranks := 0; ; {
-		reservation, scheduleErr := s.scheduler.Schedule(ctx, command)
+		reservation, scheduleErr := s.scheduler.Schedule(inferCtx, command)
 		if scheduleErr != nil {
 			if ref.ID() != "" {
-				s.cleanupGiveUp(ref, giveUpReason(ctx, scheduleErr))
+				s.cleanupGiveUp(ref, giveUpReason(inferCtx, scheduleErr))
 			}
 			return publicSchedulingError(scheduleErr)
 		}
 		ref = reservation.Ref()
-		target, prepareErr := s.scheduler.PrepareDispatch(ctx, ref)
+		target, prepareErr := s.scheduler.PrepareDispatch(inferCtx, ref)
 		if prepareErr == nil {
-			if err := s.dispatch(ctx, ref, target, request, sink); err != nil {
-				return err
-			}
-			return nil
+			return s.dispatch(inferCtx, ref, target, request, sink)
 		}
-		if errors.Is(prepareErr, domain.ErrStaleTarget) && ctx.Err() == nil && reranks < maxPreDispatchReranks {
+		if errors.Is(prepareErr, domain.ErrStaleTarget) && inferCtx.Err() == nil && reranks < maxPreDispatchReranks {
 			if err := s.cleanupAbandon(ref, domain.RerankStaleTarget); err == nil {
 				reranks++
 				continue
 			}
 		}
-		s.cleanupGiveUp(ref, giveUpReason(ctx, prepareErr))
+		s.cleanupGiveUp(ref, giveUpReason(inferCtx, prepareErr))
 		return publicSchedulingError(prepareErr)
 	}
 }
 
 func (s *Service) dispatch(ctx context.Context, ref domain.ReservationRef, target domain.DispatchTarget, request domain.AuthorizedRequest, sink publichttp.StreamSink) error {
-
 	if err := s.provider.Infer(ctx, target, request, sink); err != nil {
 		var dispatchErr *DispatchError
-		if errors.As(err, &dispatchErr) && dispatchErr.NotSent {
-			s.cleanupFinalize(ref, domain.TerminalProofNotSent)
+		if errors.As(err, &dispatchErr) && (dispatchErr.Evidence == DispatchEvidenceNotSent || dispatchErr.NotSent) {
+			_ = s.cleanupFinalize(ref, domain.TerminalProofNotSent)
 		} else {
 			s.cleanupAmbiguous(ref, ambiguousCause(ctx, err))
 		}
@@ -126,7 +143,6 @@ func (s *Service) dispatch(ctx context.Context, ref domain.ReservationRef, targe
 		return domain.NewPublicError(domain.ErrorInternal)
 	}
 	return nil
-
 }
 
 func (s *Service) cleanupAbandon(ref domain.ReservationRef, reason domain.RerankReason) error {

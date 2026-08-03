@@ -146,7 +146,11 @@ func authorizedRequest(t *testing.T) domain.AuthorizedRequest {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inference, err := domain.NewInferenceRequest(domain.InferenceRequestParams{Model: "model", Messages: []domain.MessageParams{{Role: "user", Content: "prompt"}}, MaxCompletionTokens: 16})
+	inference, err := domain.NewInferenceRequest(domain.InferenceRequestParams{
+		Model: "model", Messages: []domain.MessageParams{{Role: "user", Content: "prompt"}},
+		MaxCompletionTokens: 16, Priority: domain.PriorityNormal, Features: domain.EmptyFeatureSet(),
+		CachePolicy: domain.CachePolicyDisabled, ExecutionBudget: time.Minute,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,6 +235,21 @@ func TestInferDerivesBoundedCandidatesAndZeroizesRawIdempotencyKey(t *testing.T)
 		if value != 0 {
 			t.Fatalf("raw key byte %d was not zeroized", i)
 		}
+	}
+}
+
+func TestInferIncludesDigestCandidatesWithoutIdempotencyKey(t *testing.T) {
+	scheduler := newRecordingScheduler(t)
+	service, err := requestapp.NewService(scheduler, failingProvider{err: requestapp.NewNotSentError(errors.New("not sent"))}, idempotencyConfig(), time.Minute, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = service.Infer(context.Background(), "req_no_key", nil, authorizedRequest(t), domain.ResponseModeNonStreaming, discardSink{})
+	if scheduler.command.HasIdempotencyKey() || len(scheduler.command.IdempotencyCandidates()) != 0 {
+		t.Fatal("request without key unexpectedly had lookup candidates")
+	}
+	if len(scheduler.command.DigestCandidates()) != 1 || scheduler.command.DigestWriteVersion() != 1 {
+		t.Fatal("request without key did not carry digest candidates")
 	}
 }
 

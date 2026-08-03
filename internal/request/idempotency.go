@@ -22,6 +22,8 @@ type VersionedKey struct {
 	Version uint32
 	Key     []byte
 }
+type LookupPepperKeyring []VersionedKey
+type DigestKeyring []VersionedKey
 
 type IdempotencyConfig struct {
 	LookupKeys         []VersionedKey
@@ -89,44 +91,97 @@ func validatedKeys(input []VersionedKey, writeVersion uint32, maxCandidates int)
 }
 
 func (d idempotencyDeriver) derive(authorized domain.AuthorizedRequest, rawKey []byte) ([]domain.IdempotencyLookupCandidate, []domain.RequestDigestCandidate, error) {
-	if len(rawKey) == 0 {
-		return nil, nil, nil
-	}
 	defer clear(rawKey)
-	if len(rawKey) > maxIdempotencyKeyBytes {
-		return nil, nil, domain.NewPublicError(domain.ErrorInvalidRequest)
-	}
-	for _, value := range rawKey {
-		if value < 0x21 || value > 0x7e {
+	var lookups []domain.IdempotencyLookupCandidate
+	if len(rawKey) != 0 {
+		if len(rawKey) > maxIdempotencyKeyBytes {
 			return nil, nil, domain.NewPublicError(domain.ErrorInvalidRequest)
 		}
-	}
-
-	lookups := make([]domain.IdempotencyLookupCandidate, 0, len(d.lookupKeys))
-	for _, item := range d.lookupKeys {
-		mac := hmac.New(sha256.New, item.Key)
-		_, _ = mac.Write(lookupDomain)
-		writeField(mac, []byte(authorized.Tenant()))
-		_, _ = mac.Write([]byte{0})
-		_, _ = mac.Write(rawKey)
-		candidate, err := domain.NewIdempotencyLookupCandidate(item.Version, mac.Sum(nil))
+		for _, value := range rawKey {
+			if value < 0x21 || value > 0x7e {
+				return nil, nil, domain.NewPublicError(domain.ErrorInvalidRequest)
+			}
+		}
+		var err error
+		lookups, err = deriveLookupCandidates(authorized.TenantScope(), rawKey, d.lookupKeys)
 		if err != nil {
 			return nil, nil, err
 		}
+	}
+	digests, err := deriveDigests(authorized, d.digestKeys)
+	if err != nil {
+		return nil, nil, err
+	}
+	return lookups, digests, nil
+}
+
+// IdempotencyLookupCandidates derives tenant-scoped lookup values and clears
+// the temporary plaintext obtained from key before returning.
+func IdempotencyLookupCandidates(tenant domain.TenantScope, key domain.SecretString, peppers LookupPepperKeyring, write domain.LookupPepperVersion) (domain.LookupCandidateSet, error) {
+	validated, err := validatedKeys([]VersionedKey(peppers), uint32(write), domain.MaxLookupCandidates)
+	if err != nil {
+		return domain.LookupCandidateSet{}, err
+	}
+	raw := key.Bytes()
+	defer clear(raw)
+	if len(raw) == 0 || len(raw) > maxIdempotencyKeyBytes {
+		return domain.LookupCandidateSet{}, domain.NewPublicError(domain.ErrorInvalidRequest)
+	}
+	for _, value := range raw {
+		if value < 0x21 || value > 0x7e {
+			return domain.LookupCandidateSet{}, domain.NewPublicError(domain.ErrorInvalidRequest)
+		}
+	}
+	candidates, err := deriveLookupCandidates(tenant, raw, validated)
+	if err != nil {
+		return domain.LookupCandidateSet{}, err
+	}
+	return domain.NewLookupCandidateSet(candidates, write)
+}
+
+// CanonicalDigests returns a digest for every readable key version regardless
+// of whether the public request supplied an idempotency key.
+func CanonicalDigests(authorized domain.AuthorizedRequest, keys DigestKeyring, write domain.DigestVersion) (domain.DigestSet, error) {
+	validated, err := validatedKeys([]VersionedKey(keys), uint32(write), domain.MaxDigestCandidates)
+	if err != nil {
+		return domain.DigestSet{}, err
+	}
+	candidates, err := deriveDigests(authorized, validated)
+	if err != nil {
+		return domain.DigestSet{}, err
+	}
+	return domain.NewDigestSet(candidates, write)
+}
+
+func deriveLookupCandidates(tenant domain.TenantScope, raw []byte, keys []VersionedKey) ([]domain.IdempotencyLookupCandidate, error) {
+	lookups := make([]domain.IdempotencyLookupCandidate, 0, len(keys))
+	for _, item := range keys {
+		mac := hmac.New(sha256.New, item.Key)
+		_, _ = mac.Write(lookupDomain)
+		_, _ = mac.Write([]byte(tenant.Value()))
+		_, _ = mac.Write([]byte{0})
+		_, _ = mac.Write(raw)
+		candidate, err := domain.NewIdempotencyLookupCandidate(item.Version, mac.Sum(nil))
+		if err != nil {
+			return nil, err
+		}
 		lookups = append(lookups, candidate)
 	}
+	return lookups, nil
+}
 
-	digests := make([]domain.RequestDigestCandidate, 0, len(d.digestKeys))
-	for _, item := range d.digestKeys {
+func deriveDigests(authorized domain.AuthorizedRequest, keys []VersionedKey) ([]domain.RequestDigestCandidate, error) {
+	digests := make([]domain.RequestDigestCandidate, 0, len(keys))
+	for _, item := range keys {
 		mac := hmac.New(sha256.New, item.Key)
 		writeCanonicalRequest(mac, authorized)
 		candidate, err := domain.NewRequestDigestCandidate(item.Version, mac.Sum(nil))
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		digests = append(digests, candidate)
 	}
-	return lookups, digests, nil
+	return digests, nil
 }
 
 func writeCanonicalRequest(target hash.Hash, authorized domain.AuthorizedRequest) {
@@ -135,11 +190,27 @@ func writeCanonicalRequest(target hash.Hash, authorized domain.AuthorizedRequest
 	request := authorized.Request()
 	writeField(target, []byte(request.Model()))
 	writeUint32(target, request.MaxCompletionTokens())
+	writeUint32(target, uint32(request.Priority()))
+	writeUint32(target, uint32(request.CachePolicy()))
+	writeUint32(target, uint32(request.Features().Version()))
+	writeUint64(target, request.Features().Bits())
+	writeUint64(target, uint64(request.ExecutionBudget()))
 	messages := request.Messages()
 	writeUint32(target, uint32(len(messages)))
 	for _, message := range messages {
 		writeField(target, []byte(message.Role()))
 		writeField(target, []byte(message.Content()))
+	}
+	extensions := request.Input().Extensions()
+	names := make([]string, 0, len(extensions))
+	for name := range extensions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	writeUint32(target, uint32(len(names)))
+	for _, name := range names {
+		writeField(target, []byte(name))
+		writeField(target, []byte(extensions[name]))
 	}
 }
 
@@ -151,5 +222,11 @@ func writeField(target hash.Hash, value []byte) {
 func writeUint32(target hash.Hash, value uint32) {
 	var encoded [4]byte
 	binary.BigEndian.PutUint32(encoded[:], value)
+	_, _ = target.Write(encoded[:])
+}
+
+func writeUint64(target hash.Hash, value uint64) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], value)
 	_, _ = target.Write(encoded[:])
 }
