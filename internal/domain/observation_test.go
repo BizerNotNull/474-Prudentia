@@ -105,8 +105,8 @@ func TestStoredStampAndProjectionUpdate(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	structuralSource, _ := NewSourceStamp(SourceStructural, 1, 1)
 	healthSource, _ := NewSourceStamp(SourceRuntimeHealth, 1, 1)
-	structural, _ := NewStoredSourceStamp(structuralSource, now, now.Add(time.Minute))
-	health, _ := NewStoredSourceStamp(healthSource, now, now.Add(time.Minute))
+	structural, _ := NewStoredSourceStamp(StoredSourceStampParams{Source: structuralSource, Identity: identity, Version: 1, AcceptedAt: now, ExpiresAt: now.Add(time.Minute)})
+	health, _ := NewStoredSourceStamp(StoredSourceStampParams{Source: healthSource, Identity: identity, Version: 1, AcceptedAt: now, ExpiresAt: now.Add(time.Minute)})
 	update, err := NewProjectionUpdate(ProjectionUpdateParams{Identity: identity, Structural: structural, Health: health, ConfiguredSlots: 4, AdmissionLimit: 3})
 	if err != nil {
 		t.Fatal(err)

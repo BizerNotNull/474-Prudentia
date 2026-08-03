@@ -76,12 +76,22 @@ type CacheHintKind uint8
 const (
 	CacheMiss CacheHintKind = iota + 1
 	CacheHit
+	CacheCatalog
 )
 
+type CacheHintParams struct {
+	Identity  WorkloadIdentity
+	Digest    [32]byte
+	ExpiresAt time.Time
+}
+
+// CacheHint represents either a verified cache-compatibility hit or a
+// provider-neutral catalog hint. Miss is the explicit empty variant.
 type CacheHint struct {
 	kind      CacheHintKind
 	identity  CacheIdentity
 	source    WorkloadIdentity
+	digest    [32]byte
 	expiresAt time.Time
 }
 
@@ -90,18 +100,29 @@ func NewCacheHit(want, found CacheIdentity, source WorkloadIdentity, expiresAt t
 	if !want.Compatible(found) || source.PodUID() == "" || expiresAt.IsZero() {
 		return CacheHint{}, fmt.Errorf("unverified cache hit")
 	}
-	return CacheHint{CacheHit, found, source, expiresAt}, nil
+	return CacheHint{kind: CacheHit, identity: found, source: source, expiresAt: expiresAt}, nil
+}
+func NewCacheHint(p CacheHintParams) (CacheHint, error) {
+	if !p.Identity.valid() || p.Digest == ([32]byte{}) || p.ExpiresAt.IsZero() {
+		return CacheHint{}, fmt.Errorf("invalid cache hint")
+	}
+	return CacheHint{kind: CacheCatalog, source: p.Identity, digest: p.Digest, expiresAt: p.ExpiresAt}, nil
 }
 func (h CacheHint) Kind() CacheHintKind {
-	if h.kind != CacheHit {
+	if h.kind < CacheMiss || h.kind > CacheCatalog {
 		return CacheMiss
 	}
-	return CacheHit
+	return h.kind
 }
-func (h CacheHint) IsHit() bool                      { return h.kind == CacheHit }
-func (h CacheHint) Identity() (CacheIdentity, bool)  { return h.identity, h.kind == CacheHit }
-func (h CacheHint) Source() (WorkloadIdentity, bool) { return h.source, h.kind == CacheHit }
-func (h CacheHint) ExpiresAt() (time.Time, bool)     { return h.expiresAt, h.kind == CacheHit }
+func (h CacheHint) IsHit() bool                     { return h.kind == CacheHit }
+func (h CacheHint) Identity() (CacheIdentity, bool) { return h.identity, h.kind == CacheHit }
+func (h CacheHint) Source() (WorkloadIdentity, bool) {
+	return h.source, h.kind == CacheHit || h.kind == CacheCatalog
+}
+func (h CacheHint) Digest() [32]byte { return h.digest }
+func (h CacheHint) ExpiresAt() (time.Time, bool) {
+	return h.expiresAt, h.kind == CacheHit || h.kind == CacheCatalog
+}
 func (h CacheHint) ValidFor(id CacheIdentity, at time.Time) bool {
 	return h.kind == CacheHit && h.identity.Compatible(id) && !at.IsZero() && !at.After(h.expiresAt)
 }
