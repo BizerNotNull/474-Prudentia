@@ -33,18 +33,20 @@ const (
 )
 
 type Config struct {
-	Cluster        string
-	Namespace      string
-	LabelSelector  string
-	ProxyPort      uint16
-	ObservationTTL time.Duration
-	ResyncPeriod   time.Duration
-	LeaseNamespace string
-	LeaseName      string
-	Holder         string
-	LeaseDuration  time.Duration
-	RenewDeadline  time.Duration
-	RetryPeriod    time.Duration
+	Cluster              string
+	Namespace            string
+	LabelSelector        string
+	ProxyPort            uint16
+	ObservationTTL       time.Duration
+	ResyncPeriod         time.Duration
+	LeaseNamespace       string
+	LeaseName            string
+	Holder               string
+	LeaseDuration        time.Duration
+	RenewDeadline        time.Duration
+	RetryPeriod          time.Duration
+	MutationCallLifetime time.Duration
+	IdentityFence        IdentityFence
 }
 
 type Adapter struct {
@@ -84,6 +86,10 @@ func New(client kubernetes.Interface, config Config) (*Adapter, error) {
 	}, nil
 }
 
+func (a *Adapter) RunDiscovery(ctx context.Context, sink func(domain.ResourceKey)) error {
+	return a.Run(ctx, sink)
+}
+
 func (a *Adapter) Run(ctx context.Context, sink func(domain.ResourceKey)) error {
 	if sink == nil {
 		return errors.New("nil reconcile sink")
@@ -97,8 +103,19 @@ func (a *Adapter) Run(ctx context.Context, sink func(domain.ResourceKey)) error 
 		return fmt.Errorf("register Pod event handler: %w", err)
 	}
 	a.startOnce.Do(func() { close(a.started) })
-	a.informer.Run(ctx.Done())
-	return nil
+	go a.informer.Run(ctx.Done())
+	ticker := time.NewTicker(a.config.ResyncPeriod)
+	defer ticker.Stop()
+	for {
+		if err := a.enqueueServices(ctx, sink); err != nil && ctx.Err() == nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
 }
 
 func (a *Adapter) WaitForSync(ctx context.Context) error {
@@ -113,15 +130,17 @@ func (a *Adapter) WaitForSync(ctx context.Context) error {
 	return nil
 }
 
-func (a *Adapter) ListKeys(context.Context) ([]domain.ResourceKey, error) {
-	objects := a.informer.GetStore().List()
-	keys := make([]domain.ResourceKey, 0, len(objects))
-	for _, object := range objects {
-		pod, ok := object.(*corev1.Pod)
-		if !ok {
-			return nil, errors.New("Pod informer contained unexpected object")
+func (a *Adapter) ListKeys(ctx context.Context) ([]domain.ResourceKey, error) {
+	services, err := a.client.CoreV1().Services(a.config.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list opted-in Services: %w", err)
+	}
+	keys := make([]domain.ResourceKey, 0, len(services.Items))
+	for _, service := range services.Items {
+		if service.Annotations[annotationEnabled] != "true" || service.Spec.ClusterIP != corev1.ClusterIPNone {
+			continue
 		}
-		key, err := domain.NewResourceKey(pod.Namespace, pod.Name)
+		key, err := domain.NewResourceKey(service.Namespace, service.Name)
 		if err != nil {
 			return nil, err
 		}
@@ -130,7 +149,25 @@ func (a *Adapter) ListKeys(context.Context) ([]domain.ResourceKey, error) {
 	return keys, nil
 }
 
+func (a *Adapter) enqueueServices(ctx context.Context, sink func(domain.ResourceKey)) error {
+	keys, err := a.ListKeys(ctx)
+	if err != nil {
+		return err
+	}
+	for _, key := range keys {
+		sink(key)
+	}
+	return nil
+}
+
 func (a *Adapter) Reconcile(ctx context.Context, key domain.ResourceKey) (domain.ResourceState, error) {
+	if service, err := a.client.CoreV1().Services(key.Namespace()).Get(ctx, key.Name(), metav1.GetOptions{}); err == nil {
+		if service.Annotations[annotationEnabled] == "true" {
+			return a.reconcileService(ctx, key)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return domain.ResourceState{}, fmt.Errorf("read Service level state: %w", err)
+	}
 	pod, err := a.client.CoreV1().Pods(key.Namespace()).Get(ctx, key.Name(), metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
