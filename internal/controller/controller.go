@@ -21,6 +21,17 @@ type Discovery interface {
 	Reconcile(context.Context, domain.ResourceKey) (domain.ResourceState, error)
 }
 
+type NormalizedDiscovery interface {
+	ReadDesired(context.Context, domain.ResourceKey) (domain.DesiredModel, error)
+	ReconcileDiscovery(context.Context, domain.ResourceKey, domain.WriterGeneration) ([]domain.Observation, error)
+	ApplyDesired(context.Context, domain.DesiredModel) (domain.ApplyResult, error)
+}
+
+type ObservationCatalog interface {
+	RecordObservations(context.Context, domain.WriterGeneration, domain.ResourceKey, []domain.Observation) error
+	RecordDesiredApply(context.Context, domain.WriterGeneration, domain.ApplyResult) error
+}
+
 type LeaderElector interface {
 	Elect(context.Context, func(context.Context) error) error
 }
@@ -99,6 +110,22 @@ func (c *Controller) RunLeader(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("relist discovery keys: %w", err)
 	}
+	if ledger, ok := c.catalog.(OperationCatalog); ok {
+		operations, err := ledger.ListIncompleteWorkloadOperations(ctx, generation)
+		if err != nil {
+			return fmt.Errorf("list incomplete workload operations: %w", err)
+		}
+		if len(operations) != 0 {
+			if _, ok := c.source.(WorkloadControl); !ok {
+				return errors.New("incomplete workload operations exist but Kubernetes fencing is unavailable")
+			}
+		}
+		for _, operation := range operations {
+			if _, err := c.FenceWorkloadHandoff(ctx, generation, operation.Scope()); err != nil {
+				return err
+			}
+		}
+	}
 	for _, key := range keys {
 		if err := c.Reconcile(ctx, generation, key); err != nil {
 			return err
@@ -142,6 +169,28 @@ func (c *Controller) RunLeader(ctx context.Context) error {
 }
 
 func (c *Controller) Reconcile(ctx context.Context, generation domain.WriterGeneration, key domain.ResourceKey) error {
+	if source, ok := c.source.(NormalizedDiscovery); ok {
+		observations, err := source.ReconcileDiscovery(ctx, key, generation)
+		if err != nil {
+			return fmt.Errorf("normalize discovery %s: %w", key.String(), err)
+		}
+		desired, err := source.ReadDesired(ctx, key)
+		if err != nil {
+			return fmt.Errorf("read desired state %s: %w", key.String(), err)
+		}
+		if catalog, ok := c.catalog.(ObservationCatalog); ok {
+			if err := catalog.RecordObservations(ctx, generation, key, observations); err != nil {
+				return fmt.Errorf("store normalized observations %s: %w", key.String(), err)
+			}
+			result, err := source.ApplyDesired(ctx, desired)
+			if err != nil {
+				return fmt.Errorf("apply desired state %s: %w", key.String(), err)
+			}
+			if err := catalog.RecordDesiredApply(ctx, generation, result); err != nil {
+				return fmt.Errorf("store desired apply result %s: %w", key.String(), err)
+			}
+		}
+	}
 	state, err := c.source.Reconcile(ctx, key)
 	if err != nil {
 		return fmt.Errorf("reconcile discovery %s: %w", key.String(), err)
