@@ -14,17 +14,33 @@ service SchedulerService {
   rpc MarkAmbiguous(MarkAmbiguousRequest) returns (Empty);
 }
 
+// Candidate counts are bounded to four and hmac_sha256 is exactly 32 bytes.
 message IdempotencyLookupCandidate {
   uint32 pepper_version = 1;
   bytes hmac_sha256 = 2;
 }
 
+// Candidate counts are bounded to four and hmac_sha256 is exactly 32 bytes.
 message RequestDigestCandidate {
   uint32 digest_version = 1;
   bytes hmac_sha256 = 2;
 }
 
+message FeatureSet {
+  // Version 1 defines bits 1 through 4. Unknown versions or bits fail closed.
+  uint32 schema_version = 1;
+  uint64 bits = 2;
+}
+
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_BACKGROUND = 1;
+  PRIORITY_NORMAL = 2;
+  PRIORITY_HIGH = 3;
+}
+
 message ScheduleRequest {
+  // Request identifiers, tenant_scope, and model are bounded by the v1 codec.
   string request_id = 1;
   string attempt_id = 2;
   bytes tenant_scope = 3;
@@ -34,25 +50,37 @@ message ScheduleRequest {
   uint32 digest_write_version = 7;
   string model = 8;
   uint32 slot_cost = 9;
+  // A positive, codec-bounded total request execution budget.
   int64 execution_budget_ms = 10;
+  FeatureSet features = 11;
+  Priority priority = 12;
+  // Version 1 defines the complete ScheduleRequest field semantics.
+  uint32 schema_version = 13;
+  // Version 1 defines execution_budget_ms as a total wall-clock budget.
+  uint32 budget_schema_version = 14;
 }
 
 message ReservationRef {
   string reservation_id = 1;
   uint64 generation = 2;
+  // Bounded opaque capability plaintext, carried only over authenticated transport.
   bytes capability = 3;
+  uint32 schema_version = 4;
 }
 
 message Reservation {
   ReservationRef ref = 1;
+  uint32 schema_version = 2;
 }
 
 message ScheduleResponse {
   Reservation reservation = 1;
+  uint32 schema_version = 2;
 }
 
 message PrepareDispatchRequest {
   ReservationRef ref = 1;
+  uint32 schema_version = 2;
 }
 
 message WorkloadIdentity {
@@ -62,15 +90,19 @@ message WorkloadIdentity {
   string pod_uid = 4;
   uint64 endpoint_epoch = 5;
   uint64 recovery_epoch = 6;
+  uint32 schema_version = 7;
 }
 
 message DispatchTarget {
+  // Bounded internal proxy endpoint; it is not a provider request body.
   string endpoint = 1;
   WorkloadIdentity identity = 2;
+  uint32 schema_version = 3;
 }
 
 message PrepareDispatchResponse {
   DispatchTarget target = 1;
+  uint32 schema_version = 2;
 }
 
 enum RerankReason {
@@ -81,6 +113,7 @@ enum RerankReason {
 message AbandonBeforeDispatchRequest {
   ReservationRef ref = 1;
   RerankReason reason = 2;
+  uint32 schema_version = 3;
 }
 
 enum GiveUpReason {
@@ -93,17 +126,23 @@ enum GiveUpReason {
 message GiveUpBeforeDispatchRequest {
   ReservationRef ref = 1;
   GiveUpReason reason = 2;
+  uint32 schema_version = 3;
 }
 
 enum TerminalProof {
   TERMINAL_PROOF_UNSPECIFIED = 0;
   TERMINAL_PROOF_PROVIDER_FINISH = 1;
   TERMINAL_PROOF_NOT_SENT = 2;
+  TERMINAL_PROOF_COMPLETE_NON_STREAMING = 3;
+  TERMINAL_PROOF_AUTHENTICATED_PROVIDER_TERMINATION = 4;
 }
 
 message FinalizeRequest {
   ReservationRef ref = 1;
   TerminalProof proof = 2;
+  // Version 1 defines the terminal-proof evidence matrix above.
+  uint32 terminal_evidence_version = 3;
+  uint32 schema_version = 4;
 }
 
 enum AmbiguousCause {
@@ -116,6 +155,34 @@ enum AmbiguousCause {
 message MarkAmbiguousRequest {
   ReservationRef ref = 1;
   AmbiguousCause cause = 2;
+  // Version 1 defines the bounded ambiguity evidence classes above.
+  uint32 evidence_schema_version = 3;
+  uint32 schema_version = 4;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_INVALID_REQUEST = 1;
+  ERROR_CODE_IDEMPOTENCY_CONFLICT = 2;
+  ERROR_CODE_REQUEST_IN_PROGRESS = 3;
+  ERROR_CODE_REQUEST_NOT_REPLAYABLE = 4;
+  ERROR_CODE_NO_CAPACITY = 5;
+  ERROR_CODE_INVALID_REFERENCE = 6;
+  ERROR_CODE_STALE_TARGET = 7;
+  ERROR_CODE_INVALID_STATE = 8;
+  ERROR_CODE_CANCELED = 9;
+  ERROR_CODE_DEADLINE_EXCEEDED = 10;
+  ERROR_CODE_UNAVAILABLE = 11;
+  ERROR_CODE_INTERNAL = 12;
+}
+
+// Attached as a typed gRPC status detail. It deliberately contains no
+// diagnostics, endpoints, identities, provider data, or secret material.
+message ErrorDetail {
+  uint32 schema_version = 1;
+  ErrorCode code = 2;
+  // Zero means no retry hint; nonzero values are bounded by the v1 codec.
+  uint32 retry_after_ms = 3;
 }
 
 message Empty {}

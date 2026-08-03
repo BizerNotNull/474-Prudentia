@@ -10,6 +10,15 @@ var ErrStaleWriterGeneration = errors.New("stale controller writer generation")
 
 type WriterGeneration uint64
 
+func NewWriterGeneration(value uint64) (WriterGeneration, error) {
+	if value == 0 {
+		return 0, fmt.Errorf("invalid writer generation")
+	}
+	return WriterGeneration(value), nil
+}
+
+func (g WriterGeneration) Uint64() uint64 { return uint64(g) }
+
 type ResourceKey struct {
 	namespace string
 	name      string
