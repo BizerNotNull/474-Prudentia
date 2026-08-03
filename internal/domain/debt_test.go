@@ -26,13 +26,18 @@ func TestIdentityGoneProof(t *testing.T) {
 	if proof.WriterGeneration() != 7 || proof.Identity() != identity {
 		t.Fatalf("proof binding mismatch: generation=%d identity=%+v", proof.WriterGeneration(), proof.Identity())
 	}
-	combined := make([]byte, 0, len(identityGoneProofDomain)+3*sha256.Size)
-	combined = append(combined, identityGoneProofDomain...)
-	combined = append(combined, h1[:]...)
-	combined = append(combined, h2[:]...)
-	combined = append(combined, h3[:]...)
-	if want := sha256.Sum256(combined); proof.EvidenceHash() != want {
-		t.Fatalf("evidence hash = %x, want %x", proof.EvidenceHash(), want)
+	duplicate, err := NewIdentityGoneProof(IdentityGoneProofParams{
+		WriterGeneration:               7,
+		Identity:                       identity,
+		PodAbsenceEvidenceHash:         h1,
+		EndpointWithdrawalEvidenceHash: h2,
+		ExecutionFenceEvidenceHash:     h3,
+	})
+	if err != nil {
+		t.Fatalf("duplicate NewIdentityGoneProof: %v", err)
+	}
+	if proof.EvidenceHash() != duplicate.EvidenceHash() {
+		t.Fatal("identical identity-gone evidence produced unstable hashes")
 	}
 
 	valid := IdentityGoneProofParams{
@@ -77,8 +82,12 @@ func TestIdentityGoneDebtResolution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewIdentityGoneDebtResolution: %v", err)
 	}
-	if resolution.DebtID() != "debt_reservation-1" || resolution.ReservationID() != "reservation-1" || resolution.Proof() != proof {
-		t.Fatalf("resolution binding mismatch: %+v", resolution)
+	gotProof, ok := resolution.IdentityGoneProof()
+	if resolution.DebtID() != "debt_reservation-1" || resolution.ReservationID() != "reservation-1" || resolution.Kind() != DebtResolutionIdentityGone || !ok || gotProof != proof || resolution.Proof() != proof {
+		t.Fatalf("resolution binding mismatch: %v", resolution)
+	}
+	if _, ok := resolution.ProviderTerminationProof(); ok {
+		t.Fatal("identity-gone resolution exposed provider proof")
 	}
 
 	for _, tc := range []struct {
