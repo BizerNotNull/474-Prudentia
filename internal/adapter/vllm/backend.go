@@ -49,7 +49,7 @@ func (b *Backend) Infer(ctx context.Context, call domain.BackendCall, sink publi
 	if sink == nil || !call.Manifest().ValidAt(b.config.Now()) || !contains(call.Manifest().Routes(), "/v1/chat/completions") {
 		return 0, errors.New("invalid or expired inference capability")
 	}
-	payload, err := encodeRequest(call.Request().Request())
+	payload, err := encodeBoundRequest(call)
 	if err != nil {
 		return 0, err
 	}
@@ -69,6 +69,33 @@ func (b *Backend) Infer(ctx context.Context, call domain.BackendCall, sink publi
 		return b.decodeJSON(ctx, response.Body, sink)
 	}
 	return 0, errors.New("provider returned unsupported content type")
+}
+func encodeBoundRequest(call domain.BackendCall) ([]byte, error) {
+	payload, err := encodeRequest(call.Request().Request())
+	if err != nil {
+		return nil, err
+	}
+	var body map[string]any
+	if err = json.Unmarshal(payload, &body); err != nil {
+		return nil, errors.New("encode provider request binding")
+	}
+	requestID, ok := call.Request().Request().RequestID()
+	if !ok {
+		return nil, errors.New("provider request lacks correlation binding")
+	}
+	body["prudentia_request_binding"] = struct {
+		RequestID              string `json:"request_id"`
+		ProviderRequestID      string `json:"provider_request_id"`
+		PodUID                 string `json:"pod_uid"`
+		EndpointEpoch          uint64 `json:"endpoint_epoch"`
+		RecoveryEpoch          uint64 `json:"recovery_epoch"`
+		ProviderManifestDigest string `json:"provider_manifest_digest"`
+	}{
+		requestID.Value(), call.ProviderRequestID(), call.Target().Identity().PodUID(),
+		call.Target().Identity().EndpointEpoch(), call.Target().Identity().RecoveryEpoch(),
+		call.Manifest().PayloadDigestString(),
+	}
+	return json.Marshal(body)
 }
 
 func (b *Backend) do(ctx context.Context, method string, target domain.DispatchTarget, manifest domain.CapabilityManifest, route string, body io.Reader, length int64, contentType, accept string) (*http.Response, error) {
@@ -303,13 +330,13 @@ func (b *Backend) Terminate(ctx context.Context, req domain.ProviderRequestRef) 
 		return domain.ProviderTerminationProof{}, errors.New("invalid termination endpoint")
 	}
 	payload, err := json.Marshal(struct {
-		RequestID         string `json:"request_id"`
-		ProviderRequestID string `json:"provider_request_id"`
-		PodUID            string `json:"pod_uid"`
-		EndpointEpoch     uint64 `json:"endpoint_epoch"`
-		RecoveryEpoch     uint64 `json:"recovery_epoch"`
-		ManifestID        string `json:"manifest_id"`
-	}{req.RequestID(), req.ProviderRequestID(), req.Target().PodUID(), req.Target().EndpointEpoch(), req.Target().RecoveryEpoch(), manifest.ID()})
+		RequestID              string `json:"request_id"`
+		ProviderRequestID      string `json:"provider_request_id"`
+		PodUID                 string `json:"pod_uid"`
+		EndpointEpoch          uint64 `json:"endpoint_epoch"`
+		RecoveryEpoch          uint64 `json:"recovery_epoch"`
+		ProviderManifestDigest string `json:"provider_manifest_digest"`
+	}{req.RequestID(), req.ProviderRequestID(), req.Target().PodUID(), req.Target().EndpointEpoch(), req.Target().RecoveryEpoch(), manifest.PayloadDigestString()})
 	if err != nil {
 		return domain.ProviderTerminationProof{}, err
 	}
@@ -326,18 +353,18 @@ func (b *Backend) Terminate(ctx context.Context, req domain.ProviderRequestRef) 
 		return domain.ProviderTerminationProof{}, errors.New("provider termination acknowledgement invalid")
 	}
 	var ack struct {
-		RequestID         string `json:"request_id"`
-		ProviderRequestID string `json:"provider_request_id"`
-		PodUID            string `json:"pod_uid"`
-		EndpointEpoch     uint64 `json:"endpoint_epoch"`
-		RecoveryEpoch     uint64 `json:"recovery_epoch"`
-		ManifestID        string `json:"manifest_id"`
-		Stopped           bool   `json:"stopped"`
-		Sequence          uint64 `json:"sequence"`
+		RequestID              string `json:"request_id"`
+		ProviderRequestID      string `json:"provider_request_id"`
+		PodUID                 string `json:"pod_uid"`
+		EndpointEpoch          uint64 `json:"endpoint_epoch"`
+		RecoveryEpoch          uint64 `json:"recovery_epoch"`
+		ProviderManifestDigest string `json:"provider_manifest_digest"`
+		Stopped                bool   `json:"stopped"`
+		Sequence               uint64 `json:"sequence"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&ack) != nil || decoder.Decode(&struct{}{}) != io.EOF || !ack.Stopped || ack.Sequence == 0 || ack.RequestID != req.RequestID() || ack.ProviderRequestID != req.ProviderRequestID() || ack.PodUID != req.Target().PodUID() || ack.EndpointEpoch != req.Target().EndpointEpoch() || ack.RecoveryEpoch != req.Target().RecoveryEpoch() || ack.ManifestID != manifest.ID() {
+	if decoder.Decode(&ack) != nil || decoder.Decode(&struct{}{}) != io.EOF || !ack.Stopped || ack.Sequence == 0 || ack.RequestID != req.RequestID() || ack.ProviderRequestID != req.ProviderRequestID() || ack.PodUID != req.Target().PodUID() || ack.EndpointEpoch != req.Target().EndpointEpoch() || ack.RecoveryEpoch != req.Target().RecoveryEpoch() || ack.ProviderManifestDigest != manifest.PayloadDigestString() {
 		return domain.ProviderTerminationProof{}, errors.New("provider termination acknowledgement mismatch")
 	}
 	return domain.NewProviderTerminationProof(domain.ProviderTerminationProofParams{RequestID: req.RequestID(), ReservationID: req.ProviderRequestID(), Identity: req.Target(), ManifestID: manifest.ID(), AcknowledgementSequence: ack.Sequence, AuthenticatedAcknowledgementHash: acknowledgementHash(data)})
