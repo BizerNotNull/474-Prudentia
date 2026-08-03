@@ -72,10 +72,13 @@ func TestSnapshotAndCatalogCopyCacheHints(t *testing.T) {
 	endpoint, _ := NewEndpointRef("https://engine.test")
 	model, _ := NewModelKey("model")
 	fingerprint, _ := NewModelFingerprint(model, "revision")
-	stamp, _ := NewStoredSourceStamp(StoredSourceStampParams{Identity: identity, Version: 1, AcceptedAt: asOf.Add(-time.Minute), ExpiresAt: asOf.Add(time.Minute)})
+	structuralSource, _ := NewSourceStamp(SourceStructural, 1, 1)
+	healthSource, _ := NewSourceStamp(SourceRuntimeHealth, 1, 1)
+	structural, _ := NewStoredSourceStamp(StoredSourceStampParams{Source: structuralSource, Identity: identity, Version: 1, AcceptedAt: asOf.Add(-time.Minute), ExpiresAt: asOf.Add(time.Minute)})
+	health, _ := NewStoredSourceStamp(StoredSourceStampParams{Source: healthSource, Identity: identity, Version: 1, AcceptedAt: asOf.Add(-time.Minute), ExpiresAt: asOf.Add(time.Minute)})
 	hint, _ := NewCacheHint(CacheHintParams{Identity: identity, Digest: [32]byte{1}, ExpiresAt: asOf.Add(time.Minute)})
 	hints := []CacheHint{hint}
-	snapshot, err := NewInstanceSnapshot(SnapshotParams{Identity: identity, Endpoint: endpoint, Model: fingerprint, Capabilities: EmptyFeatureSet(), Structural: stamp, Health: stamp, HealthState: HealthStateHealthy, DrainState: DrainStateReady, ConfiguredSlots: 2, CacheHints: hints, ProjectionVersion: 1, CatalogAsOf: asOf})
+	snapshot, err := NewInstanceSnapshot(SnapshotParams{Identity: identity, Endpoint: endpoint, Model: fingerprint, Capabilities: EmptyFeatureSet(), Structural: structural, Health: health, HealthState: HealthStateHealthy, DrainState: DrainStateReady, ConfiguredSlots: 2, CacheHints: hints, ProjectionVersion: 1, CatalogAsOf: asOf})
 	if err != nil {
 		t.Fatal(err)
 	}

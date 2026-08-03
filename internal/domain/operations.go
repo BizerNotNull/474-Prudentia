@@ -210,14 +210,27 @@ func (r ApplyResult) Workload() WorkloadRef { return r.ref }
 type DrainState uint8
 
 const (
-	DrainRequested DrainState = iota + 1
+	DrainReady DrainState = iota + 1
+	DrainRequested
 	DrainActive
 	DrainForced
 	DrainRemoving
 	DrainComplete
 )
 
-func (s DrainState) Valid() bool { return s >= DrainRequested && s <= DrainComplete }
+// Snapshot aliases preserve the scheduling vocabulary without defining a
+// second drain-state type.
+const (
+	DrainStateReady     = DrainReady
+	DrainStateRequested = DrainRequested
+	DrainStateActive    = DrainActive
+	DrainStateForced    = DrainForced
+	DrainStateRemoving  = DrainRemoving
+	DrainStateComplete  = DrainComplete
+)
+
+func (s DrainState) Valid() bool { return s >= DrainReady && s <= DrainComplete }
+func (s DrainState) valid() bool { return s.Valid() }
 
 type DrainScopeKind uint8
 

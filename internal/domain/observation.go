@@ -54,24 +54,59 @@ func (s SourceStamp) Kind() SourceKind                   { return s.kind }
 func (s SourceStamp) WriterGeneration() WriterGeneration { return s.generation }
 func (s SourceStamp) Sequence() SourceSequence           { return s.sequence }
 
-// StoredSourceStamp is the catalog-assigned freshness stamp. Its times are database times.
-type StoredSourceStamp struct {
-	source     SourceStamp
-	acceptedAt time.Time
-	expiresAt  time.Time
+// StoredSourceStampParams binds database freshness to the exact source and
+// workload projection that was accepted.
+type StoredSourceStampParams struct {
+	Source                SourceStamp
+	Identity              WorkloadIdentity
+	Version               uint64
+	AcceptedAt, ExpiresAt time.Time
 }
 
-func NewStoredSourceStamp(source SourceStamp, acceptedAt, expiresAt time.Time) (StoredSourceStamp, error) {
-	if source.kind == 0 || acceptedAt.IsZero() || !expiresAt.After(acceptedAt) {
+// StoredSourceStamp is the catalog-assigned freshness stamp. Its times are database times.
+type StoredSourceStamp struct {
+	source                SourceStamp
+	identity              WorkloadIdentity
+	version               uint64
+	acceptedAt, expiresAt time.Time
+}
+
+// NewStoredSourceStamp accepts the integrated parameter shape. The SourceStamp
+// plus two-time form remains accepted for callers predating the integrated
+// catalog contract.
+func NewStoredSourceStamp(value any, legacyTimes ...time.Time) (StoredSourceStamp, error) {
+	var p StoredSourceStampParams
+	switch value := value.(type) {
+	case StoredSourceStampParams:
+		if len(legacyTimes) != 0 {
+			return StoredSourceStamp{}, fmt.Errorf("invalid stored source stamp")
+		}
+		p = value
+	case SourceStamp:
+		if len(legacyTimes) != 2 {
+			return StoredSourceStamp{}, fmt.Errorf("invalid stored source stamp")
+		}
+		p = StoredSourceStampParams{Source: value, AcceptedAt: legacyTimes[0], ExpiresAt: legacyTimes[1]}
+	default:
 		return StoredSourceStamp{}, fmt.Errorf("invalid stored source stamp")
 	}
-	return StoredSourceStamp{source: source, acceptedAt: acceptedAt, expiresAt: expiresAt}, nil
+	sourceValid := p.Source.kind.Valid()
+	identityValid := p.Identity.valid()
+	if (!sourceValid && !identityValid) || sourceValid != (p.Source.generation != 0 && p.Source.sequence != 0) || identityValid != (p.Version != 0) || p.AcceptedAt.IsZero() || !p.ExpiresAt.After(p.AcceptedAt) {
+		return StoredSourceStamp{}, fmt.Errorf("invalid stored source stamp")
+	}
+	return StoredSourceStamp{source: p.Source, identity: p.Identity, version: p.Version, acceptedAt: p.AcceptedAt, expiresAt: p.ExpiresAt}, nil
 }
-func (s StoredSourceStamp) Source() SourceStamp   { return s.source }
-func (s StoredSourceStamp) AcceptedAt() time.Time { return s.acceptedAt }
-func (s StoredSourceStamp) ExpiresAt() time.Time  { return s.expiresAt }
+func (s StoredSourceStamp) Source() SourceStamp        { return s.source }
+func (s StoredSourceStamp) Identity() WorkloadIdentity { return s.identity }
+func (s StoredSourceStamp) Version() uint64            { return s.version }
+func (s StoredSourceStamp) AcceptedAt() time.Time      { return s.acceptedAt }
+func (s StoredSourceStamp) ExpiresAt() time.Time       { return s.expiresAt }
 func (s StoredSourceStamp) FreshAt(at time.Time) bool {
 	return !at.Before(s.acceptedAt) && at.Before(s.expiresAt)
+}
+func (s StoredSourceStamp) validAt(id WorkloadIdentity, asOf time.Time) bool {
+	return s.identity == id && s.version != 0 && s.FreshAt(asOf)
 }
 
 type HealthState uint8
@@ -83,7 +118,16 @@ const (
 	HealthUnhealthy
 )
 
+// Snapshot aliases preserve the scheduling vocabulary without defining a
+// second health-state type.
+const (
+	HealthStateHealthy   = HealthReady
+	HealthStateDegraded  = HealthDegraded
+	HealthStateUnhealthy = HealthUnhealthy
+)
+
 func (s HealthState) Valid() bool { return s >= HealthStarting && s <= HealthUnhealthy }
+func (s HealthState) valid() bool { return s.Valid() }
 
 type StructuralFactParams struct {
 	Endpoint      string
@@ -263,7 +307,7 @@ type ProjectionUpdate struct {
 }
 
 func NewProjectionUpdate(p ProjectionUpdateParams) (ProjectionUpdate, error) {
-	if p.Identity.PodUID() == "" || p.Structural.source.kind != SourceStructural || p.Health.source.kind != SourceRuntimeHealth || (p.HasLoad && p.Load.source.kind != SourceLoad) || (!p.HasLoad && p.Load.source.kind != 0) || p.ConfiguredSlots == 0 || p.ConfiguredSlots > 1024 || p.AdmissionLimit > p.ConfiguredSlots {
+	if !p.Identity.valid() || p.Structural.source.kind != SourceStructural || p.Health.source.kind != SourceRuntimeHealth || p.Structural.identity != p.Identity || p.Health.identity != p.Identity || p.Structural.version == 0 || p.Health.version == 0 || (p.HasLoad && (p.Load.source.kind != SourceLoad || p.Load.identity != p.Identity || p.Load.version == 0)) || (!p.HasLoad && p.Load != (StoredSourceStamp{})) || p.ConfiguredSlots == 0 || p.ConfiguredSlots > 1024 || p.AdmissionLimit > p.ConfiguredSlots {
 		return ProjectionUpdate{}, fmt.Errorf("invalid projection update")
 	}
 	return ProjectionUpdate{identity: p.Identity, structural: p.Structural, health: p.Health, load: p.Load, hasLoad: p.HasLoad, configuredSlots: p.ConfiguredSlots, admissionLimit: p.AdmissionLimit, previousVersion: p.PreviousVersion}, nil

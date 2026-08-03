@@ -333,54 +333,6 @@ func NewModelFingerprint(model ModelKey, revision string) (ModelFingerprint, err
 func (f ModelFingerprint) Model() ModelKey  { return f.model }
 func (f ModelFingerprint) Revision() string { return f.revision }
 
-type HealthState uint8
-
-const (
-	HealthStateHealthy HealthState = iota + 1
-	HealthStateDegraded
-	HealthStateUnhealthy
-)
-
-func (s HealthState) valid() bool { return s >= HealthStateHealthy && s <= HealthStateUnhealthy }
-
-type DrainState uint8
-
-const (
-	DrainStateReady DrainState = iota + 1
-	DrainStateRequested
-	DrainStateActive
-	DrainStateForced
-	DrainStateRemoving
-	DrainStateComplete
-)
-
-func (s DrainState) valid() bool { return s >= DrainStateReady && s <= DrainStateComplete }
-
-type StoredSourceStampParams struct {
-	Identity              WorkloadIdentity
-	Version               uint64
-	AcceptedAt, ExpiresAt time.Time
-}
-type StoredSourceStamp struct {
-	identity              WorkloadIdentity
-	version               uint64
-	acceptedAt, expiresAt time.Time
-}
-
-func NewStoredSourceStamp(p StoredSourceStampParams) (StoredSourceStamp, error) {
-	if !p.Identity.valid() || p.Version == 0 || p.AcceptedAt.IsZero() || !p.ExpiresAt.After(p.AcceptedAt) {
-		return StoredSourceStamp{}, fmt.Errorf("invalid source stamp")
-	}
-	return StoredSourceStamp{identity: p.Identity, version: p.Version, acceptedAt: p.AcceptedAt, expiresAt: p.ExpiresAt}, nil
-}
-func (s StoredSourceStamp) Identity() WorkloadIdentity { return s.identity }
-func (s StoredSourceStamp) Version() uint64            { return s.version }
-func (s StoredSourceStamp) AcceptedAt() time.Time      { return s.acceptedAt }
-func (s StoredSourceStamp) ExpiresAt() time.Time       { return s.expiresAt }
-func (s StoredSourceStamp) validAt(id WorkloadIdentity, asOf time.Time) bool {
-	return s.identity == id && s.version != 0 && !s.acceptedAt.After(asOf) && s.expiresAt.After(asOf)
-}
-
 type AdvisoryLoad struct{ utilizationBasisPoints uint16 }
 
 func NewAdvisoryLoad(utilizationBasisPoints uint16) (AdvisoryLoad, error) {
@@ -390,27 +342,6 @@ func NewAdvisoryLoad(utilizationBasisPoints uint16) (AdvisoryLoad, error) {
 	return AdvisoryLoad{utilizationBasisPoints: utilizationBasisPoints}, nil
 }
 func (l AdvisoryLoad) UtilizationBasisPoints() uint16 { return l.utilizationBasisPoints }
-
-type CacheHintParams struct {
-	Identity  WorkloadIdentity
-	Digest    [32]byte
-	ExpiresAt time.Time
-}
-type CacheHint struct {
-	identity  WorkloadIdentity
-	digest    [32]byte
-	expiresAt time.Time
-}
-
-func NewCacheHint(p CacheHintParams) (CacheHint, error) {
-	if !p.Identity.valid() || p.Digest == ([32]byte{}) || p.ExpiresAt.IsZero() {
-		return CacheHint{}, fmt.Errorf("invalid cache hint")
-	}
-	return CacheHint{identity: p.Identity, digest: p.Digest, expiresAt: p.ExpiresAt}, nil
-}
-func (h CacheHint) Identity() WorkloadIdentity { return h.identity }
-func (h CacheHint) Digest() [32]byte           { return h.digest }
-func (h CacheHint) ExpiresAt() time.Time       { return h.expiresAt }
 
 type SnapshotParams struct {
 	Identity                                      WorkloadIdentity
@@ -452,7 +383,7 @@ func NewInstanceSnapshot(p SnapshotParams) (InstanceSnapshot, error) {
 	if !p.Identity.valid() || p.Endpoint.value == "" || p.Model.model.value == "" || !p.Capabilities.Valid() || !p.HealthState.valid() || !p.DrainState.valid() || p.ConfiguredSlots == 0 || uint64(p.ReservedSlots)+uint64(p.OrphanedSlots) > uint64(p.ConfiguredSlots) || p.ProjectionVersion == 0 || p.CatalogAsOf.IsZero() || p.CatalogAsOf.After(time.Now()) {
 		return InstanceSnapshot{}, fmt.Errorf("invalid instance snapshot")
 	}
-	if !p.Structural.validAt(p.Identity, p.CatalogAsOf) || !p.Health.validAt(p.Identity, p.CatalogAsOf) || (p.HasLoadStamp && !p.Load.validAt(p.Identity, p.CatalogAsOf)) || p.HasAdvisoryLoad != p.HasLoadStamp {
+	if p.Structural.source.kind != SourceStructural || p.Health.source.kind != SourceRuntimeHealth || (p.HasLoadStamp && p.Load.source.kind != SourceLoad) || !p.Structural.validAt(p.Identity, p.CatalogAsOf) || !p.Health.validAt(p.Identity, p.CatalogAsOf) || (p.HasLoadStamp && !p.Load.validAt(p.Identity, p.CatalogAsOf)) || p.HasAdvisoryLoad != p.HasLoadStamp {
 		return InstanceSnapshot{}, fmt.Errorf("invalid instance snapshot")
 	}
 	hints := append([]CacheHint(nil), p.CacheHints...)
@@ -460,7 +391,7 @@ func NewInstanceSnapshot(p SnapshotParams) (InstanceSnapshot, error) {
 		return InstanceSnapshot{}, fmt.Errorf("invalid instance snapshot")
 	}
 	for _, h := range hints {
-		if h.identity != p.Identity || h.expiresAt.IsZero() {
+		if h.source != p.Identity || h.expiresAt.IsZero() || (h.kind != CacheCatalog && h.kind != CacheHit) {
 			return InstanceSnapshot{}, fmt.Errorf("invalid instance snapshot")
 		}
 	}
