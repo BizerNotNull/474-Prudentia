@@ -50,9 +50,9 @@ func NewSourceStamp(kind SourceKind, generation WriterGeneration, sequence Sourc
 	}
 	return SourceStamp{kind: kind, generation: generation, sequence: sequence}, nil
 }
-func (s SourceStamp) Kind() SourceKind              { return s.kind }
+func (s SourceStamp) Kind() SourceKind                   { return s.kind }
 func (s SourceStamp) WriterGeneration() WriterGeneration { return s.generation }
-func (s SourceStamp) Sequence() SourceSequence      { return s.sequence }
+func (s SourceStamp) Sequence() SourceSequence           { return s.sequence }
 
 // StoredSourceStamp is the catalog-assigned freshness stamp. Its times are database times.
 type StoredSourceStamp struct {
@@ -82,15 +82,16 @@ const (
 	HealthDegraded
 	HealthUnhealthy
 )
+
 func (s HealthState) Valid() bool { return s >= HealthStarting && s <= HealthUnhealthy }
 
 type StructuralFactParams struct {
-	Endpoint       string
-	Model          string
-	Workload       WorkloadRef
-	Members        []PodRef
-	EndpointEpoch  uint64
-	RecoveryEpoch  uint64
+	Endpoint      string
+	Model         string
+	Workload      WorkloadRef
+	Members       []PodRef
+	EndpointEpoch uint64
+	RecoveryEpoch uint64
 }
 
 type StructuralFact struct {
@@ -127,17 +128,18 @@ func NewStructuralFact(p StructuralFactParams) (StructuralFact, error) {
 	}
 	return StructuralFact{endpoint: p.Endpoint, model: p.Model, workload: p.Workload, members: members, endpointEpoch: p.EndpointEpoch, recoveryEpoch: p.RecoveryEpoch}, nil
 }
-func (f StructuralFact) Endpoint() string          { return f.endpoint }
-func (f StructuralFact) Model() string             { return f.model }
-func (f StructuralFact) Workload() WorkloadRef     { return f.workload }
-func (f StructuralFact) Members() []PodRef         { return append([]PodRef(nil), f.members...) }
-func (f StructuralFact) EndpointEpoch() uint64     { return f.endpointEpoch }
-func (f StructuralFact) RecoveryEpoch() uint64     { return f.recoveryEpoch }
+func (f StructuralFact) Endpoint() string      { return f.endpoint }
+func (f StructuralFact) Model() string         { return f.model }
+func (f StructuralFact) Workload() WorkloadRef { return f.workload }
+func (f StructuralFact) Members() []PodRef     { return append([]PodRef(nil), f.members...) }
+func (f StructuralFact) EndpointEpoch() uint64 { return f.endpointEpoch }
+func (f StructuralFact) RecoveryEpoch() uint64 { return f.recoveryEpoch }
 
 type RuntimeHealthFact struct {
 	state HealthState
 	warm  bool
 }
+
 func NewRuntimeHealthFact(state HealthState, warm bool) (RuntimeHealthFact, error) {
 	if !state.Valid() || (warm && state != HealthReady && state != HealthDegraded) {
 		return RuntimeHealthFact{}, fmt.Errorf("invalid runtime health fact")
@@ -159,36 +161,38 @@ type LoadFact struct {
 	hasUtilization  bool
 	observed        bool
 }
+
 func NewLoadFact(p LoadFactParams) (LoadFact, error) {
 	if p.RunningRequests > 1_000_000 || p.QueuedRequests > 1_000_000 || math.IsNaN(p.Utilization) || math.IsInf(p.Utilization, 0) || (p.HasUtilization && (p.Utilization < 0 || p.Utilization > 1)) || (!p.HasUtilization && p.Utilization != 0) {
 		return LoadFact{}, fmt.Errorf("invalid load fact")
 	}
 	return LoadFact{running: p.RunningRequests, queued: p.QueuedRequests, utilization: p.Utilization, hasUtilization: p.HasUtilization, observed: true}, nil
 }
-func (f LoadFact) RunningRequests() uint32       { return f.running }
-func (f LoadFact) QueuedRequests() uint32        { return f.queued }
-func (f LoadFact) Utilization() (float64, bool)  { return f.utilization, f.hasUtilization }
+func (f LoadFact) RunningRequests() uint32      { return f.running }
+func (f LoadFact) QueuedRequests() uint32       { return f.queued }
+func (f LoadFact) Utilization() (float64, bool) { return f.utilization, f.hasUtilization }
 
 type ObservationParams struct {
-	Stamp                SourceStamp
-	Identity             WorkloadIdentity
-	TTLClass             TTLClass
-	Structural           StructuralFact
-	RuntimeHealth        RuntimeHealthFact
-	Load                  LoadFact
-	SourceReportedAt      time.Time
-	HasSourceReportedAt   bool
+	Stamp               SourceStamp
+	Identity            WorkloadIdentity
+	TTLClass            TTLClass
+	Structural          StructuralFact
+	RuntimeHealth       RuntimeHealthFact
+	Load                LoadFact
+	SourceReportedAt    time.Time
+	HasSourceReportedAt bool
 }
 type Observation struct {
-	stamp SourceStamp
-	identity WorkloadIdentity
-	ttlClass TTLClass
-	structural StructuralFact
-	health RuntimeHealthFact
-	load LoadFact
-	sourceReportedAt time.Time
+	stamp               SourceStamp
+	identity            WorkloadIdentity
+	ttlClass            TTLClass
+	structural          StructuralFact
+	health              RuntimeHealthFact
+	load                LoadFact
+	sourceReportedAt    time.Time
 	hasSourceReportedAt bool
 }
+
 func NewObservation(p ObservationParams) (Observation, error) {
 	if !p.Stamp.kind.Valid() || !p.TTLClass.Valid() || p.Identity.PodUID() == "" || (!p.HasSourceReportedAt && !p.SourceReportedAt.IsZero()) || (p.HasSourceReportedAt && p.SourceReportedAt.IsZero()) {
 		return Observation{}, fmt.Errorf("invalid observation")
@@ -199,7 +203,9 @@ func NewObservation(p ObservationParams) (Observation, error) {
 			return Observation{}, fmt.Errorf("invalid structural observation")
 		}
 		found := false
-		for _, member := range p.Structural.members { found = found || string(member.uid) == p.Identity.PodUID() }
+		for _, member := range p.Structural.members {
+			found = found || string(member.uid) == p.Identity.PodUID()
+		}
 		if !found || p.Structural.endpointEpoch != p.Identity.EndpointEpoch() || p.Structural.recoveryEpoch != p.Identity.RecoveryEpoch() {
 			return Observation{}, fmt.Errorf("structural observation identity mismatch")
 		}
@@ -212,50 +218,60 @@ func NewObservation(p ObservationParams) (Observation, error) {
 			return Observation{}, fmt.Errorf("invalid load observation")
 		}
 	}
-	return Observation{stamp:p.Stamp, identity:p.Identity, ttlClass:p.TTLClass, structural:p.Structural, health:p.RuntimeHealth, load:p.Load, sourceReportedAt:p.SourceReportedAt, hasSourceReportedAt:p.HasSourceReportedAt}, nil
+	return Observation{stamp: p.Stamp, identity: p.Identity, ttlClass: p.TTLClass, structural: p.Structural, health: p.RuntimeHealth, load: p.Load, sourceReportedAt: p.SourceReportedAt, hasSourceReportedAt: p.HasSourceReportedAt}, nil
 }
-func (o Observation) Stamp() SourceStamp { return o.stamp }
+func (o Observation) Stamp() SourceStamp         { return o.stamp }
 func (o Observation) Identity() WorkloadIdentity { return o.identity }
-func (o Observation) TTLClass() TTLClass { return o.ttlClass }
-func (o Observation) Structural() (StructuralFact, bool) { return o.structural, o.stamp.kind == SourceStructural }
-func (o Observation) RuntimeHealth() (RuntimeHealthFact, bool) { return o.health, o.stamp.kind == SourceRuntimeHealth }
+func (o Observation) TTLClass() TTLClass         { return o.ttlClass }
+func (o Observation) Structural() (StructuralFact, bool) {
+	return o.structural, o.stamp.kind == SourceStructural
+}
+func (o Observation) RuntimeHealth() (RuntimeHealthFact, bool) {
+	return o.health, o.stamp.kind == SourceRuntimeHealth
+}
 func (o Observation) Load() (LoadFact, bool) { return o.load, o.stamp.kind == SourceLoad }
-func (o Observation) SourceReportedAt() (time.Time, bool) { return o.sourceReportedAt, o.hasSourceReportedAt }
+func (o Observation) SourceReportedAt() (time.Time, bool) {
+	return o.sourceReportedAt, o.hasSourceReportedAt
+}
 
 type ProjectionVersion uint64
+
 func NewProjectionVersion(value uint64) (ProjectionVersion, error) {
-	if value == 0 { return 0, fmt.Errorf("invalid projection version") }
+	if value == 0 {
+		return 0, fmt.Errorf("invalid projection version")
+	}
 	return ProjectionVersion(value), nil
 }
 func (v ProjectionVersion) Uint64() uint64 { return uint64(v) }
 
 type ProjectionUpdateParams struct {
-	Identity WorkloadIdentity
-	Structural StoredSourceStamp
-	Health StoredSourceStamp
-	Load StoredSourceStamp
-	HasLoad bool
+	Identity        WorkloadIdentity
+	Structural      StoredSourceStamp
+	Health          StoredSourceStamp
+	Load            StoredSourceStamp
+	HasLoad         bool
 	ConfiguredSlots uint32
-	AdmissionLimit uint32
+	AdmissionLimit  uint32
 	PreviousVersion ProjectionVersion
 }
 type ProjectionUpdate struct {
-	identity WorkloadIdentity
-	structural, health, load StoredSourceStamp
-	hasLoad bool
+	identity                        WorkloadIdentity
+	structural, health, load        StoredSourceStamp
+	hasLoad                         bool
 	configuredSlots, admissionLimit uint32
-	previousVersion ProjectionVersion
+	previousVersion                 ProjectionVersion
 }
+
 func NewProjectionUpdate(p ProjectionUpdateParams) (ProjectionUpdate, error) {
 	if p.Identity.PodUID() == "" || p.Structural.source.kind != SourceStructural || p.Health.source.kind != SourceRuntimeHealth || (p.HasLoad && p.Load.source.kind != SourceLoad) || (!p.HasLoad && p.Load.source.kind != 0) || p.ConfiguredSlots == 0 || p.ConfiguredSlots > 1024 || p.AdmissionLimit > p.ConfiguredSlots {
 		return ProjectionUpdate{}, fmt.Errorf("invalid projection update")
 	}
-	return ProjectionUpdate{identity:p.Identity, structural:p.Structural, health:p.Health, load:p.Load, hasLoad:p.HasLoad, configuredSlots:p.ConfiguredSlots, admissionLimit:p.AdmissionLimit, previousVersion:p.PreviousVersion}, nil
+	return ProjectionUpdate{identity: p.Identity, structural: p.Structural, health: p.Health, load: p.Load, hasLoad: p.HasLoad, configuredSlots: p.ConfiguredSlots, admissionLimit: p.AdmissionLimit, previousVersion: p.PreviousVersion}, nil
 }
-func (p ProjectionUpdate) Identity() WorkloadIdentity { return p.identity }
-func (p ProjectionUpdate) StructuralStamp() StoredSourceStamp { return p.structural }
-func (p ProjectionUpdate) HealthStamp() StoredSourceStamp { return p.health }
+func (p ProjectionUpdate) Identity() WorkloadIdentity           { return p.identity }
+func (p ProjectionUpdate) StructuralStamp() StoredSourceStamp   { return p.structural }
+func (p ProjectionUpdate) HealthStamp() StoredSourceStamp       { return p.health }
 func (p ProjectionUpdate) LoadStamp() (StoredSourceStamp, bool) { return p.load, p.hasLoad }
-func (p ProjectionUpdate) ConfiguredSlots() uint32 { return p.configuredSlots }
-func (p ProjectionUpdate) AdmissionLimit() uint32 { return p.admissionLimit }
-func (p ProjectionUpdate) PreviousVersion() ProjectionVersion { return p.previousVersion }
+func (p ProjectionUpdate) ConfiguredSlots() uint32              { return p.configuredSlots }
+func (p ProjectionUpdate) AdmissionLimit() uint32               { return p.admissionLimit }
+func (p ProjectionUpdate) PreviousVersion() ProjectionVersion   { return p.previousVersion }

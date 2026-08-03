@@ -58,11 +58,11 @@ func (p IdentityGoneProof) EvidenceHash() [sha256.Size]byte    { return p.eviden
 func (p IdentityGoneProof) String() string                     { return "identity-gone-proof[redacted]" }
 
 type ProviderTerminationProofParams struct {
-	RequestID                      string
-	ReservationID                  string
-	Identity                       WorkloadIdentity
-	ManifestID                     string
-	AcknowledgementSequence        uint64
+	RequestID                        string
+	ReservationID                    string
+	Identity                         WorkloadIdentity
+	ManifestID                       string
+	AcknowledgementSequence          uint64
 	AuthenticatedAcknowledgementHash [sha256.Size]byte
 }
 
@@ -99,13 +99,13 @@ func NewProviderTerminationProof(p ProviderTerminationProofParams) (ProviderTerm
 	}, nil
 }
 
-func (p ProviderTerminationProof) RequestID() string                 { return p.requestID }
-func (p ProviderTerminationProof) ReservationID() string             { return p.reservationID }
-func (p ProviderTerminationProof) Identity() WorkloadIdentity        { return p.identity }
-func (p ProviderTerminationProof) ManifestID() string                 { return p.manifestID }
-func (p ProviderTerminationProof) AcknowledgementSequence() uint64    { return p.acknowledgementSequence }
-func (p ProviderTerminationProof) EvidenceHash() [sha256.Size]byte    { return p.evidenceHash }
-func (p ProviderTerminationProof) String() string                     { return "provider-termination-proof[redacted]" }
+func (p ProviderTerminationProof) RequestID() string               { return p.requestID }
+func (p ProviderTerminationProof) ReservationID() string           { return p.reservationID }
+func (p ProviderTerminationProof) Identity() WorkloadIdentity      { return p.identity }
+func (p ProviderTerminationProof) ManifestID() string              { return p.manifestID }
+func (p ProviderTerminationProof) AcknowledgementSequence() uint64 { return p.acknowledgementSequence }
+func (p ProviderTerminationProof) EvidenceHash() [sha256.Size]byte { return p.evidenceHash }
+func (p ProviderTerminationProof) String() string                  { return "provider-termination-proof[redacted]" }
 
 type DebtResolutionKind uint8
 
@@ -126,8 +126,8 @@ func (k DebtResolutionKind) String() string {
 }
 
 type DebtResolution struct {
-	debtID                  string
-	reservationID           string
+	debtID                   string
+	reservationID            string
 	kind                     DebtResolutionKind
 	identityGoneProof        IdentityGoneProof
 	providerTerminationProof ProviderTerminationProof
@@ -147,8 +147,8 @@ func NewProviderTerminationDebtResolution(debtID, reservationID string, proof Pr
 	return DebtResolution{debtID: debtID, reservationID: reservationID, kind: DebtResolutionProviderTermination, providerTerminationProof: proof}, nil
 }
 
-func (r DebtResolution) DebtID() string        { return r.debtID }
-func (r DebtResolution) ReservationID() string { return r.reservationID }
+func (r DebtResolution) DebtID() string           { return r.debtID }
+func (r DebtResolution) ReservationID() string    { return r.reservationID }
 func (r DebtResolution) Kind() DebtResolutionKind { return r.kind }
 
 func (r DebtResolution) IdentityGoneProof() (IdentityGoneProof, bool) {

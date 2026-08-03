@@ -69,12 +69,12 @@ func TestProviderTerminationProofRejectsPartialEvidence(t *testing.T) {
 		AuthenticatedAcknowledgementHash: sha256.Sum256([]byte("ack")),
 	}
 	tests := map[string]func(*ProviderTerminationProofParams){
-		"request":         func(p *ProviderTerminationProofParams) { p.RequestID = "" },
-		"reservation":     func(p *ProviderTerminationProofParams) { p.ReservationID = "" },
-		"identity":        func(p *ProviderTerminationProofParams) { p.Identity = WorkloadIdentity{} },
-		"manifest":        func(p *ProviderTerminationProofParams) { p.ManifestID = "" },
-		"sequence":        func(p *ProviderTerminationProofParams) { p.AcknowledgementSequence = 0 },
-		"authentication":  func(p *ProviderTerminationProofParams) { p.AuthenticatedAcknowledgementHash = [sha256.Size]byte{} },
+		"request":        func(p *ProviderTerminationProofParams) { p.RequestID = "" },
+		"reservation":    func(p *ProviderTerminationProofParams) { p.ReservationID = "" },
+		"identity":       func(p *ProviderTerminationProofParams) { p.Identity = WorkloadIdentity{} },
+		"manifest":       func(p *ProviderTerminationProofParams) { p.ManifestID = "" },
+		"sequence":       func(p *ProviderTerminationProofParams) { p.AcknowledgementSequence = 0 },
+		"authentication": func(p *ProviderTerminationProofParams) { p.AuthenticatedAcknowledgementHash = [sha256.Size]byte{} },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

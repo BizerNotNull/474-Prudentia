@@ -25,26 +25,50 @@ func TestCapabilityManifestRejectsUnknownVersionsAndInvalidSignature(t *testing.
 		func(p *CapabilityManifestParams) { p.SignatureVerified = false },
 	}
 	for _, mutate := range cases {
-		p := validManifestParams(); mutate(&p)
-		if _, err := NewCapabilityManifest(p); err == nil { t.Fatal("invalid signed manifest accepted") }
+		p := validManifestParams()
+		mutate(&p)
+		if _, err := NewCapabilityManifest(p); err == nil {
+			t.Fatal("invalid signed manifest accepted")
+		}
 	}
 }
 
 func TestCapabilityManifestCopiesCollectionsAndFailsClosed(t *testing.T) {
 	p := validManifestParams()
-	m, err := NewCapabilityManifest(p); if err != nil { t.Fatal(err) }
+	m, err := NewCapabilityManifest(p)
+	if err != nil {
+		t.Fatal(err)
+	}
 	p.Routes[0] = "/changed"
-	routes := m.Routes(); routes[0] = "/also-changed"
-	if m.Routes()[0] != "/v1/chat/completions" { t.Fatal("routes were not copied") }
-	if m.Supports(ProviderCapability(255)) || m.Supports(CapabilityTermination) { t.Fatal("unsupported capability enabled") }
+	routes := m.Routes()
+	routes[0] = "/also-changed"
+	if m.Routes()[0] != "/v1/chat/completions" {
+		t.Fatal("routes were not copied")
+	}
+	if m.Supports(ProviderCapability(255)) || m.Supports(CapabilityTermination) {
+		t.Fatal("unsupported capability enabled")
+	}
 }
 
 func TestAPCRequiresDedicatedEngineOrProvenTenantSalt(t *testing.T) {
-	p := validManifestParams(); p.APCIsolation = APCTenantSalted; p.TenantSaltVersion = 1
-	if _, err := NewCapabilityManifest(p); err == nil { t.Fatal("unproven tenant salt accepted") }
+	p := validManifestParams()
+	p.APCIsolation = APCTenantSalted
+	p.TenantSaltVersion = 1
+	if _, err := NewCapabilityManifest(p); err == nil {
+		t.Fatal("unproven tenant salt accepted")
+	}
 	p.TenantSaltProven = true
-	m, err := NewCapabilityManifest(p); if err != nil { t.Fatal(err) }
-	if !m.Supports(CapabilityAPC) { t.Fatal("proven tenant salt not enabled") }
-	p = validManifestParams(); p.APCIsolation = APCTenantDedicated
-	m, err = NewCapabilityManifest(p); if err != nil || !m.Supports(CapabilityAPC) { t.Fatal("tenant-dedicated APC rejected") }
+	m, err := NewCapabilityManifest(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Supports(CapabilityAPC) {
+		t.Fatal("proven tenant salt not enabled")
+	}
+	p = validManifestParams()
+	p.APCIsolation = APCTenantDedicated
+	m, err = NewCapabilityManifest(p)
+	if err != nil || !m.Supports(CapabilityAPC) {
+		t.Fatal("tenant-dedicated APC rejected")
+	}
 }

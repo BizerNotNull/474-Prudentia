@@ -8,9 +8,9 @@ import (
 )
 
 var (
-	ErrInvalidAdminPrincipal    = errors.New("invalid admin principal")
+	ErrInvalidAdminPrincipal     = errors.New("invalid admin principal")
 	ErrInvalidUnsafeDebtOverride = errors.New("invalid unsafe capacity debt override")
-	ErrInvalidDebtAuditEvent    = errors.New("invalid capacity debt audit event")
+	ErrInvalidDebtAuditEvent     = errors.New("invalid capacity debt audit event")
 )
 
 type AdminAction string
@@ -75,10 +75,10 @@ func NewUnsafeDebtOverride(p UnsafeDebtOverrideParams) (UnsafeDebtOverride, erro
 	}, nil
 }
 
-func (o UnsafeDebtOverride) DebtID() string                    { return o.debtID }
+func (o UnsafeDebtOverride) DebtID() string                     { return o.debtID }
 func (o UnsafeDebtOverride) ExpectedIdentity() WorkloadIdentity { return o.expectedIdentity }
 func (o UnsafeDebtOverride) Principal() AdminPrincipal          { return o.principal }
-func (o UnsafeDebtOverride) Action() AdminAction                 { return AdminActionCapacityDebtUnsafeOverride }
+func (o UnsafeDebtOverride) Action() AdminAction                { return AdminActionCapacityDebtUnsafeOverride }
 func (o UnsafeDebtOverride) Confirmation() string               { return UnsafeDebtOverrideDangerPhrase }
 func (o UnsafeDebtOverride) Ticket() string                     { return o.ticket }
 func (o UnsafeDebtOverride) Reason() string                     { return o.reason }
@@ -147,11 +147,11 @@ func (e UnsafeDebtOverrideAuditEvent) Type() DebtAuditEventType {
 func (e UnsafeDebtOverrideAuditEvent) PrincipalHash() [sha256.Size]byte { return e.principalHash }
 func (e UnsafeDebtOverrideAuditEvent) DebtHash() [sha256.Size]byte      { return e.debtHash }
 func (e UnsafeDebtOverrideAuditEvent) IdentityHash() [sha256.Size]byte  { return e.identityHash }
-func (e UnsafeDebtOverrideAuditEvent) Ticket() string                  { return e.ticket }
-func (e UnsafeDebtOverrideAuditEvent) Reason() string                  { return e.reason }
-func (e UnsafeDebtOverrideAuditEvent) OccurredAt() time.Time           { return e.occurredAt }
+func (e UnsafeDebtOverrideAuditEvent) Ticket() string                   { return e.ticket }
+func (e UnsafeDebtOverrideAuditEvent) Reason() string                   { return e.reason }
+func (e UnsafeDebtOverrideAuditEvent) OccurredAt() time.Time            { return e.occurredAt }
 func (e UnsafeDebtOverrideAuditEvent) EventHash() [sha256.Size]byte     { return e.eventHash }
-func (e UnsafeDebtOverrideAuditEvent) String() string                  { return "capacity-debt-audit-event[redacted]" }
+func (e UnsafeDebtOverrideAuditEvent) String() string                   { return "capacity-debt-audit-event[redacted]" }
 
 func validUnsafeDebtOverride(command UnsafeDebtOverride) bool {
 	return boundedToken(command.debtID, 256) && !isZeroWorkloadIdentity(command.expectedIdentity) && !isZeroHash(command.principal.identityHash) && boundedToken(command.ticket, 256) && boundedReason(command.reason, 1024)
