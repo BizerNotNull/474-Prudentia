@@ -29,11 +29,19 @@ func (Codec) DecodeSchedule(m *schedulerv1.ScheduleRequest) (domain.ScheduleComm
 		len(m.RequestId) == 0 || len(m.RequestId) > MaxRequestIDBytes || len(m.AttemptId) == 0 || len(m.AttemptId) > MaxAttemptIDBytes ||
 		len(m.TenantScope) == 0 || len(m.TenantScope) > MaxTenantScopeBytes || len(m.Model) == 0 || len(m.Model) > MaxModelBytes ||
 		len(m.IdempotencyLookupCandidates) > domain.MaxLookupCandidates || len(m.DigestCandidates) == 0 || len(m.DigestCandidates) > domain.MaxDigestCandidates ||
-		m.ExecutionBudgetMs <= 0 || m.ExecutionBudgetMs > int64((30*time.Minute)/time.Millisecond) || m.Priority != schedulerv1.Priority_PRIORITY_NORMAL ||
+		m.ExecutionBudgetMs <= 0 || m.ExecutionBudgetMs > int64((30*time.Minute)/time.Millisecond) ||
 		m.Features == nil || m.Features.SchemaVersion != SchemaVersionV1 {
 		return domain.ScheduleCommand{}, errors.New("invalid schedule request")
 	}
 	features, err := domain.NewFeatureSet(domain.FeatureVersion(m.Features.SchemaVersion), m.Features.Bits)
+	if err != nil {
+		return domain.ScheduleCommand{}, errors.New("invalid schedule request")
+	}
+	priority, err := decodePriority(m.Priority)
+	if err != nil {
+		return domain.ScheduleCommand{}, errors.New("invalid schedule request")
+	}
+	cachePolicy, err := decodeCachePolicy(m.CachePolicy)
 	if err != nil {
 		return domain.ScheduleCommand{}, errors.New("invalid schedule request")
 	}
@@ -57,11 +65,37 @@ func (Codec) DecodeSchedule(m *schedulerv1.ScheduleRequest) (domain.ScheduleComm
 			return domain.ScheduleCommand{}, errors.New("invalid schedule request")
 		}
 	}
-	cmd, err := domain.NewScheduleCommand(domain.ScheduleParams{RequestID: m.RequestId, AttemptID: m.AttemptId, Tenant: string(m.TenantScope), IdempotencyCandidates: lookups, LookupWriteVersion: m.LookupWriteVersion, DigestCandidates: digests, DigestWriteVersion: m.DigestWriteVersion, Model: m.Model, SlotCost: m.SlotCost, Features: features, ExecutionBudget: time.Duration(m.ExecutionBudgetMs) * time.Millisecond})
+	cmd, err := domain.NewScheduleCommand(domain.ScheduleParams{RequestID: m.RequestId, AttemptID: m.AttemptId, Tenant: string(m.TenantScope), IdempotencyCandidates: lookups, LookupWriteVersion: m.LookupWriteVersion, DigestCandidates: digests, DigestWriteVersion: m.DigestWriteVersion, Model: m.Model, SlotCost: m.SlotCost, Features: features, Priority: priority, CachePolicy: cachePolicy, ExecutionBudget: time.Duration(m.ExecutionBudgetMs) * time.Millisecond})
 	if err != nil {
 		return domain.ScheduleCommand{}, errors.New("invalid schedule request")
 	}
 	return cmd, nil
+}
+
+func decodePriority(priority schedulerv1.Priority) (domain.Priority, error) {
+	switch priority {
+	case schedulerv1.Priority_PRIORITY_BACKGROUND:
+		return domain.PriorityBackground, nil
+	case schedulerv1.Priority_PRIORITY_NORMAL:
+		return domain.PriorityNormal, nil
+	case schedulerv1.Priority_PRIORITY_HIGH:
+		return domain.PriorityHigh, nil
+	default:
+		return 0, errors.New("invalid priority")
+	}
+}
+
+func decodeCachePolicy(policy schedulerv1.CachePolicy) (domain.CachePolicy, error) {
+	switch policy {
+	case schedulerv1.CachePolicy_CACHE_POLICY_DISABLED:
+		return domain.CachePolicyDisabled, nil
+	case schedulerv1.CachePolicy_CACHE_POLICY_PREFER:
+		return domain.CachePolicyPrefer, nil
+	case schedulerv1.CachePolicy_CACHE_POLICY_REQUIRE_COMPATIBLE:
+		return domain.CachePolicyRequireCompatible, nil
+	default:
+		return 0, errors.New("invalid cache policy")
+	}
 }
 
 func (Codec) DecodeReservationRef(m *schedulerv1.ReservationRef) (domain.ReservationRef, error) {

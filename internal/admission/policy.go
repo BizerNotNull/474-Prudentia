@@ -64,7 +64,7 @@ func (Policy) Evaluate(req domain.ScheduleCommand, tenant TenantPolicy, usage Us
 	// Priority values are ordered from least to most privileged.
 	// ScheduleCommand is already authorized, but admission independently checks
 	// the tenant ceiling so a stale/malformed caller cannot bypass it.
-	priority := inferPriority(req)
+	priority := req.Priority()
 	if priority > tenant.MaxPriority {
 		return AdmissionClaim{}, ErrPriorityDenied
 	}
@@ -79,8 +79,3 @@ func (Policy) Evaluate(req domain.ScheduleCommand, tenant TenantPolicy, usage Us
 	}
 	return AdmissionClaim{tenant: tenant.Tenant, slots: req.SlotCost(), priority: priority, features: req.Features(), budget: req.ExecutionBudget()}, nil
 }
-
-// ScheduleCommand currently carries feature/capacity semantics but not a
-// separate priority field; authorization has already checked priority. Keep
-// this explicit conservative value until the command contract gains it.
-func inferPriority(domain.ScheduleCommand) domain.Priority { return domain.PriorityNormal }

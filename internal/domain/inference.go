@@ -150,6 +150,12 @@ const (
 	ErrorIdempotencyConflict
 	ErrorRequestInProgress
 	ErrorRequestNotReplayable
+	ErrorNoCapacity
+	ErrorBackendUnavailable
+	ErrorDeadlineExceeded
+	ErrorRateLimited
+	ErrorRecoveryFenced
+	ErrorRetryWindowClosed
 	ErrorUnavailable
 	ErrorInternal
 )

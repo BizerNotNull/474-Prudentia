@@ -54,7 +54,7 @@ func scheduleCommand(t *testing.T) domain.ScheduleCommand {
 	t.Helper()
 	digest, _ := domain.NewRequestDigestCandidate(1, make([]byte, 32))
 	features, _ := domain.NewFeatureSet(domain.FeatureVersion1, 0)
-	command, err := domain.NewScheduleCommand(domain.ScheduleParams{RequestID: "request", AttemptID: "attempt", Tenant: "tenant", DigestCandidates: []domain.RequestDigestCandidate{digest}, DigestWriteVersion: 1, Model: "model", SlotCost: 1, Features: features, ExecutionBudget: time.Second})
+	command, err := domain.NewScheduleCommand(domain.ScheduleParams{RequestID: "request", AttemptID: "attempt", Tenant: "tenant", DigestCandidates: []domain.RequestDigestCandidate{digest}, DigestWriteVersion: 1, Model: "model", SlotCost: 1, Features: features, Priority: domain.PriorityHigh, CachePolicy: domain.CachePolicyRequireCompatible, ExecutionBudget: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestScheduleRetriesIdenticalBoundedRequest(t *testing.T) {
 	if !proto.Equal(rpc.captured[0], rpc.captured[1]) {
 		t.Fatal("retry changed command bytes")
 	}
-	if rpc.captured[0].SchemaVersion != 1 || rpc.captured[0].Features.SchemaVersion != 1 || rpc.captured[0].Priority != schedulerv1.Priority_PRIORITY_NORMAL {
+	if rpc.captured[0].SchemaVersion != 1 || rpc.captured[0].Features.SchemaVersion != 1 || rpc.captured[0].Priority != schedulerv1.Priority_PRIORITY_HIGH || rpc.captured[0].CachePolicy != schedulerv1.CachePolicy_CACHE_POLICY_REQUIRE_COMPATIBLE {
 		t.Fatal("client omitted strict wire versions")
 	}
 }

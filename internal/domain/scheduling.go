@@ -112,6 +112,8 @@ type ScheduleParams struct {
 	Model                 string
 	SlotCost              uint32
 	Features              FeatureSet
+	Priority              Priority
+	CachePolicy           CachePolicy
 	ExecutionBudget       time.Duration
 }
 type ScheduleCommand struct {
@@ -125,6 +127,8 @@ type ScheduleCommand struct {
 	model                 ModelKey
 	slotCost              uint32
 	features              FeatureSet
+	priority              Priority
+	cachePolicy           CachePolicy
 	executionBudget       time.Duration
 }
 
@@ -146,7 +150,15 @@ func NewScheduleCommand(p ScheduleParams) (ScheduleCommand, error) {
 		return ScheduleCommand{}, fmt.Errorf("invalid schedule command")
 	}
 	features := p.Features
-	if p.SlotCost == 0 || p.SlotCost > 1024 || p.ExecutionBudget <= 0 || p.ExecutionBudget > 30*time.Minute || !features.Valid() {
+	priority := p.Priority
+	if priority == 0 {
+		priority = PriorityNormal
+	}
+	cachePolicy := p.CachePolicy
+	if cachePolicy == 0 {
+		cachePolicy = CachePolicyDisabled
+	}
+	if p.SlotCost == 0 || p.SlotCost > 1024 || p.ExecutionBudget <= 0 || p.ExecutionBudget > 30*time.Minute || !features.Valid() || !validPriority(priority) || !validCachePolicy(cachePolicy) {
 		return ScheduleCommand{}, fmt.Errorf("invalid schedule command")
 	}
 	if err := validateCandidateSets(p.IdempotencyCandidates, LookupPepperVersion(p.LookupWriteVersion), p.DigestCandidates, DigestVersion(p.DigestWriteVersion)); err != nil {
@@ -155,7 +167,7 @@ func NewScheduleCommand(p ScheduleParams) (ScheduleCommand, error) {
 	return ScheduleCommand{requestID: requestID, attemptID: attemptID, tenant: tenant,
 		idempotencyCandidates: append([]IdempotencyLookupCandidate(nil), p.IdempotencyCandidates...), lookupWriteVersion: LookupPepperVersion(p.LookupWriteVersion),
 		digestCandidates: append([]RequestDigestCandidate(nil), p.DigestCandidates...), digestWriteVersion: DigestVersion(p.DigestWriteVersion),
-		model: model, slotCost: p.SlotCost, features: features, executionBudget: p.ExecutionBudget}, nil
+		model: model, slotCost: p.SlotCost, features: features, priority: priority, cachePolicy: cachePolicy, executionBudget: p.ExecutionBudget}, nil
 }
 func (c ScheduleCommand) RequestID() string              { return c.requestID.value }
 func (c ScheduleCommand) RequestIDValue() RequestID      { return c.requestID }
@@ -167,6 +179,8 @@ func (c ScheduleCommand) Model() string                  { return c.model.value 
 func (c ScheduleCommand) ModelKey() ModelKey             { return c.model }
 func (c ScheduleCommand) SlotCost() uint32               { return c.slotCost }
 func (c ScheduleCommand) Features() FeatureSet           { return c.features }
+func (c ScheduleCommand) Priority() Priority             { return c.priority }
+func (c ScheduleCommand) CachePolicy() CachePolicy       { return c.cachePolicy }
 func (c ScheduleCommand) ExecutionBudget() time.Duration { return c.executionBudget }
 func (c ScheduleCommand) IdempotencyCandidates() []IdempotencyLookupCandidate {
 	return append([]IdempotencyLookupCandidate(nil), c.idempotencyCandidates...)

@@ -49,7 +49,7 @@ func (c *Client) Schedule(ctx context.Context, command domain.ScheduleCommand) (
 		wireDigests[i] = &schedulerv1.RequestDigestCandidate{DigestVersion: candidate.Version(), HmacSha256: append([]byte(nil), value[:]...)}
 	}
 	features := command.Features()
-	request := &schedulerv1.ScheduleRequest{RequestId: command.RequestID(), AttemptId: command.AttemptID(), TenantScope: []byte(command.Tenant()), IdempotencyLookupCandidates: wireLookups, LookupWriteVersion: command.LookupWriteVersion(), DigestCandidates: wireDigests, DigestWriteVersion: command.DigestWriteVersion(), Model: command.Model(), SlotCost: command.SlotCost(), ExecutionBudgetMs: command.ExecutionBudget().Milliseconds(), Features: &schedulerv1.FeatureSet{SchemaVersion: schemaVersionV1, Bits: features.Bits()}, Priority: schedulerv1.Priority_PRIORITY_NORMAL, SchemaVersion: schemaVersionV1, BudgetSchemaVersion: schemaVersionV1}
+	request := &schedulerv1.ScheduleRequest{RequestId: command.RequestID(), AttemptId: command.AttemptID(), TenantScope: []byte(command.Tenant()), IdempotencyLookupCandidates: wireLookups, LookupWriteVersion: command.LookupWriteVersion(), DigestCandidates: wireDigests, DigestWriteVersion: command.DigestWriteVersion(), Model: command.Model(), SlotCost: command.SlotCost(), ExecutionBudgetMs: command.ExecutionBudget().Milliseconds(), Features: &schedulerv1.FeatureSet{SchemaVersion: schemaVersionV1, Bits: features.Bits()}, Priority: encodePriority(command.Priority()), CachePolicy: encodeCachePolicy(command.CachePolicy()), SchemaVersion: schemaVersionV1, BudgetSchemaVersion: schemaVersionV1}
 	var response *schedulerv1.ScheduleResponse
 	err := c.retry(ctx, func(callCtx context.Context) error {
 		var err error
@@ -67,6 +67,32 @@ func (c *Client) Schedule(ctx context.Context, command domain.ScheduleCommand) (
 		return domain.Reservation{}, err
 	}
 	return domain.NewReservation(ref), nil
+}
+
+func encodePriority(priority domain.Priority) schedulerv1.Priority {
+	switch priority {
+	case domain.PriorityBackground:
+		return schedulerv1.Priority_PRIORITY_BACKGROUND
+	case domain.PriorityNormal:
+		return schedulerv1.Priority_PRIORITY_NORMAL
+	case domain.PriorityHigh:
+		return schedulerv1.Priority_PRIORITY_HIGH
+	default:
+		return schedulerv1.Priority_PRIORITY_UNSPECIFIED
+	}
+}
+
+func encodeCachePolicy(policy domain.CachePolicy) schedulerv1.CachePolicy {
+	switch policy {
+	case domain.CachePolicyDisabled:
+		return schedulerv1.CachePolicy_CACHE_POLICY_DISABLED
+	case domain.CachePolicyPrefer:
+		return schedulerv1.CachePolicy_CACHE_POLICY_PREFER
+	case domain.CachePolicyRequireCompatible:
+		return schedulerv1.CachePolicy_CACHE_POLICY_REQUIRE_COMPATIBLE
+	default:
+		return schedulerv1.CachePolicy_CACHE_POLICY_UNSPECIFIED
+	}
 }
 
 func (c *Client) PrepareDispatch(ctx context.Context, ref domain.ReservationRef) (domain.DispatchTarget, error) {

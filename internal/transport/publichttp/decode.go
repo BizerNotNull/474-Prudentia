@@ -36,13 +36,18 @@ func DefaultLimits() Limits {
 }
 
 type chatRequest struct {
-	Model               string        `json:"model"`
-	Messages            []chatMessage `json:"messages"`
-	Stream              bool          `json:"stream"`
-	MaxCompletionTokens *uint32       `json:"max_completion_tokens"`
-	Priority            string        `json:"priority,omitempty"`
-	CachePolicy         string        `json:"cache_policy,omitempty"`
-	ExecutionBudgetMS   *uint32       `json:"execution_budget_ms,omitempty"`
+	Model               string         `json:"model"`
+	Messages            []chatMessage  `json:"messages"`
+	Stream              bool           `json:"stream"`
+	MaxCompletionTokens *uint32        `json:"max_completion_tokens"`
+	Priority            string         `json:"priority,omitempty"`
+	CachePolicy         string         `json:"cache_policy,omitempty"`
+	ExecutionBudgetMS   *uint32        `json:"execution_budget_ms,omitempty"`
+	StreamOptions       *streamOptions `json:"stream_options,omitempty"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type chatMessage struct {
@@ -133,6 +138,14 @@ func DecodeChat(r *http.Request, limits Limits) (domain.InferenceRequest, Respon
 	var featureBits uint64
 	if input.Stream {
 		featureBits |= 1 << domain.FeatureStreaming
+	}
+	if input.StreamOptions != nil {
+		if !input.Stream {
+			return domain.InferenceRequest{}, 0, domain.NewPublicError(domain.ErrorInvalidRequest)
+		}
+		if input.StreamOptions.IncludeUsage {
+			featureBits |= 1 << domain.FeatureUsage
+		}
 	}
 	features, err := domain.NewFeatureSet(domain.FeatureVersion1, featureBits)
 	if err != nil {

@@ -5,11 +5,13 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -29,9 +31,11 @@ func TestOIDCAuthenticatorFailsClosedAndRefreshesUnknownKey(t *testing.T) {
 	}
 	var mu sync.Mutex
 	kid, key := "first", &first.PublicKey
-	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	fetches := 0
+	issuer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
+		fetches++
 		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{jwk(kid, key)}})
 	}))
 	defer issuer.Close()
@@ -48,10 +52,26 @@ func TestOIDCAuthenticatorFailsClosedAndRefreshesUnknownKey(t *testing.T) {
 	mu.Lock()
 	kid, key = "second", &second.PublicKey
 	mu.Unlock()
+	now = now.Add(time.Hour + time.Second)
 	rotated := signedToken(t, second, "second", issuer.URL, "gateway", now.Add(time.Minute))
 	if _, err := authenticate(authenticator, rotated); err != nil {
 		t.Fatalf("rotated key rejected: %v", err)
 	}
+
+	mu.Lock()
+	fetchesAfterRotation := fetches
+	mu.Unlock()
+	for i := range 20 {
+		unknown := signedToken(t, second, "attacker-"+strconv.Itoa(i), issuer.URL, "gateway", now.Add(time.Minute))
+		if _, err := authenticate(authenticator, unknown); domain.ErrorKindOf(err) != domain.ErrorUnauthenticated {
+			t.Fatalf("unknown kid %d: error=%v", i, err)
+		}
+	}
+	mu.Lock()
+	if fetches != fetchesAfterRotation {
+		t.Fatalf("unknown kids caused %d extra JWKS fetches", fetches-fetchesAfterRotation)
+	}
+	mu.Unlock()
 	for name, token := range map[string]string{
 		"expired":     signedToken(t, second, "second", issuer.URL, "gateway", now.Add(-time.Second)),
 		"audience":    signedToken(t, second, "second", issuer.URL, "other", now.Add(time.Minute)),
@@ -63,6 +83,19 @@ func TestOIDCAuthenticatorFailsClosedAndRefreshesUnknownKey(t *testing.T) {
 				t.Fatalf("error=%v", err)
 			}
 		})
+	}
+}
+
+func TestOIDCRejectsUnauthenticatedKeySources(t *testing.T) {
+	configs := []auth.OIDCConfig{
+		{Issuer: "http://issuer.example", Audience: "gateway", JWKSURL: "https://issuer.example/keys"},
+		{Issuer: "https://issuer.example", Audience: "gateway", JWKSURL: "http://issuer.example/keys"},
+		{Issuer: "https://issuer.example", Audience: "gateway", JWKSURL: "https://issuer.example/keys", HTTPClient: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}},
+	}
+	for _, cfg := range configs {
+		if _, err := auth.NewAuthenticatorWithOIDC(nil, []auth.OIDCConfig{cfg}); err == nil {
+			t.Fatal("accepted an unauthenticated OIDC source")
+		}
 	}
 }
 
