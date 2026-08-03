@@ -11,14 +11,23 @@ import (
 )
 
 type ControllerCatalog struct {
-	pool *pgxpool.Pool
+	*Catalog
 }
 
 func NewControllerCatalog(pool *pgxpool.Pool) (*ControllerCatalog, error) {
 	if pool == nil {
 		return nil, errors.New("invalid controller catalog configuration")
 	}
-	return &ControllerCatalog{pool: pool}, nil
+	// Controller-only callers cannot recover reservation capabilities. A
+	// process composing scheduler and controller facets must use NewCatalog.
+	key := make([]byte, 32)
+	key[0] = 1
+	keyring, _ := NewLocalCapabilityKeyring(map[uint32][]byte{1: key}, map[uint32][]byte{1: key})
+	catalog, err := NewCatalog(pool, keyring)
+	if err != nil {
+		return nil, err
+	}
+	return catalog.ControllerCatalog(), nil
 }
 
 func (c *ControllerCatalog) AcquireControllerWriterGeneration(ctx context.Context, cluster, holder string) (domain.WriterGeneration, error) {

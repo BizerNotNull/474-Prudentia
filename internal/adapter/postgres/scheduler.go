@@ -12,61 +12,45 @@ import (
 	"math"
 
 	"github.com/BizerNotNull/474-Prudentia/internal/domain"
-	"github.com/BizerNotNull/474-Prudentia/internal/scheduling"
+	"github.com/BizerNotNull/474-Prudentia/internal/registry"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type SchedulerStore struct {
-	pool *pgxpool.Pool
-	aead cipher.AEAD
+	*Catalog
 }
 
 func NewSchedulerStore(pool *pgxpool.Pool, capabilityKey []byte) (*SchedulerStore, error) {
-	if pool == nil || len(capabilityKey) != 32 {
+	keyring, err := NewLocalCapabilityKeyring(
+		map[uint32][]byte{1: capabilityKey},
+		map[uint32][]byte{1: capabilityKey},
+	)
+	if err != nil || pool == nil {
 		return nil, errors.New("invalid scheduler store configuration")
+	}
+	catalog, err := NewCatalog(pool, keyring)
+	if err != nil {
+		return nil, err
 	}
 	block, err := aes.NewCipher(capabilityKey)
 	if err != nil {
 		return nil, fmt.Errorf("create capability cipher: %w", err)
 	}
-	aead, err := cipher.NewGCM(block)
+	catalog.aead, err = cipher.NewGCM(block)
 	if err != nil {
 		return nil, fmt.Errorf("create capability AEAD: %w", err)
 	}
-	return &SchedulerStore{pool: pool, aead: aead}, nil
+	return catalog.SchedulerStore(), nil
 }
 
-func (s *SchedulerStore) Candidates(ctx context.Context, cmd domain.ScheduleCommand) ([]scheduling.Candidate, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT cluster, namespace, logical_engine, pod_uid, endpoint_epoch, recovery_epoch,
-		       admission_limit - reserved_slots - orphaned_slots
-		FROM scheduler_backends
-		WHERE model = $1 AND healthy AND NOT drain_active AND eligible_until > clock_timestamp()
-		  AND admission_limit - reserved_slots - orphaned_slots >= $2`, cmd.Model(), cmd.SlotCost())
+func (s *SchedulerStore) Candidates(ctx context.Context, cmd domain.ScheduleCommand) (domain.CandidateCatalog, error) {
+	query, err := registry.NewCandidateQuery(cmd.Model(), cmd.Features(), registry.MaxCandidates)
 	if err != nil {
-		return nil, fmt.Errorf("read scheduling candidates: %w", err)
+		return domain.CandidateCatalog{}, err
 	}
-	defer rows.Close()
-
-	var candidates []scheduling.Candidate
-	for rows.Next() {
-		var p domain.WorkloadIdentityParams
-		var available int32
-		if err := rows.Scan(&p.Cluster, &p.Namespace, &p.LogicalEngine, &p.PodUID, &p.EndpointEpoch, &p.RecoveryEpoch, &available); err != nil {
-			return nil, fmt.Errorf("scan scheduling candidate: %w", err)
-		}
-		identity, err := domain.NewWorkloadIdentity(p)
-		if err != nil {
-			return nil, fmt.Errorf("decode scheduling candidate: %w", err)
-		}
-		candidates = append(candidates, scheduling.Candidate{Identity: identity, AvailableSlots: uint32(available)})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read scheduling candidates: %w", err)
-	}
-	return candidates, nil
+	return s.ListCandidateSnapshots(ctx, query)
 }
 
 func (s *SchedulerStore) LookupReservation(ctx context.Context, cmd domain.ScheduleCommand) (domain.Reservation, bool, error) {
