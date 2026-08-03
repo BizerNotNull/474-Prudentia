@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -43,6 +44,76 @@ func NewBackend(config BackendConfig) (*Backend, error) {
 	}
 	config.TLSConfig = config.TLSConfig.Clone()
 	return &Backend{config: config}, nil
+}
+
+// ExactManifestProber binds every health/load request to one already verified,
+// immutable manifest. It deliberately has no unpinned/default target path.
+type ExactManifestProber struct {
+	backend  *Backend
+	manifest domain.CapabilityManifest
+}
+
+func NewExactManifestProber(backend *Backend, manifest domain.CapabilityManifest) (*ExactManifestProber, error) {
+	if backend == nil || !manifest.ValidAt(backend.config.Now()) ||
+		!contains(manifest.Routes(), "/health") || !contains(manifest.Routes(), "/metrics") ||
+		!manifest.Supports(domain.CapabilityMetrics) ||
+		!contains(manifest.Metrics(), "vllm:num_requests_running") ||
+		!contains(manifest.Metrics(), "vllm:num_requests_waiting") {
+		return nil, errors.New("manifest does not provide exact mandatory probe and load contract")
+	}
+	return &ExactManifestProber{backend: backend, manifest: manifest}, nil
+}
+
+func (p *ExactManifestProber) ProbeTarget(_ context.Context, projection domain.BackendProjection) (domain.ProbeTarget, error) {
+	target, err := domain.NewDispatchTarget(projection.Endpoint(), projection.Identity())
+	if err != nil {
+		return domain.ProbeTarget{}, err
+	}
+	return domain.NewProbeTarget(target, p.manifest)
+}
+
+// RegistrationReady proves that the exact Pod UID/epochs and manifest claims
+// are currently attested. A failed handshake or health response is never readiness.
+func (p *ExactManifestProber) RegistrationReady(ctx context.Context, identity domain.WorkloadIdentity, endpoint string) (bool, error) {
+	target, err := domain.NewDispatchTarget(endpoint, identity)
+	if err != nil {
+		return false, err
+	}
+	probeTarget, err := domain.NewProbeTarget(target, p.manifest)
+	if err != nil {
+		return false, err
+	}
+	if _, err := p.Probe(ctx, probeTarget); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+func (p *ExactManifestProber) Probe(ctx context.Context, target domain.ProbeTarget) (domain.RuntimeHealthObservation, error) {
+	if !exactManifest(target.Manifest(), p.manifest) {
+		return domain.RuntimeHealthObservation{}, errors.New("probe target manifest mismatch")
+	}
+	return p.backend.Probe(ctx, target)
+}
+
+func (p *ExactManifestProber) ScrapeLoad(ctx context.Context, target domain.ProbeTarget) (domain.LoadObservation, error) {
+	if !exactManifest(target.Manifest(), p.manifest) {
+		return domain.LoadObservation{}, errors.New("load target manifest mismatch")
+	}
+	return p.backend.ScrapeLoad(ctx, target)
+}
+
+func exactManifest(left, right domain.CapabilityManifest) bool {
+	if !left.Compatible(right) || left.SignatureVersion() != right.SignatureVersion() ||
+		!left.ValidFrom().Equal(right.ValidFrom()) || !left.ValidUntil().Equal(right.ValidUntil()) ||
+		left.APCIsolation() != right.APCIsolation() || !slices.Equal(left.Metrics(), right.Metrics()) {
+		return false
+	}
+	for capability := domain.CapabilityInference; capability <= domain.CapabilityMover; capability++ {
+		if left.Supports(capability) != right.Supports(capability) {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *Backend) Infer(ctx context.Context, call domain.BackendCall, sink publichttp.StreamSink) (domain.TerminalProof, error) {

@@ -16,7 +16,7 @@ type OperationCatalog interface {
 	RecordWorkloadBarrier(context.Context, domain.WriterGeneration, domain.WorkloadBarrierProof) error
 	WaitForOldCallsQuiescent(context.Context, domain.WriterGeneration, domain.WorkloadOperationRef) error
 	RecordWorkloadVictims(context.Context, domain.WriterGeneration, domain.WorkloadVictimObservation) error
-	CompleteWorkloadOperationAndReopen(context.Context, domain.WriterGeneration, domain.WorkloadOperationRef) error
+	CompleteWorkloadOperationAndReopen(context.Context, domain.WriterGeneration, domain.WorkloadCompletionProof) error
 }
 
 // WorkloadControl is the Kubernetes-facing inward port. Implementations must use the
@@ -24,6 +24,7 @@ type OperationCatalog interface {
 type WorkloadControl interface {
 	InstallWorkloadOperationBarrier(context.Context, domain.WorkloadOperation, domain.WorkloadRef, []domain.PodRef) (domain.WorkloadBarrierProof, error)
 	ObserveWorkloadVictims(context.Context, domain.WorkloadOperationRef, domain.PodUIDSet) (domain.WorkloadVictimObservation, error)
+	BuildWorkloadCompletionProof(context.Context, domain.WorkloadBarrierProof, domain.WorkloadVictimObservation) (domain.WorkloadCompletionProof, error)
 }
 
 // DrainCatalog extends the handoff ledger protocol with durable drain preparation and
@@ -68,9 +69,7 @@ type RecoveryControl interface {
 }
 
 func (c *Controller) operationPorts() (OperationCatalog, WorkloadControl, bool) {
-	ledger, ledgerOK := c.catalog.(OperationCatalog)
-	control, controlOK := c.source.(WorkloadControl)
-	return ledger, control, ledgerOK && controlOK
+	return c.operations, c.workloads, c.operations != nil && c.workloads != nil
 }
 
 // FenceWorkloadHandoff advances a durable token, observes its Kubernetes barrier, waits
@@ -109,7 +108,11 @@ func (c *Controller) FenceWorkloadHandoff(ctx context.Context, gen domain.Writer
 	if err := ledger.RecordWorkloadVictims(ctx, gen, victims); err != nil {
 		return domain.WorkloadBarrierProof{}, fmt.Errorf("record workload handoff victims: %w", err)
 	}
-	if err := ledger.CompleteWorkloadOperationAndReopen(ctx, gen, op.Ref()); err != nil {
+	completion, err := control.BuildWorkloadCompletionProof(ctx, proof, victims)
+	if err != nil {
+		return domain.WorkloadBarrierProof{}, fmt.Errorf("prove current workload state after handoff: %w", err)
+	}
+	if err := ledger.CompleteWorkloadOperationAndReopen(ctx, gen, completion); err != nil {
 		return domain.WorkloadBarrierProof{}, fmt.Errorf("complete workload handoff: %w", err)
 	}
 	return proof, nil
@@ -186,7 +189,11 @@ func (c *Controller) ReconcileDrain(ctx context.Context, gen domain.WriterGenera
 	if err := ledger.RecordWorkloadVictims(ctx, gen, victims); err != nil {
 		return fmt.Errorf("record drain victims: %w", err)
 	}
-	if err := ledger.CompleteWorkloadOperationAndReopen(ctx, gen, op.Ref()); err != nil {
+	completion, err := control.BuildWorkloadCompletionProof(ctx, proof, victims)
+	if err != nil {
+		return fmt.Errorf("prove current workload state after drain: %w", err)
+	}
+	if err := ledger.CompleteWorkloadOperationAndReopen(ctx, gen, completion); err != nil {
 		return fmt.Errorf("complete drain: %w", err)
 	}
 	return nil

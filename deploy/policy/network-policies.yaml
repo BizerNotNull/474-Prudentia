@@ -70,6 +70,30 @@ spec:
   - to: [{namespaceSelector: {matchLabels: {prudentia.io/telemetry: "true"}}}]
     ports: [{port: 4317, protocol: TCP}]
 ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: prudentia-inference}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: identity-proxy-only, namespace: prudentia-inference}
+spec:
+  podSelector: {matchLabels: {prudentia.io/component: identity-proxy}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: prudentia-system}}
+      podSelector:
+        matchExpressions:
+        - {key: app.kubernetes.io/name, operator: In, values: [gateway, controller]}
+    ports: [{port: 9443, protocol: TCP}]
+  egress:
+  - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}}]
+    ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+---
 # Apply in the database namespace: PostgreSQL accepts only scheduler,
 # controller, backup, and recovery identities; gateway has no credential or path.
 apiVersion: networking.k8s.io/v1

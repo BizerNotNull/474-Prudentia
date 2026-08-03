@@ -81,8 +81,8 @@ func NewResourceState(cluster string, key ResourceKey, projections []BackendProj
 	if !boundedToken(cluster, 128) {
 		return ResourceState{}, fmt.Errorf("invalid resource cluster")
 	}
-	if len(projections) > 1 {
-		return ResourceState{}, fmt.Errorf("Pod resource has too many backend projections")
+	if len(projections) > 1024 {
+		return ResourceState{}, fmt.Errorf("resource has too many backend projections")
 	}
 	cloned := make([]BackendProjection, len(projections))
 	for i, projection := range projections {
