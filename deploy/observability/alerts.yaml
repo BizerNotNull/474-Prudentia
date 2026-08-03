@@ -1,0 +1,50 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: prudentia-safety
+  namespace: prudentia-system
+  annotations:
+    prudentia.io/cardinality-contract: labels are bounded states and reasons; IDs, tenant, Pod UID/IP, tokens, capabilities, tickets, digests, and raw epochs are prohibited
+spec:
+  groups:
+  - name: prudentia.capacity-and-recovery
+    rules:
+    - alert: PrudentiaUnsafeDebtOverride
+      expr: increase(prudentia_unsafe_debt_override_total[5m]) > 0
+      for: 0m
+      labels: {severity: critical}
+      annotations:
+        summary: privileged unsafe debt override occurred
+        runbook_behavior: correlate the immutable authenticated audit event; never include actor, ticket, capability, or tenant in alert labels
+    - alert: PrudentiaOrphanedDebtStale
+      expr: max(prudentia_orphaned_debt_age_seconds{state="orphaned"}) > 900
+      for: 10m
+      labels: {severity: critical}
+      annotations: {summary: ambiguous provider work remains unresolved}
+    - alert: PrudentiaRecoveryFenceClosed
+      expr: max(prudentia_recovery_fence) == 1
+      for: 5m
+      labels: {severity: critical}
+      annotations:
+        summary: request-plane admission and dispatch are recovery-fenced
+        runbook_behavior: reopen only after a new controller generation, old identity termination, new epoch rollout, relist, capacity rebuild, restored-row reconciliation, and complete fleet proof
+    - alert: PrudentiaOperationBarrierStalled
+      expr: increase(prudentia_operation_barrier_total{state="installed"}[15m]) > increase(prudentia_operation_barrier_total{state="observed"}[15m])
+      for: 10m
+      labels: {severity: warning}
+      annotations: {summary: workload operation barrier has not been read back}
+    - alert: PrudentiaCapacityDebtMismatch
+      expr: abs(sum(prudentia_capacity_slots{state="orphaned"}) - sum(prudentia_orphaned_debt)) > 0
+      for: 5m
+      labels: {severity: critical}
+      annotations: {summary: debt metrics do not reconcile with capacity projection}
+    - alert: PrudentiaSchedulerDatabaseUnavailable
+      expr: max(prudentia_dependency_ready{role="scheduler",dependency="postgres"}) == 0
+      for: 2m
+      labels: {severity: critical}
+      annotations: {summary: scheduler is fail-closed because PostgreSQL is unavailable}
+    - alert: PrudentiaObservationStale
+      expr: max(prudentia_db_observation_age_seconds) > 60
+      for: 5m
+      labels: {severity: warning}
+      annotations: {summary: database-time controller observations are stale}
