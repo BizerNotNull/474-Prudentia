@@ -56,7 +56,7 @@ func TestCacheCompatibilityAndRotationFailClosed(t *testing.T) {
 	v1 := cacheIdentity(t, cacheParams("tenant-a", 1, 'a'))
 	v2 := cacheIdentity(t, cacheParams("tenant-a", 2, 'b'))
 	otherTenant := cacheIdentity(t, cacheParams("tenant-b", 2, 'b'))
-	if err := metadata.RecordVerified(v1, source, now.Add(time.Minute)); err != nil {
+	if err := metadata.RecordVerified(v1, source, cacheManifest(t, now), now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if hit, err := metadata.Lookup(context.Background(), v1); err != nil || !hit.IsHit() {
@@ -65,7 +65,7 @@ func TestCacheCompatibilityAndRotationFailClosed(t *testing.T) {
 	if hit, err := metadata.Lookup(context.Background(), v2); err != nil || hit.IsHit() {
 		t.Fatalf("unrecorded v2 lookup = hit:%v err:%v", hit.IsHit(), err)
 	}
-	if err := metadata.RecordVerified(v2, source, now.Add(time.Minute)); err != nil {
+	if err := metadata.RecordVerified(v2, source, cacheManifest(t, now), now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if hit, err := metadata.Lookup(context.Background(), v2); err != nil || !hit.IsHit() {
@@ -88,7 +88,7 @@ func TestCacheOutageFallsBackColdUnlessCompatibilityRequired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	coordinator, err := cacheapp.NewCoordinator(nil, func() time.Time { return now }, time.Millisecond, 1024)
+	coordinator, err := cacheapp.NewColdCoordinator(func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
 	}
