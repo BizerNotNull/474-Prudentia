@@ -22,6 +22,16 @@ import (
 	"github.com/BizerNotNull/474-Prudentia/internal/domain"
 )
 
+type backendSink struct{}
+
+func (backendSink) Write(context.Context, domain.StreamEvent) error { return nil }
+
+type exactRequestBinding struct {
+	RequestID              string `json:"request_id"`
+	ProviderRequestID      string `json:"provider_request_id"`
+	ProviderManifestDigest string `json:"provider_manifest_digest"`
+}
+
 func testIdentity(t *testing.T) domain.WorkloadIdentity {
 	t.Helper()
 	id, err := domain.NewWorkloadIdentity(domain.WorkloadIdentityParams{Cluster: "c", Namespace: "n", LogicalEngine: "e", PodUID: "pod-uid", EndpointEpoch: 7, RecoveryEpoch: 9})
@@ -140,5 +150,90 @@ func TestBackendDoesNotFollowRedirect(t *testing.T) {
 	response.Body.Close()
 	if response.StatusCode != http.StatusTemporaryRedirect || calls != 1 {
 		t.Fatalf("status=%d calls=%d", response.StatusCode, calls)
+	}
+}
+
+func TestTerminationAcknowledgementBindsExactInferencePOSTAndManifest(t *testing.T) {
+	id := testIdentity(t)
+	image, proxy := "sha256:"+strings.Repeat("a", 64), "sha256:"+strings.Repeat("b", 64)
+	claims := PeerIdentityClaims{id.PodUID(), id.EndpointEpoch(), id.RecoveryEpoch(), "m", image, proxy}
+	certificate, _, roots := certificateFixture(t, id, claims)
+	now := time.Now()
+	manifest, err := domain.NewCapabilityManifest(domain.CapabilityManifestParams{ID: "m", SchemaVersion: 1, CapabilityVersion: 1, SignatureVersion: 1, SignatureVerified: true, VerifiedAt: now, ValidFrom: now.Add(-time.Hour), ValidUntil: now.Add(time.Hour), ImageDigest: image, ProxyDigest: proxy, Routes: []string{"/v1/chat/completions", "/v1/prudentia/terminate"}, Fields: []string{"model", "prudentia_request_binding"}, Parser: "p", IdentityProfile: domain.IdentityExactWorkloadMTLS, APCIsolation: domain.APCDisabled, Termination: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var original exactRequestBinding
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if r.URL.Path == "/v1/chat/completions" {
+			var body struct {
+				Binding exactRequestBinding `json:"prudentia_request_binding"`
+			}
+			if json.NewDecoder(r.Body).Decode(&body) != nil {
+				t.Error("invalid inference payload")
+			}
+			original = body.Binding
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"choices":[]}`))
+			return
+		}
+		var termination exactRequestBinding
+		if json.NewDecoder(r.Body).Decode(&termination) != nil {
+			t.Error("invalid termination payload")
+		}
+		if termination != original {
+			t.Error("termination did not reference exact inference POST")
+		}
+		_ = json.NewEncoder(w).Encode(struct {
+			RequestID              string `json:"request_id"`
+			ProviderRequestID      string `json:"provider_request_id"`
+			PodUID                 string `json:"pod_uid"`
+			ProviderManifestDigest string `json:"provider_manifest_digest"`
+			EndpointEpoch          uint64 `json:"endpoint_epoch"`
+			RecoveryEpoch          uint64 `json:"recovery_epoch"`
+			Sequence               uint64 `json:"sequence"`
+			Stopped                bool   `json:"stopped"`
+		}{original.RequestID, original.ProviderRequestID, id.PodUID(), original.ProviderManifestDigest, id.EndpointEpoch(), id.RecoveryEpoch(), 1, true})
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13}
+	server.StartTLS()
+	defer server.Close()
+	backend, err := NewBackend(BackendConfig{TLSConfig: &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{certificate}}, ResponseHeaderTimeout: time.Second, DialTimeout: time.Second, MaxEventBytes: 4096, MaxEvents: 8, MaxResponseBytes: 4096, Now: func() time.Time { return now }, ResolveEndpoint: func(domain.WorkloadIdentity) (string, error) { return server.URL, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID, _ := domain.NewRequestID("request-1")
+	principal, _ := domain.NewPrincipal("tenant", []string{"model"})
+	inference, err := domain.NewInferenceRequest(domain.InferenceRequestParams{RequestID: requestID, Model: "model", Messages: []domain.MessageParams{{Role: "user", Content: "prompt"}}, MaxCompletionTokens: 8, Priority: domain.PriorityNormal, Features: domain.EmptyFeatureSet(), CachePolicy: domain.CachePolicyDisabled, ExecutionBudget: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := domain.NewDispatchTarget(server.URL, id)
+	call, err := domain.NewBackendCall(domain.BackendCallParams{Request: domain.NewAuthorizedRequest(principal, inference), Target: target, Manifest: manifest, ProviderRequestID: "provider-request-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = backend.Infer(context.Background(), call, backendSink{}); err != nil {
+		t.Fatal(err)
+	}
+	if original.RequestID != "request-1" || original.ProviderRequestID != "provider-request-1" || original.ProviderManifestDigest != manifest.PayloadDigestString() {
+		t.Fatal("inference POST omitted exact termination binding")
+	}
+	ref, err := domain.NewProviderRequestRef(domain.ProviderRequestRefParams{Tenant: "tenant", RequestID: "request-1", ProviderRequestID: "provider-request-1", Target: id, Manifest: manifest, ExpiresAt: now.Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = backend.Terminate(context.Background(), ref); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStockManifestCannotClaimTermination(t *testing.T) {
+	now := time.Now()
+	digest := "sha256:" + strings.Repeat("a", 64)
+	_, err := domain.NewCapabilityManifest(domain.CapabilityManifestParams{ID: "stock", SchemaVersion: 1, CapabilityVersion: 1, SignatureVersion: 1, SignatureVerified: true, VerifiedAt: now, ValidFrom: now.Add(-time.Hour), ValidUntil: now.Add(time.Hour), ImageDigest: digest, ProxyDigest: digest, Routes: []string{"/v1/chat/completions"}, Fields: []string{"model"}, Parser: "stock", IdentityProfile: domain.IdentityExactWorkloadMTLS, APCIsolation: domain.APCDisabled, Termination: true})
+	if err == nil {
+		t.Fatal("stock path enabled termination without exact request binding route and field")
 	}
 }

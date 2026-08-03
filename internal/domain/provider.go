@@ -1,7 +1,9 @@
 package domain
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -37,6 +39,7 @@ const (
 )
 
 type CapabilityManifestParams struct {
+	ManifestRevision                                   uint64
 	ID                                                 string
 	SchemaVersion, CapabilityVersion, SignatureVersion uint16
 	SignatureVerified                                  bool
@@ -53,6 +56,7 @@ type CapabilityManifestParams struct {
 }
 
 type CapabilityManifest struct {
+	manifestRevision                                   uint64
 	id                                                 string
 	schemaVersion, capabilityVersion, signatureVersion uint16
 	verifiedAt, validFrom, validUntil                  time.Time
@@ -67,6 +71,9 @@ type CapabilityManifest struct {
 }
 
 func NewCapabilityManifest(p CapabilityManifestParams) (CapabilityManifest, error) {
+	if p.ManifestRevision == 0 {
+		p.ManifestRevision = 1
+	}
 	if !boundedProviderString(p.ID, 256) || p.SchemaVersion != CurrentManifestSchemaVersion || p.CapabilityVersion != CurrentCapabilityVersion || p.SignatureVersion != CurrentSignatureVersion || !p.SignatureVerified || p.VerifiedAt.IsZero() || p.ValidFrom.IsZero() || p.ValidUntil.IsZero() || p.ValidUntil.Before(p.ValidFrom) || p.VerifiedAt.Before(p.ValidFrom) || p.VerifiedAt.After(p.ValidUntil) || !validSHA256Digest(p.ImageDigest) || !validSHA256Digest(p.ProxyDigest) || p.IdentityProfile != IdentityExactWorkloadMTLS || !boundedProviderString(p.Parser, 128) {
 		return CapabilityManifest{}, fmt.Errorf("invalid capability manifest")
 	}
@@ -82,6 +89,9 @@ func NewCapabilityManifest(p CapabilityManifestParams) (CapabilityManifest, erro
 	if err != nil {
 		return CapabilityManifest{}, fmt.Errorf("invalid capability manifest metrics")
 	}
+	if p.Termination && (!containsString(routes, "/v1/prudentia/terminate") || !containsString(fields, "prudentia_request_binding")) {
+		return CapabilityManifest{}, fmt.Errorf("termination capability lacks exact request binding")
+	}
 	switch p.APCIsolation {
 	case APCDisabled, APCTenantDedicated:
 		if p.TenantSaltVersion != 0 || p.TenantSaltProven {
@@ -94,15 +104,42 @@ func NewCapabilityManifest(p CapabilityManifestParams) (CapabilityManifest, erro
 	default:
 		return CapabilityManifest{}, fmt.Errorf("unknown APC isolation")
 	}
-	return CapabilityManifest{id: p.ID, schemaVersion: p.SchemaVersion, capabilityVersion: p.CapabilityVersion, signatureVersion: p.SignatureVersion, verifiedAt: p.VerifiedAt, validFrom: p.ValidFrom, validUntil: p.ValidUntil, imageDigest: p.ImageDigest, proxyDigest: p.ProxyDigest, routes: routes, fields: fields, parser: p.Parser, identityProfile: p.IdentityProfile, apcIsolation: p.APCIsolation, tenantSaltVersion: p.TenantSaltVersion, metrics: metrics, termination: p.Termination, cacheMetadata: p.CacheMetadata, mover: p.Mover}, nil
+	return CapabilityManifest{id: p.ID, schemaVersion: p.SchemaVersion, capabilityVersion: p.CapabilityVersion, signatureVersion: p.SignatureVersion, manifestRevision: p.ManifestRevision, verifiedAt: p.VerifiedAt, validFrom: p.ValidFrom, validUntil: p.ValidUntil, imageDigest: p.ImageDigest, proxyDigest: p.ProxyDigest, routes: routes, fields: fields, parser: p.Parser, identityProfile: p.IdentityProfile, apcIsolation: p.APCIsolation, tenantSaltVersion: p.TenantSaltVersion, metrics: metrics, termination: p.Termination, cacheMetadata: p.CacheMetadata, mover: p.Mover}, nil
 }
-func (m CapabilityManifest) ID() string                       { return m.id }
-func (m CapabilityManifest) SchemaVersion() uint16            { return m.schemaVersion }
-func (m CapabilityManifest) CapabilityVersion() uint16        { return m.capabilityVersion }
-func (m CapabilityManifest) SignatureVersion() uint16         { return m.signatureVersion }
-func (m CapabilityManifest) VerifiedAt() time.Time            { return m.verifiedAt }
-func (m CapabilityManifest) ValidFrom() time.Time             { return m.validFrom }
-func (m CapabilityManifest) ValidUntil() time.Time            { return m.validUntil }
+func (m CapabilityManifest) ID() string                { return m.id }
+func (m CapabilityManifest) SchemaVersion() uint16     { return m.schemaVersion }
+func (m CapabilityManifest) CapabilityVersion() uint16 { return m.capabilityVersion }
+func (m CapabilityManifest) ManifestRevision() uint64  { return m.manifestRevision }
+func (m CapabilityManifest) SignatureVersion() uint16  { return m.signatureVersion }
+func (m CapabilityManifest) VerifiedAt() time.Time     { return m.verifiedAt }
+func (m CapabilityManifest) ValidFrom() time.Time      { return m.validFrom }
+func (m CapabilityManifest) ValidUntil() time.Time     { return m.validUntil }
+func (m CapabilityManifest) PayloadDigest() [32]byte {
+	payload := struct {
+		ID                                                 string
+		SchemaVersion, CapabilityVersion, SignatureVersion uint16
+		ManifestRevision                                   uint64
+		ValidFrom, ValidUntil                              int64
+		ImageDigest, ProxyDigest, Parser                   string
+		Routes, Fields, Metrics                            []string
+		IdentityProfile                                    IdentityProfile
+		APCIsolation                                       APCIsolation
+		TenantSaltVersion                                  uint16
+		Termination, CacheMetadata, Mover                  bool
+	}{
+		m.id, m.schemaVersion, m.capabilityVersion, m.signatureVersion, m.manifestRevision,
+		m.validFrom.UnixNano(), m.validUntil.UnixNano(),
+		m.imageDigest, m.proxyDigest, m.parser, m.routes, m.fields, m.metrics,
+		m.identityProfile, m.apcIsolation, m.tenantSaltVersion,
+		m.termination, m.cacheMetadata, m.mover,
+	}
+	encoded, _ := json.Marshal(payload)
+	return sha256.Sum256(encoded)
+}
+func (m CapabilityManifest) PayloadDigestString() string {
+	digest := m.PayloadDigest()
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
 func (m CapabilityManifest) ImageDigest() string              { return m.imageDigest }
 func (m CapabilityManifest) ProxyDigest() string              { return m.proxyDigest }
 func (m CapabilityManifest) Routes() []string                 { return append([]string(nil), m.routes...) }
@@ -139,7 +176,8 @@ func (m CapabilityManifest) ValidAt(at time.Time) bool {
 	return !at.IsZero() && !at.Before(m.validFrom) && !at.After(m.validUntil) && m.Supports(CapabilityInference)
 }
 func (m CapabilityManifest) Compatible(o CapabilityManifest) bool {
-	return m.id == o.id && m.schemaVersion == o.schemaVersion && m.capabilityVersion == o.capabilityVersion && m.imageDigest == o.imageDigest && m.proxyDigest == o.proxyDigest && m.parser == o.parser && m.identityProfile == o.identityProfile && equalStrings(m.routes, o.routes) && equalStrings(m.fields, o.fields)
+	a, b := m.PayloadDigest(), o.PayloadDigest()
+	return a == b
 }
 func (m CapabilityManifest) String() string { return "capability-manifest[verified]" }
 
@@ -157,7 +195,8 @@ type BackendCall struct {
 }
 
 func NewBackendCall(p BackendCallParams) (BackendCall, error) {
-	if !boundedProviderString(p.ProviderRequestID, 256) || p.Request.Tenant() == "" || p.Target.Endpoint() == "" || !p.Manifest.Supports(CapabilityInference) {
+	_, hasRequestID := p.Request.Request().RequestID()
+	if !boundedProviderString(p.ProviderRequestID, 256) || !hasRequestID || p.Request.Tenant() == "" || p.Target.Endpoint() == "" || !p.Manifest.Supports(CapabilityInference) {
 		return BackendCall{}, fmt.Errorf("invalid backend call")
 	}
 	return BackendCall{p.Request, p.Target, p.Manifest, p.ProviderRequestID}, nil

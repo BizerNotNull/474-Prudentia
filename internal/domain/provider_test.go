@@ -72,3 +72,21 @@ func TestAPCRequiresDedicatedEngineOrProvenTenantSalt(t *testing.T) {
 		t.Fatal("tenant-dedicated APC rejected")
 	}
 }
+
+func TestCapabilityManifestCompatibilityIncludesExactRevision(t *testing.T) {
+	firstParams := validManifestParams()
+	firstParams.ManifestRevision = 1
+	first, err := NewCapabilityManifest(firstParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondParams := validManifestParams()
+	secondParams.ManifestRevision = 2
+	second, err := NewCapabilityManifest(secondParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Compatible(second) || first.PayloadDigestString() == second.PayloadDigestString() {
+		t.Fatal("provider manifest revision was ignored")
+	}
+}

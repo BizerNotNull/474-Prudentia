@@ -2,6 +2,7 @@ package kvmover
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"sync"
 	"time"
@@ -11,63 +12,87 @@ import (
 
 var ErrUnsupported = errors.New("KV mover capability unsupported")
 
-// AuthenticatedControlPlane is implemented by a pinned mTLS connector adapter.
-// Its contract deliberately contains no KV bytes, file descriptors, addresses,
-// or transport descriptors.
+const defaultMaxHandles = 1024
+
+// AuthenticatedControlPlane is a separately configured, mutually authenticated
+// connector channel. Its DTOs cannot carry KV bytes, descriptors, addresses, or
+// file handles.
 type AuthenticatedControlPlane interface {
+	ConnectorIdentity() string
 	Start(context.Context, StartRequest) (StartResponse, error)
 	Status(context.Context, StatusRequest) (StatusResponse, error)
 	Commit(context.Context, HandleRequest) error
 	Abort(context.Context, HandleRequest) error
 }
 
+type DestinationRevalidator interface {
+	RevalidateDestination(context.Context, domain.WorkloadIdentity, domain.CapabilityManifest) error
+}
+
 type StartRequest struct {
-	Tenant, RequestID   string
-	Source, Destination domain.WorkloadIdentity
-	ManifestID          string
-	ExpiresAt           time.Time
-	MaxBytes            uint64
+	Tenant, RequestID       string
+	Source, Destination     domain.WorkloadIdentity
+	ProviderManifestDigest  string
+	ConnectorManifestDigest string
+	ExpiresAt               time.Time
+	MaxBytes                uint64
 }
 type StartResponse struct{ Opaque []byte }
 type StatusRequest struct {
-	Opaque      []byte
-	Tenant      string
-	Destination domain.WorkloadIdentity
-	ManifestID  string
+	Opaque                  []byte
+	Tenant, RequestID       string
+	Source, Destination     domain.WorkloadIdentity
+	ProviderManifestDigest  string
+	ConnectorManifestDigest string
 }
 type HandleRequest = StatusRequest
 type StatusResponse struct {
-	State                      domain.TransferState
-	Sequence, TransferredBytes uint64
-	Tenant                     string
-	Destination                domain.WorkloadIdentity
-	ManifestID                 string
+	State                                           domain.TransferState
+	Sequence, TransferredBytes                      uint64
+	Tenant, RequestID                               string
+	Source, Destination                             domain.WorkloadIdentity
+	ProviderManifestDigest, ConnectorManifestDigest string
 }
 
 type tracked struct {
+	mu                            sync.Mutex
+	handle                        domain.MoverHandle
+	destinationManifest           domain.CapabilityManifest
+	connector                     domain.ConnectorManifest
 	status                        domain.TransferStatus
 	hasStatus, committed, aborted bool
 }
+
 type Mover struct {
 	control        AuthenticatedControlPlane
+	revalidator    DestinationRevalidator
 	now            func() time.Time
 	cleanupTimeout time.Duration
+	maxHandles     int
 	mu             sync.Mutex
-	handles        map[string]tracked
+	handles        map[[32]byte]*tracked
 }
 
-func New(control AuthenticatedControlPlane, now func() time.Time, cleanupTimeout time.Duration) (*Mover, error) {
-	if control == nil || now == nil || cleanupTimeout <= 0 {
+func New(control AuthenticatedControlPlane, revalidator DestinationRevalidator, now func() time.Time, cleanupTimeout time.Duration) (*Mover, error) {
+	return NewBounded(control, revalidator, now, cleanupTimeout, defaultMaxHandles)
+}
+
+func NewBounded(control AuthenticatedControlPlane, revalidator DestinationRevalidator, now func() time.Time, cleanupTimeout time.Duration, maxHandles int) (*Mover, error) {
+	if control == nil || revalidator == nil || now == nil || cleanupTimeout <= 0 || maxHandles <= 0 {
 		return nil, errors.New("invalid mover configuration")
 	}
-	return &Mover{control: control, now: now, cleanupTimeout: cleanupTimeout, handles: make(map[string]tracked)}, nil
+	return &Mover{control: control, revalidator: revalidator, now: now, cleanupTimeout: cleanupTimeout, maxHandles: maxHandles, handles: make(map[[32]byte]*tracked)}, nil
 }
 
 func (m *Mover) Start(ctx context.Context, spec domain.TransferSpec) (domain.MoverHandle, error) {
-	if !spec.SourceManifest().Supports(domain.CapabilityMover) || !spec.DestinationManifest().Supports(domain.CapabilityMover) || !spec.SourceManifest().Compatible(spec.DestinationManifest()) || !m.now().Before(spec.ExpiresAt()) {
+	now := m.now()
+	connector := spec.ConnectorManifest()
+	if !spec.SourceManifest().ValidAt(now) || !spec.DestinationManifest().ValidAt(now) || !spec.SourceManifest().Supports(domain.CapabilityMover) || !spec.DestinationManifest().Supports(domain.CapabilityMover) || !spec.SourceManifest().Compatible(spec.DestinationManifest()) || !connector.ValidAt(now) || connector.Digest() != spec.CacheIdentity().ConnectorManifestDigest() || connector.ControlPlaneIdentity() != m.control.ConnectorIdentity() || !now.Before(spec.ExpiresAt()) {
 		return domain.MoverHandle{}, ErrUnsupported
 	}
-	response, err := m.control.Start(ctx, StartRequest{spec.Tenant(), spec.RequestID(), spec.Source(), spec.Destination(), spec.SourceManifest().ID(), spec.ExpiresAt(), spec.MaxBytes()})
+	opCtx, cancel := operationContext(ctx, now, spec.ExpiresAt(), connector.MaxOperation())
+	defer cancel()
+	response, err := m.control.Start(opCtx, StartRequest{spec.Tenant(), spec.RequestID(), spec.Source(), spec.Destination(), spec.SourceManifest().PayloadDigestString(), connector.Digest(), spec.ExpiresAt(), spec.MaxBytes()})
 	if err != nil {
 		return domain.MoverHandle{}, err
 	}
@@ -75,96 +100,125 @@ func (m *Mover) Start(ctx context.Context, spec domain.TransferSpec) (domain.Mov
 	if err != nil {
 		return domain.MoverHandle{}, err
 	}
+	key := opaqueKey(response.Opaque)
 	m.mu.Lock()
-	m.handles[string(response.Opaque)] = tracked{}
-	m.mu.Unlock()
+	defer m.mu.Unlock()
+	m.evictExpiredLocked(now)
+	if _, collision := m.handles[key]; collision {
+		return domain.MoverHandle{}, errors.New("mover handle collision")
+	}
+	if len(m.handles) >= m.maxHandles {
+		return domain.MoverHandle{}, errors.New("mover handle capacity exceeded")
+	}
+	m.handles[key] = &tracked{handle: handle, destinationManifest: spec.DestinationManifest(), connector: connector}
 	return handle, nil
 }
 
 func (m *Mover) Status(ctx context.Context, handle domain.MoverHandle) (domain.TransferStatus, error) {
-	if !m.now().Before(handle.ExpiresAt()) {
-		return domain.TransferStatus{}, errors.New("mover handle expired")
-	}
-	key := string(handle.Opaque())
-	m.mu.Lock()
-	prior, ok := m.handles[key]
-	m.mu.Unlock()
-	if !ok || prior.committed || prior.aborted {
-		return domain.TransferStatus{}, errors.New("unknown mover handle")
-	}
-	response, err := m.control.Status(ctx, request(handle))
+	item, err := m.lookup(handle)
 	if err != nil {
 		return domain.TransferStatus{}, err
 	}
-	if response.Tenant != handle.Tenant() || !response.Destination.Equal(handle.Destination()) || response.ManifestID != handle.ManifestID() {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	if item.committed || item.aborted || !m.now().Before(handle.ExpiresAt()) {
+		return domain.TransferStatus{}, errors.New("inactive mover handle")
+	}
+	opCtx, cancel := operationContext(ctx, m.now(), handle.ExpiresAt(), item.connector.MaxOperation())
+	defer cancel()
+	response, err := m.control.Status(opCtx, request(handle))
+	if err != nil {
+		return domain.TransferStatus{}, err
+	}
+	if response.Tenant != handle.Tenant() || response.RequestID != handle.RequestID() || !response.Source.Equal(handle.Source()) || !response.Destination.Equal(handle.Destination()) || response.ProviderManifestDigest != handle.CacheIdentity().ProviderManifestDigest() || response.ConnectorManifestDigest != handle.ConnectorManifestDigest() || response.TransferredBytes > handle.MaxBytes() {
 		return domain.TransferStatus{}, errors.New("mover status binding mismatch")
 	}
-	status, err := domain.NewTransferStatus(domain.TransferStatusParams{Handle: handle, State: response.State, Sequence: response.Sequence, TransferredBytes: response.TransferredBytes, Previous: prior.status, HasPrevious: prior.hasStatus})
+	status, err := domain.NewTransferStatus(domain.TransferStatusParams{Handle: handle, State: response.State, Sequence: response.Sequence, TransferredBytes: response.TransferredBytes, Previous: item.status, HasPrevious: item.hasStatus})
 	if err != nil {
 		return domain.TransferStatus{}, err
 	}
-	m.mu.Lock()
-	current, exists := m.handles[key]
-	if exists && current.hasStatus && !current.status.CanAdvanceTo(status) {
-		m.mu.Unlock()
-		return domain.TransferStatus{}, errors.New("non-monotonic concurrent mover status")
-	}
-	current.status, current.hasStatus = status, true
-	m.handles[key] = current
-	m.mu.Unlock()
+	item.status, item.hasStatus = status, true
 	return status, nil
 }
 
 func (m *Mover) Commit(ctx context.Context, handle domain.MoverHandle) error {
-	key := string(handle.Opaque())
-	m.mu.Lock()
-	item, ok := m.handles[key]
-	if !ok || item.aborted || !item.hasStatus || item.status.State() != domain.TransferComplete {
-		m.mu.Unlock()
-		return errors.New("incomplete or unknown mover handle")
-	}
-	if item.committed {
-		m.mu.Unlock()
-		return nil
-	}
-	m.mu.Unlock()
-	if err := m.control.Commit(ctx, request(handle)); err != nil {
+	item, err := m.lookup(handle)
+	if err != nil {
 		return err
 	}
-	m.mu.Lock()
-	item = m.handles[key]
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	if item.committed {
+		return nil
+	}
+	if item.aborted || !item.hasStatus || item.status.State() != domain.TransferComplete || item.status.TransferredBytes() > handle.MaxBytes() || !m.now().Before(handle.ExpiresAt()) {
+		return errors.New("incomplete or inactive mover handle")
+	}
+	opCtx, cancel := operationContext(ctx, m.now(), handle.ExpiresAt(), item.connector.MaxOperation())
+	defer cancel()
+	// This is deliberately the last action before the publish RPC.
+	if err = m.revalidator.RevalidateDestination(opCtx, handle.Destination(), item.destinationManifest); err != nil {
+		return errors.New("destination identity or manifest changed")
+	}
+	if err = m.control.Commit(opCtx, request(handle)); err != nil {
+		return err
+	}
 	item.committed = true
-	m.handles[key] = item
-	m.mu.Unlock()
 	return nil
 }
 
 func (m *Mover) Abort(ctx context.Context, handle domain.MoverHandle) error {
-	key := string(handle.Opaque())
-	m.mu.Lock()
-	item, ok := m.handles[key]
-	if !ok || item.committed {
-		m.mu.Unlock()
+	item, err := m.lookup(handle)
+	if err != nil {
 		return nil
 	}
-	if item.aborted {
-		m.mu.Unlock()
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	if item.committed || item.aborted {
 		return nil
 	}
-	m.mu.Unlock()
-	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.cleanupTimeout)
+	limit := m.cleanupTimeout
+	if manifestLimit := item.connector.MaxOperation(); manifestLimit < limit {
+		limit = manifestLimit
+	}
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), limit)
 	defer cancel()
-	if err := m.control.Abort(cleanup, request(handle)); err != nil {
+	if err = m.control.Abort(cleanup, request(handle)); err != nil {
 		return err
 	}
-	m.mu.Lock()
-	item = m.handles[key]
 	item.aborted = true
-	m.handles[key] = item
-	m.mu.Unlock()
 	return nil
 }
 
+func (m *Mover) lookup(handle domain.MoverHandle) (*tracked, error) {
+	key := opaqueKey(handle.Opaque())
+	m.mu.Lock()
+	item, ok := m.handles[key]
+	m.mu.Unlock()
+	if !ok || item.handle.Tenant() != handle.Tenant() || item.handle.RequestID() != handle.RequestID() || !item.handle.Source().Equal(handle.Source()) || !item.handle.Destination().Equal(handle.Destination()) || item.handle.ConnectorManifestDigest() != handle.ConnectorManifestDigest() {
+		return nil, errors.New("unknown mover handle")
+	}
+	return item, nil
+}
+
+func (m *Mover) evictExpiredLocked(now time.Time) {
+	for key, item := range m.handles {
+		if !now.Before(item.handle.ExpiresAt()) {
+			delete(m.handles, key)
+		}
+	}
+}
+
 func request(handle domain.MoverHandle) HandleRequest {
-	return HandleRequest{Opaque: handle.Opaque(), Tenant: handle.Tenant(), Destination: handle.Destination(), ManifestID: handle.ManifestID()}
+	return HandleRequest{handle.Opaque(), handle.Tenant(), handle.RequestID(), handle.Source(), handle.Destination(), handle.CacheIdentity().ProviderManifestDigest(), handle.ConnectorManifestDigest()}
+}
+
+func opaqueKey(opaque []byte) [32]byte { return sha256.Sum256(opaque) }
+
+func operationContext(parent context.Context, now, expiry time.Time, max time.Duration) (context.Context, context.CancelFunc) {
+	deadline := expiry
+	if bounded := now.Add(max); bounded.Before(deadline) {
+		deadline = bounded
+	}
+	return context.WithDeadline(parent, deadline)
 }
