@@ -5,19 +5,37 @@ spec: {holderIdentity: "", leaseDurationSeconds: 30}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
-metadata: {name: prudentia-controller, namespace: prudentia-system}
+metadata: {name: prudentia-controller-lease, namespace: prudentia-system}
+rules:
+- apiGroups: [coordination.k8s.io]
+  resources: [leases]
+  resourceNames: [prudentia-controller]
+  verbs: [get, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: prudentia-controller-lease, namespace: prudentia-system}
+subjects: [{kind: ServiceAccount, name: controller, namespace: prudentia-system}]
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: prudentia-controller-lease}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: prudentia-controller, namespace: prudentia-inference}
 rules:
 - apiGroups: [""]
-  resources: [pods, services]
-  verbs: [get, list, watch]
-- apiGroups: [""]
   resources: [pods]
-  verbs: [delete]
+  verbs: [get, list, watch, patch, delete]
+- apiGroups: [""]
+  resources: [services]
+  verbs: [get, list, watch]
 - apiGroups: [policy]
   resources: [pods/eviction]
   verbs: [create]
 - apiGroups: [discovery.k8s.io]
   resources: [endpointslices]
+  verbs: [get, list, watch]
+- apiGroups: [apps]
+  resources: [replicasets]
   verbs: [get, list, watch]
 - apiGroups: [apps]
   resources: [deployments, statefulsets]
@@ -28,20 +46,15 @@ rules:
 - apiGroups: [prudentia.io]
   resources: [inferencefleets/status]
   verbs: [get, patch, update]
-- apiGroups: [coordination.k8s.io]
-  resources: [leases]
-  resourceNames: [prudentia-controller]
-  verbs: [get, update, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
-metadata: {name: prudentia-controller, namespace: prudentia-system}
+metadata: {name: prudentia-controller, namespace: prudentia-inference}
 subjects: [{kind: ServiceAccount, name: controller, namespace: prudentia-system}]
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: prudentia-controller}
 ---
-# This policy reserves operation annotations and binds mutations to the dedicated
-# controller identity. Namespace isolation is the authorization boundary because
-# Kubernetes cannot label-scope list/watch or resourceName-scope create/delete.
+# Dedicated-namespace RBAC is paired with fail-closed admission. Every direct
+# delete and policy/v1 eviction carries exact UID/resourceVersion preconditions.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata: {name: prudentia-operation-ownership}
@@ -57,24 +70,35 @@ spec:
       apiVersions: [v1]
       operations: [UPDATE, DELETE]
       resources: [pods]
+    - apiGroups: [policy]
+      apiVersions: [v1]
+      operations: [CREATE]
+      resources: [pods/eviction]
   validations:
+  - expression: request.userInfo.username == 'system:serviceaccount:prudentia-system:controller'
+    message: only the dedicated Prudentia controller may mutate inference workloads
   - expression: >-
-      request.userInfo.username == 'system:serviceaccount:prudentia-system:controller'
-    message: only the namespace controller may mutate managed workloads or Pods
+      request.resource.group == 'policy' ||
+      (oldObject.metadata.labels['prudentia.io/managed-owner'] == 'controller' &&
+       (request.operation == 'DELETE' || object.metadata.labels['prudentia.io/managed-owner'] == 'controller'))
+    message: workload and Pod mutations require controller ownership
   - expression: >-
-      oldObject.metadata.labels['prudentia.io/managed-owner'] == 'controller' &&
-      (request.operation == 'DELETE' || object.metadata.labels['prudentia.io/managed-owner'] == 'controller')
-    message: target must have controller ownership
-  - expression: >-
-      request.operation == 'DELETE' ||
+      request.operation == 'DELETE' || request.resource.group == 'policy' ||
       (has(object.metadata.annotations['prudentia.io/operation-token']) &&
        has(object.metadata.annotations['prudentia.io/operation-generation']) &&
-       has(object.metadata.annotations['prudentia.io/admission-closed']))
-    message: workload mutation requires current operation token, generation, and closed admission
+       object.metadata.annotations['prudentia.io/admission-closed'] == 'true')
+    message: updates require the current operation token, generation, and closed admission
   - expression: >-
       request.operation != 'DELETE' ||
-      (has(request.options.preconditions) && has(request.options.preconditions.uid) && has(request.options.preconditions.resourceVersion))
-    message: Pod deletion requires exact UID and resourceVersion preconditions
+      (has(request.options.preconditions) && has(request.options.preconditions.uid) &&
+       has(request.options.preconditions.resourceVersion))
+    message: direct Pod deletion requires exact UID and resourceVersion preconditions
+  - expression: >-
+      request.resource.group != 'policy' ||
+      (has(object.deleteOptions) && has(object.deleteOptions.preconditions) &&
+       has(object.deleteOptions.preconditions.uid) &&
+       has(object.deleteOptions.preconditions.resourceVersion))
+    message: eviction requires exact UID and token-bound resourceVersion preconditions
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

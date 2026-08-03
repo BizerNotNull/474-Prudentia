@@ -22,36 +22,31 @@ const (
 	proxyPortName     = "proxy"
 )
 
+type discoveredEngine struct {
+	state    domain.ResourceState
+	workload domain.WorkloadRef
+	members  []domain.PodRef
+}
+
 // ReconcileDiscovery performs a level read rooted at an opted-in headless Service.
-// Incomplete joins deliberately produce a tombstone rather than partial engine capacity.
+// Every member receives the same exact, complete workload membership fact.
 func (a *Adapter) ReconcileDiscovery(ctx context.Context, key domain.ResourceKey, generation domain.WriterGeneration) ([]domain.Observation, error) {
-	state, err := a.reconcileService(ctx, key)
+	group, err := a.discoverEngine(ctx, key)
 	if err != nil {
 		return nil, err
 	}
-	projections := state.Projections()
+	projections := group.state.Projections()
 	observations := make([]domain.Observation, 0, len(projections))
-	sequence := uint64(1)
 	for _, projection := range projections {
-		stamp, err := domain.NewSourceStamp(domain.SourceStructural, generation, domain.SourceSequence(sequence))
+		stamp, err := domain.NewSourceStamp(domain.SourceStructural, generation, a.nextSourceSequence())
 		if err != nil {
 			return nil, err
 		}
-		// The legacy projection contains one Pod. Structural observations normalize it as a
-		// complete one-member engine fact while the ResourceState API retains the full group.
-		resource, err := domain.NewResourceRef(domain.ResourceRefParams{Cluster: a.config.Cluster, Namespace: key.Namespace(), Name: key.Name(), UID: projection.Identity().PodUID(), ResourceVersion: "observed"})
-		if err != nil {
-			return nil, err
-		}
-		workload, err := domain.NewWorkloadRef(domain.WorkloadDeployment, resource, int32(len(projections)))
-		if err != nil {
-			return nil, err
-		}
-		pod, err := domain.NewPodRef(domain.PodRefParams{Resource: resource, WorkloadUID: projection.Identity().PodUID()})
-		if err != nil {
-			return nil, err
-		}
-		fact, err := domain.NewStructuralFact(domain.StructuralFactParams{Endpoint: projection.Endpoint(), Model: projection.Model(), Workload: workload, Members: []domain.PodRef{pod}, EndpointEpoch: projection.Identity().EndpointEpoch(), RecoveryEpoch: projection.Identity().RecoveryEpoch()})
+		fact, err := domain.NewStructuralFact(domain.StructuralFactParams{
+			Endpoint: projection.Endpoint(), Model: projection.Model(), Workload: group.workload,
+			Members: group.members, EndpointEpoch: projection.Identity().EndpointEpoch(),
+			RecoveryEpoch: projection.Identity().RecoveryEpoch(),
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -60,55 +55,70 @@ func (a *Adapter) ReconcileDiscovery(ctx context.Context, key domain.ResourceKey
 			return nil, err
 		}
 		observations = append(observations, observation)
-		sequence++
 	}
 	return observations, nil
 }
 
 func (a *Adapter) reconcileService(ctx context.Context, key domain.ResourceKey) (domain.ResourceState, error) {
+	group, err := a.discoverEngine(ctx, key)
+	return group.state, err
+}
+
+func (a *Adapter) discoverEngine(ctx context.Context, key domain.ResourceKey) (discoveredEngine, error) {
+	empty := func() (discoveredEngine, error) {
+		state, err := domain.NewResourceState(a.config.Cluster, key, nil)
+		return discoveredEngine{state: state}, err
+	}
 	service, err := a.client.CoreV1().Services(key.Namespace()).Get(ctx, key.Name(), metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			return domain.NewResourceState(a.config.Cluster, key, nil)
+			return empty()
 		}
-		return domain.ResourceState{}, fmt.Errorf("read Service level state: %w", err)
+		return discoveredEngine{}, fmt.Errorf("read Service level state: %w", err)
 	}
 	if service.Annotations[annotationEnabled] != "true" || service.Spec.ClusterIP != corev1.ClusterIPNone {
-		return domain.NewResourceState(a.config.Cluster, key, nil)
+		return empty()
 	}
 	slices, err := a.client.DiscoveryV1().EndpointSlices(key.Namespace()).List(ctx, metav1.ListOptions{LabelSelector: discoveryv1.LabelServiceName + "=" + service.Name})
 	if err != nil {
-		return domain.ResourceState{}, fmt.Errorf("list EndpointSlices: %w", err)
+		return discoveredEngine{}, fmt.Errorf("list EndpointSlices: %w", err)
 	}
-	if len(slices.Items) == 0 {
-		return domain.NewResourceState(a.config.Cluster, key, nil)
-	}
-	pods, err := a.client.CoreV1().Pods(key.Namespace()).List(ctx, metav1.ListOptions{})
+	podList, err := a.client.CoreV1().Pods(key.Namespace()).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return domain.ResourceState{}, fmt.Errorf("list target Pods: %w", err)
+		return discoveredEngine{}, fmt.Errorf("list target Pods: %w", err)
 	}
-	byUID := make(map[types.UID]*corev1.Pod, len(pods.Items))
-	for i := range pods.Items {
-		byUID[pods.Items[i].UID] = &pods.Items[i]
+	selected := make(map[types.UID]*corev1.Pod)
+	allPods := make(map[types.UID]*corev1.Pod, len(podList.Items))
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		allPods[pod.UID] = pod
+		if serviceSelects(service, pod) {
+			selected[pod.UID] = pod
+		}
+	}
+	if len(selected) == 0 || len(slices.Items) == 0 {
+		return empty()
 	}
 	replicaSets, err := a.client.AppsV1().ReplicaSets(key.Namespace()).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return domain.ResourceState{}, fmt.Errorf("list ReplicaSet ownership: %w", err)
+		return discoveredEngine{}, fmt.Errorf("list ReplicaSet ownership: %w", err)
 	}
 	deployments, err := a.client.AppsV1().Deployments(key.Namespace()).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return domain.ResourceState{}, fmt.Errorf("list Deployment ownership: %w", err)
+		return discoveredEngine{}, fmt.Errorf("list Deployment ownership: %w", err)
 	}
 	statefulSets, err := a.client.AppsV1().StatefulSets(key.Namespace()).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return domain.ResourceState{}, fmt.Errorf("list StatefulSet ownership: %w", err)
+		return discoveredEngine{}, fmt.Errorf("list StatefulSet ownership: %w", err)
 	}
-	workloads := make(map[types.UID]struct{}, len(deployments.Items)+len(statefulSets.Items))
-	for _, deployment := range deployments.Items {
-		workloads[deployment.UID] = struct{}{}
+	workloads := make(map[types.UID]workloadLevel, len(deployments.Items)+len(statefulSets.Items))
+	for i := range deployments.Items {
+		level := deploymentLevel(&deployments.Items[i])
+		workloads[deployments.Items[i].UID] = level
 	}
-	for _, statefulSet := range statefulSets.Items {
-		workloads[statefulSet.UID] = struct{}{}
+	for i := range statefulSets.Items {
+		level := statefulSetLevel(&statefulSets.Items[i])
+		workloads[statefulSets.Items[i].UID] = level
 	}
 	replicaSetOwners := make(map[types.UID]types.UID, len(replicaSets.Items))
 	for _, replicaSet := range replicaSets.Items {
@@ -119,65 +129,73 @@ func (a *Adapter) reconcileService(ctx context.Context, key domain.ResourceKey) 
 		}
 	}
 	var projections []domain.BackendProjection
-	seen := map[types.UID]struct{}{}
-	engine := ""
+	seen := make(map[types.UID]struct{}, len(selected))
+	model, engine := "", ""
 	var groupOwner types.UID
 	for _, slice := range slices.Items {
 		if !sliceHasProxyPort(slice, a.config.ProxyPort) {
-			return domain.NewResourceState(a.config.Cluster, key, nil)
+			return empty()
 		}
 		for _, endpoint := range slice.Endpoints {
-			if endpoint.TargetRef == nil || endpoint.TargetRef.Kind != "Pod" || endpoint.TargetRef.UID == "" || endpoint.Conditions.Ready == nil || !*endpoint.Conditions.Ready || len(endpoint.Addresses) == 0 {
-				return domain.NewResourceState(a.config.Cluster, key, nil)
+			if endpoint.TargetRef == nil || endpoint.TargetRef.Kind != "Pod" || endpoint.TargetRef.UID == "" || endpoint.Conditions.Ready == nil || !*endpoint.Conditions.Ready || len(endpoint.Addresses) != 1 {
+				return empty()
 			}
-			pod := byUID[endpoint.TargetRef.UID]
-			if pod == nil || !serviceSelects(service, pod) {
-				return domain.NewResourceState(a.config.Cluster, key, nil)
+			pod := allPods[endpoint.TargetRef.UID]
+			if pod == nil || selected[pod.UID] == nil || endpoint.Addresses[0] != pod.Status.PodIP {
+				return empty()
 			}
 			owner, ok := controllerOwner(pod.OwnerReferences)
-			if !ok {
-				return domain.NewResourceState(a.config.Cluster, key, nil)
-			}
 			if parent, viaReplicaSet := replicaSetOwners[owner]; viaReplicaSet {
 				owner = parent
 			}
-			if _, managed := workloads[owner]; !managed {
-				return domain.NewResourceState(a.config.Cluster, key, nil)
+			if !ok || workloads[owner].object == nil || (groupOwner != "" && groupOwner != owner) {
+				return empty()
 			}
-			if groupOwner == "" {
-				groupOwner = owner
-			} else if groupOwner != owner {
-				return domain.NewResourceState(a.config.Cluster, key, nil)
-			}
+			groupOwner = owner
 			if _, duplicate := seen[pod.UID]; duplicate {
 				continue
 			}
+			projection, eligible, err := a.projection(ctx, pod)
+			if err != nil {
+				return discoveredEngine{}, err
+			}
+			if !eligible || (model != "" && projection.Model() != model) || (engine != "" && projection.Identity().LogicalEngine() != engine) {
+				return empty()
+			}
+			model = projection.Model()
+			engine = projection.Identity().LogicalEngine()
 			seen[pod.UID] = struct{}{}
-			copy := pod.DeepCopy()
-			copy.Status.PodIP = endpoint.Addresses[0]
-			projection, eligible, err := a.projection(copy)
-			if err != nil || !eligible {
-				return domain.NewResourceState(a.config.Cluster, key, nil)
-			}
-			if engine == "" {
-				engine = projection.Identity().LogicalEngine()
-			}
-			if projection.Identity().LogicalEngine() != engine {
-				return domain.NewResourceState(a.config.Cluster, key, nil)
-			}
 			projections = append(projections, projection)
 		}
 	}
-	if len(projections) == 0 {
-		return domain.NewResourceState(a.config.Cluster, key, nil)
+	if len(seen) != len(selected) {
+		return empty()
 	}
 	sort.Slice(projections, func(i, j int) bool { return projections[i].Identity().PodUID() < projections[j].Identity().PodUID() })
-	return domain.NewResourceState(a.config.Cluster, key, projections)
+	level := workloads[groupOwner]
+	workload, err := workloadRef(a.config.Cluster, level.object, level.kind, level.replicas)
+	if err != nil {
+		return discoveredEngine{}, err
+	}
+	members := make([]domain.PodRef, 0, len(projections))
+	for _, projection := range projections {
+		pod := selected[types.UID(projection.Identity().PodUID())]
+		member, err := podRef(a.config.Cluster, pod, string(groupOwner), nil)
+		if err != nil {
+			return discoveredEngine{}, err
+		}
+		members = append(members, member)
+	}
+	state, err := domain.NewResourceState(a.config.Cluster, key, projections)
+	if err != nil {
+		return discoveredEngine{}, err
+	}
+	return discoveredEngine{state: state, workload: workload, members: members}, nil
 }
 
 func sliceHasProxyPort(slice discoveryv1.EndpointSlice, port uint16) bool {
 	for _, p := range slice.Ports {
-		if p.Port != nil && uint16(*p.Port) == port && (p.Name == nil || *p.Name == proxyPortName) {
+		if p.Port != nil && p.Name != nil && *p.Name == proxyPortName && uint16(*p.Port) == port {
 			return true
 		}
 	}

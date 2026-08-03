@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/BizerNotNull/474-Prudentia/internal/domain"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -94,6 +96,33 @@ func barrierPatch(uid types.UID, rv string, annotations map[string]string, op do
 	return json.Marshal(patch)
 }
 
+func workloadBarrierPatch(uid types.UID, rv string, annotations, templateAnnotations map[string]string, op domain.WorkloadOperationRef) ([]byte, error) {
+	raw, err := barrierPatch(uid, rv, annotations, op)
+	if err != nil {
+		return nil, err
+	}
+	var patch []map[string]any
+	if err := json.Unmarshal(raw, &patch); err != nil {
+		return nil, err
+	}
+	if prior, ok := templateAnnotations[annotationOperationToken]; ok {
+		patch = append(patch, map[string]any{"op": "test", "path": "/spec/template/metadata/annotations/prudentia.io~1operation-token", "value": prior})
+	}
+	updated := make(map[string]string, len(templateAnnotations)+3)
+	for key, value := range templateAnnotations {
+		updated[key] = value
+	}
+	updated[annotationOperationGeneration] = strconv.FormatUint(op.Generation(), 10)
+	updated[annotationOperationToken] = op.Token()
+	updated[annotationAdmissionClosed] = "true"
+	opName := "replace"
+	if templateAnnotations == nil {
+		opName = "add"
+	}
+	patch = append(patch, map[string]any{"op": opName, "path": "/spec/template/metadata/annotations", "value": updated})
+	return json.Marshal(patch)
+}
+
 // InstallWorkloadOperationBarrier atomically advances the workload and every current owned Pod,
 // then reads all objects back. A partial result is never returned as proof.
 func (a *Adapter) InstallWorkloadOperationBarrier(ctx context.Context, operation domain.WorkloadOperation, ref domain.WorkloadRef, _ []domain.PodRef) (domain.WorkloadBarrierProof, error) {
@@ -107,7 +136,7 @@ func (a *Adapter) InstallWorkloadOperationBarrier(ctx context.Context, operation
 	if current.uid != ref.UID() {
 		return domain.WorkloadBarrierProof{}, ErrOperationConflict
 	}
-	body, err := barrierPatch(types.UID(current.uid), current.rv, current.annotations, operation.Ref())
+	body, err := workloadBarrierPatch(types.UID(current.uid), current.rv, current.annotations, current.templateAnnotations, operation.Ref())
 	if err != nil {
 		return domain.WorkloadBarrierProof{}, err
 	}
@@ -133,7 +162,7 @@ func (a *Adapter) InstallWorkloadOperationBarrier(ctx context.Context, operation
 		}
 	}
 	observed, err := a.getWorkload(ctx, ref.Kind(), ref.Namespace(), ref.Name())
-	if err != nil || observed.uid != ref.UID() || !hasBarrier(observed.annotations, operation.Ref()) {
+	if err != nil || observed.uid != ref.UID() || !hasBarrier(observed.annotations, operation.Ref()) || !hasBarrier(observed.templateAnnotations, operation.Ref()) {
 		if err == nil {
 			err = ErrOperationConflict
 		}
@@ -280,6 +309,48 @@ func (a *Adapter) ObserveWorkloadVictims(ctx context.Context, op domain.Workload
 	return domain.NewWorkloadVictimObservation(domain.WorkloadVictimObservationParams{Operation: op, Workload: ref, Before: before, Terminating: t, Disappeared: d, Surviving: s, ObservedAt: time.Now().UTC()})
 }
 
+// BuildWorkloadCompletionProof performs a fresh API-server level read. Reopen is
+// impossible while a replacement/terminating Pod lacks the current operation barrier.
+func (a *Adapter) BuildWorkloadCompletionProof(ctx context.Context, barrier domain.WorkloadBarrierProof, victims domain.WorkloadVictimObservation) (domain.WorkloadCompletionProof, error) {
+	op := barrier.Operation()
+	if victims.Operation() != op {
+		return domain.WorkloadCompletionProof{}, ErrOperationConflict
+	}
+	current, err := a.findWorkloadByUID(ctx, op.WorkloadUID())
+	if err != nil {
+		return domain.WorkloadCompletionProof{}, err
+	}
+	if !hasBarrier(current.annotations, op) || !hasBarrier(current.templateAnnotations, op) {
+		return domain.WorkloadCompletionProof{}, ErrOperationConflict
+	}
+	pods, err := a.listOwnedPods(ctx, op.WorkloadUID(), current.object.GetNamespace())
+	if err != nil {
+		return domain.WorkloadCompletionProof{}, err
+	}
+	currentPods := make([]domain.PodRef, 0, len(pods))
+	for i := range pods {
+		if pods[i].DeletionTimestamp != nil || !hasBarrier(pods[i].Annotations, op) {
+			return domain.WorkloadCompletionProof{}, ErrOperationConflict
+		}
+		ref, err := podRef(a.config.Cluster, &pods[i], op.WorkloadUID(), &op)
+		if err != nil {
+			return domain.WorkloadCompletionProof{}, err
+		}
+		currentPods = append(currentPods, ref)
+	}
+	if int32(len(currentPods)) != current.replicas {
+		return domain.WorkloadCompletionProof{}, ErrOperationConflict
+	}
+	workload, err := workloadRef(a.config.Cluster, current.object, current.kind, current.replicas)
+	if err != nil {
+		return domain.WorkloadCompletionProof{}, err
+	}
+	return domain.NewWorkloadCompletionProof(domain.WorkloadCompletionProofParams{
+		Barrier: barrier, Victims: victims, Current: workload, CurrentPods: currentPods,
+		DesiredReplicas: current.replicas, CompletedAt: time.Now().UTC(),
+	})
+}
+
 func (a *Adapter) ObserveIdentityGone(ctx context.Context, id domain.WorkloadIdentity) (domain.IdentityGoneProof, error) {
 	pods, err := a.client.CoreV1().Pods(id.Namespace()).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -311,18 +382,80 @@ func (a *Adapter) ObserveIdentityGone(ctx context.Context, id domain.WorkloadIde
 	if generation == 0 || !revoked || len(evidence) == 0 {
 		return domain.IdentityGoneProof{}, ErrIdentityNotGone
 	}
-	podHash := sha256.Sum256([]byte("pod-list:" + id.PodUID()))
-	endpointHash := sha256.Sum256([]byte("endpoint-list:" + strconv.FormatUint(id.EndpointEpoch(), 10)))
-	fenceHash := sha256.Sum256(evidence)
+	podEvidence, err := json.Marshal(struct {
+		Cluster, Namespace, PodUID   string
+		EndpointEpoch, RecoveryEpoch uint64
+		ListResourceVersion          string
+		ObservedPodUIDs              []string
+	}{
+		Cluster: id.Cluster(), Namespace: id.Namespace(), PodUID: id.PodUID(),
+		EndpointEpoch: id.EndpointEpoch(), RecoveryEpoch: id.RecoveryEpoch(),
+		ListResourceVersion: pods.ResourceVersion, ObservedPodUIDs: sortedPodUIDs(pods.Items),
+	})
+	if err != nil {
+		return domain.IdentityGoneProof{}, err
+	}
+	endpointEvidence, err := json.Marshal(struct {
+		Cluster, Namespace, LogicalEngine, PodUID string
+		EndpointEpoch, RecoveryEpoch              uint64
+		ListResourceVersion                       string
+		Slices                                    []endpointSliceEvidence
+	}{
+		Cluster: id.Cluster(), Namespace: id.Namespace(), LogicalEngine: id.LogicalEngine(), PodUID: id.PodUID(),
+		EndpointEpoch: id.EndpointEpoch(), RecoveryEpoch: id.RecoveryEpoch(),
+		ListResourceVersion: slices.ResourceVersion, Slices: exactEndpointSliceEvidence(slices.Items),
+	})
+	if err != nil {
+		return domain.IdentityGoneProof{}, err
+	}
+	podHash := sha256.Sum256(podEvidence)
+	endpointHash := sha256.Sum256(endpointEvidence)
+	fenceBinding := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%d\x00%d\x00", id.Cluster(), id.Namespace(), id.LogicalEngine(), id.PodUID(), id.EndpointEpoch(), id.RecoveryEpoch())
+	fenceHash := sha256.Sum256(append([]byte(fenceBinding), evidence...))
 	return domain.NewIdentityGoneProof(domain.IdentityGoneProofParams{WriterGeneration: generation, Identity: id, PodAbsenceEvidenceHash: podHash, EndpointWithdrawalEvidenceHash: endpointHash, ExecutionFenceEvidenceHash: fenceHash})
 }
 
+type endpointSliceEvidence struct {
+	Name, ResourceVersion string
+	Targets               []string
+}
+
+func sortedPodUIDs(pods []corev1.Pod) []string {
+	values := make([]string, 0, len(pods))
+	for i := range pods {
+		values = append(values, string(pods[i].UID))
+	}
+	sort.Strings(values)
+	return values
+}
+
+func exactEndpointSliceEvidence(slices []discoveryv1.EndpointSlice) []endpointSliceEvidence {
+	values := make([]endpointSliceEvidence, 0, len(slices))
+	for i := range slices {
+		targets := make([]string, 0, len(slices[i].Endpoints))
+		for _, endpoint := range slices[i].Endpoints {
+			uid := ""
+			if endpoint.TargetRef != nil {
+				uid = string(endpoint.TargetRef.UID)
+			}
+			addresses := append([]string(nil), endpoint.Addresses...)
+			sort.Strings(addresses)
+			targets = append(targets, uid+"@"+strings.Join(addresses, ","))
+		}
+		sort.Strings(targets)
+		values = append(values, endpointSliceEvidence{Name: slices[i].Name, ResourceVersion: slices[i].ResourceVersion, Targets: targets})
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i].Name < values[j].Name })
+	return values
+}
+
 type workloadLevel struct {
-	object      metav1.Object
-	kind        domain.WorkloadKind
-	uid, rv     string
-	replicas    int32
-	annotations map[string]string
+	object              metav1.Object
+	kind                domain.WorkloadKind
+	uid, rv             string
+	replicas            int32
+	annotations         map[string]string
+	templateAnnotations map[string]string
 }
 
 func (a *Adapter) getWorkload(ctx context.Context, kind domain.WorkloadKind, namespace, name string) (workloadLevel, error) {
@@ -345,14 +478,15 @@ func deploymentLevel(v *appsv1.Deployment) workloadLevel {
 	if v.Spec.Replicas != nil {
 		replicas = *v.Spec.Replicas
 	}
-	return workloadLevel{object: v, kind: domain.WorkloadDeployment, uid: string(v.UID), rv: v.ResourceVersion, replicas: replicas, annotations: v.Annotations}
+	return workloadLevel{object: v, kind: domain.WorkloadDeployment, uid: string(v.UID), rv: v.ResourceVersion, replicas: replicas, annotations: v.Annotations, templateAnnotations: v.Spec.Template.Annotations}
 }
+
 func statefulSetLevel(v *appsv1.StatefulSet) workloadLevel {
 	replicas := int32(1)
 	if v.Spec.Replicas != nil {
 		replicas = *v.Spec.Replicas
 	}
-	return workloadLevel{object: v, kind: domain.WorkloadStatefulSet, uid: string(v.UID), rv: v.ResourceVersion, replicas: replicas, annotations: v.Annotations}
+	return workloadLevel{object: v, kind: domain.WorkloadStatefulSet, uid: string(v.UID), rv: v.ResourceVersion, replicas: replicas, annotations: v.Annotations, templateAnnotations: v.Spec.Template.Annotations}
 }
 
 func (a *Adapter) patchWorkload(ctx context.Context, kind domain.WorkloadKind, namespace, name string, patch []byte) error {

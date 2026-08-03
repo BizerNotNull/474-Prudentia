@@ -43,7 +43,7 @@ func (f *fencingCatalog) RecordWorkloadVictims(context.Context, domain.WriterGen
 	f.record("victims")
 	return nil
 }
-func (f *fencingCatalog) CompleteWorkloadOperationAndReopen(context.Context, domain.WriterGeneration, domain.WorkloadOperationRef) error {
+func (f *fencingCatalog) CompleteWorkloadOperationAndReopen(context.Context, domain.WriterGeneration, domain.WorkloadCompletionProof) error {
 	f.record("complete")
 	close(f.completed)
 	return nil
@@ -58,6 +58,7 @@ type fencingSource struct {
 	fakeDiscovery
 	proof      domain.WorkloadBarrierProof
 	victims    domain.WorkloadVictimObservation
+	completion domain.WorkloadCompletionProof
 	reconciled chan struct{}
 	once       sync.Once
 }
@@ -72,6 +73,9 @@ func (f *fencingSource) InstallWorkloadOperationBarrier(context.Context, domain.
 func (f *fencingSource) ObserveWorkloadVictims(context.Context, domain.WorkloadOperationRef, domain.PodUIDSet) (domain.WorkloadVictimObservation, error) {
 	return f.victims, nil
 }
+func (f *fencingSource) BuildWorkloadCompletionProof(context.Context, domain.WorkloadBarrierProof, domain.WorkloadVictimObservation) (domain.WorkloadCompletionProof, error) {
+	return f.completion, nil
+}
 
 func TestRunLeaderDoesNotReopenOrWriteBeforeHandoffQuiescence(t *testing.T) {
 	key, _ := domain.NewResourceKey("models", "svc")
@@ -84,11 +88,12 @@ func TestRunLeaderDoesNotReopenOrWriteBeforeHandoffQuiescence(t *testing.T) {
 	before, _ := domain.NewPodUIDSet([]string{"pod-uid"})
 	empty, _ := domain.NewPodUIDSet(nil)
 	victims, _ := domain.NewWorkloadVictimObservation(domain.WorkloadVictimObservationParams{Operation: op.Ref(), Workload: workload, Before: before, Terminating: empty, Disappeared: empty, Surviving: before, ObservedAt: time.Unix(102, 0).UTC()})
+	completion, _ := domain.NewWorkloadCompletionProof(domain.WorkloadCompletionProofParams{Barrier: proof, Victims: victims, Current: workload, CurrentPods: []domain.PodRef{pod}, DesiredReplicas: 1, CompletedAt: time.Unix(103, 0).UTC()})
 	state, _ := domain.NewResourceState("cluster", key, nil)
 	catalog := &fencingCatalog{op: op, barrierSeen: make(chan struct{}), allowOld: make(chan struct{}), completed: make(chan struct{})}
-	source := &fencingSource{fakeDiscovery: fakeDiscovery{key: key, state: state}, proof: proof, victims: victims, reconciled: make(chan struct{})}
+	source := &fencingSource{fakeDiscovery: fakeDiscovery{key: key, state: state}, proof: proof, victims: victims, completion: completion, reconciled: make(chan struct{})}
 	ready := &fakeReadiness{becameReady: make(chan struct{})}
-	controller, err := New("cluster", "holder", 1, 4, catalog, source, fakeElector{}, ready)
+	controller, err := New("cluster", "holder", 1, 4, catalog, source, fakeElector{}, ready, fakeProvider{})
 	if err != nil {
 		t.Fatal(err)
 	}

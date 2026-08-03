@@ -24,11 +24,11 @@ func TestJoinedDiscoveryDeduplicatesHintsAndTracksReplacementUID(t *testing.T) {
 	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "engine", Annotations: map[string]string{annotationEnabled: "true"}}, Spec: corev1.ServiceSpec{ClusterIP: corev1.ClusterIPNone, Selector: map[string]string{"app": "engine"}}}
 	pod := eligiblePod("new-uid", "10.0.0.2")
 	controlled := true
-	workload := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "engine", UID: "workload-uid"}}
+	workload := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "engine", UID: "workload-uid", ResourceVersion: "workload-rv"}}
 	pod.OwnerReferences = []metav1.OwnerReference{{UID: workload.UID, Controller: &controlled}}
 	slice := &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "engine-a", Labels: map[string]string{discoveryv1.LabelServiceName: "engine"}}, Ports: []discoveryv1.EndpointPort{{Name: &portName, Port: &port}}, Endpoints: []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.2"}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}, TargetRef: &corev1.ObjectReference{Kind: "Pod", UID: pod.UID}}, {Addresses: []string{"10.0.0.2"}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}, TargetRef: &corev1.ObjectReference{Kind: "Pod", UID: pod.UID}}}}
 	client := fake.NewClientset(service, workload, pod, slice)
-	a := &Adapter{client: client, config: Config{Cluster: "cluster", Namespace: "models", ProxyPort: 8443, ObservationTTL: time.Minute}}
+	a := &Adapter{client: client, config: Config{Cluster: "cluster", Namespace: "models", ProxyPort: 8443, ObservationTTL: time.Minute, IdentityRegistry: fakeIdentityRegistry{ready: true}}}
 	key, _ := domain.NewResourceKey("models", "engine")
 	first, err := a.reconcileService(context.Background(), key)
 	if err != nil {
@@ -40,6 +40,71 @@ func TestJoinedDiscoveryDeduplicatesHintsAndTracksReplacementUID(t *testing.T) {
 	}
 	if len(first.Projections()) != 1 || len(second.Projections()) != 1 || first.Projections()[0].Identity().PodUID() != "new-uid" || second.Projections()[0].Identity().PodUID() != "new-uid" {
 		t.Fatal("duplicate hints did not converge to one replacement identity")
+	}
+}
+
+func TestDiscoveryRejectsIncompleteAndMixedRevisionGroups(t *testing.T) {
+	ready := true
+	port, portName := int32(8443), proxyPortName
+	replicas := int32(2)
+	controlled := true
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "engine", Annotations: map[string]string{annotationEnabled: "true"}}, Spec: corev1.ServiceSpec{ClusterIP: corev1.ClusterIPNone, Selector: map[string]string{"app": "engine"}}}
+	workload := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "engine", UID: "workload-uid", ResourceVersion: "workload-rv"}, Spec: appsv1.StatefulSetSpec{Replicas: &replicas}}
+	first, second := eligiblePod("uid-1", "10.0.0.1"), eligiblePod("uid-2", "10.0.0.2")
+	first.OwnerReferences = []metav1.OwnerReference{{UID: workload.UID, Controller: &controlled}}
+	second.OwnerReferences = first.OwnerReferences
+	slice := &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "engine-a", Labels: map[string]string{discoveryv1.LabelServiceName: "engine"}}, Ports: []discoveryv1.EndpointPort{{Name: &portName, Port: &port}}, Endpoints: []discoveryv1.Endpoint{{Addresses: []string{first.Status.PodIP}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}, TargetRef: &corev1.ObjectReference{Kind: "Pod", UID: first.UID}}}}
+	client := fake.NewClientset(service, workload, first, second, slice)
+	adapter := &Adapter{client: client, config: Config{Cluster: "cluster", Namespace: "models", ProxyPort: 8443, ObservationTTL: time.Minute, IdentityRegistry: fakeIdentityRegistry{ready: true}}}
+	key, _ := domain.NewResourceKey("models", "engine")
+	state, err := adapter.reconcileService(context.Background(), key)
+	if err != nil || len(state.Projections()) != 0 {
+		t.Fatalf("incomplete engine group became eligible: projections=%d err=%v", len(state.Projections()), err)
+	}
+	slice.Endpoints = append(slice.Endpoints, discoveryv1.Endpoint{Addresses: []string{second.Status.PodIP}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}, TargetRef: &corev1.ObjectReference{Kind: "Pod", UID: second.UID}})
+	if _, err := client.DiscoveryV1().EndpointSlices("models").Update(context.Background(), slice, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	second.Annotations[annotationModel] = "different-revision"
+	if _, err := client.CoreV1().Pods("models").Update(context.Background(), second, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	state, err = adapter.reconcileService(context.Background(), key)
+	if err != nil || len(state.Projections()) != 0 {
+		t.Fatalf("mixed-revision engine group became eligible: projections=%d err=%v", len(state.Projections()), err)
+	}
+}
+
+func TestDiscoveryEnqueuesConsumingServiceAndUsesMonotonicCompleteFacts(t *testing.T) {
+	ready := true
+	port, portName := int32(8443), proxyPortName
+	controlled := true
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "engine", Annotations: map[string]string{annotationEnabled: "true"}}, Spec: corev1.ServiceSpec{ClusterIP: corev1.ClusterIPNone, Selector: map[string]string{"app": "engine"}}}
+	workload := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "engine", UID: "workload-uid", ResourceVersion: "workload-rv"}}
+	pod := eligiblePod("uid-1", "10.0.0.1")
+	pod.OwnerReferences = []metav1.OwnerReference{{UID: workload.UID, Controller: &controlled}}
+	slice := &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "engine-a", Labels: map[string]string{discoveryv1.LabelServiceName: "engine"}}, Ports: []discoveryv1.EndpointPort{{Name: &portName, Port: &port}}, Endpoints: []discoveryv1.Endpoint{{Addresses: []string{pod.Status.PodIP}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}, TargetRef: &corev1.ObjectReference{Kind: "Pod", UID: pod.UID}}}}
+	adapter := &Adapter{client: fake.NewClientset(service, workload, pod, slice), config: Config{Cluster: "cluster", Namespace: "models", ProxyPort: 8443, ObservationTTL: time.Minute, IdentityRegistry: fakeIdentityRegistry{ready: true}}}
+	var keys []domain.ResourceKey
+	adapter.enqueueObject(pod, func(key domain.ResourceKey) { keys = append(keys, key) })
+	if len(keys) != 1 || keys[0].Name() != "engine" {
+		t.Fatalf("Pod hint enqueued %v, want consuming Service engine", keys)
+	}
+	key := keys[0]
+	first, err := adapter.ReconcileDiscovery(context.Background(), key, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := adapter.ReconcileDiscovery(context.Background(), key, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || len(second) != 1 || second[0].Stamp().Sequence() <= first[0].Stamp().Sequence() {
+		t.Fatalf("source sequence did not advance across writer generations: first=%v second=%v", first, second)
+	}
+	fact, ok := second[0].Structural()
+	if !ok || fact.Workload().UID() != "workload-uid" || len(fact.Members()) != 1 || fact.Members()[0].UID() != "uid-1" {
+		t.Fatal("structural observation did not bind exact complete workload membership")
 	}
 }
 
@@ -83,12 +148,13 @@ func TestBarrierPatchTestsUIDResourceVersionAndPreviousToken(t *testing.T) {
 	}
 	var workloadOps []map[string]any
 	_ = json.Unmarshal(patches[0], &workloadOps)
-	foundPrior := false
+	foundPrior, foundTemplate := false, false
 	for _, operation := range workloadOps {
 		foundPrior = foundPrior || operation["path"] == "/metadata/annotations/prudentia.io~1operation-token" && operation["value"] == "old-token"
+		foundTemplate = foundTemplate || operation["path"] == "/spec/template/metadata/annotations"
 	}
-	if !foundPrior {
-		t.Fatal("workload barrier did not test previous operation token")
+	if !foundPrior || !foundTemplate {
+		t.Fatal("workload barrier did not test previous token and close the replacement Pod template")
 	}
 }
 
@@ -109,5 +175,5 @@ func TestExactRemovalCarriesUIDAndTokenBoundResourceVersion(t *testing.T) {
 }
 
 func eligiblePod(uid, ip string) *corev1.Pod {
-	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "pod-" + uid, UID: types.UID(uid), Labels: map[string]string{"app": "engine"}, Annotations: map[string]string{annotationModel: "engine", annotationEngine: "engine", annotationEndpointEpoch: "1", annotationRecoveryEpoch: "1", annotationSlots: "2", annotationProxyReady: "true"}}, Status: corev1.PodStatus{PodIP: ip, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "pod-" + uid, UID: types.UID(uid), ResourceVersion: "pod-rv-" + uid, Labels: map[string]string{"app": "engine"}, Annotations: map[string]string{annotationModel: "engine", annotationEngine: "engine", annotationEndpointEpoch: "1", annotationRecoveryEpoch: "1", annotationSlots: "2"}}, Status: corev1.PodStatus{PodIP: ip, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
 }
