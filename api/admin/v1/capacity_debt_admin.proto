@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package prudentia.admin.v1;
+
+import "google/protobuf/empty.proto";
+
+option go_package = "github.com/BizerNotNull/474-Prudentia/api/admin/v1;adminv1";
+
+// This service is exposed only on the separately addressed admin mTLS listener.
+service CapacityDebtAdminService {
+  rpc UnsafeOverrideCapacityDebt(UnsafeOverrideCapacityDebtRequest) returns (google.protobuf.Empty);
+}
+
+message UnsafeOverrideCapacityDebtRequest {
+  string debt_id = 1;
+  string expected_pod_uid = 2;
+  uint64 expected_endpoint_epoch = 3;
+  // Must equal I_UNDERSTAND_THE_PROVIDER_MAY_STILL_BE_EXECUTING exactly.
+  string confirmation = 4;
+  // Bounded, nonempty, sanitized operational ticket and reason.
+  string ticket = 5;
+  string reason = 6;
+  // Version 1 defines the confirmation phrase and all field semantics.
+  uint32 schema_version = 7;
+}
