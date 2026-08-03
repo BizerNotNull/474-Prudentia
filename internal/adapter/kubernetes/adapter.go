@@ -10,8 +10,9 @@ import (
 	"time"
 
 	"github.com/BizerNotNull/474-Prudentia/internal/domain"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/informers"
@@ -29,8 +30,13 @@ const (
 	annotationEndpointEpoch = "prudentia.io/endpoint-epoch"
 	annotationRecoveryEpoch = "prudentia.io/recovery-epoch"
 	annotationSlots         = "prudentia.io/configured-slots"
-	annotationProxyReady    = "prudentia.io/proxy-ready"
 )
+
+// IdentityRegistry is the attested issuer/registration authority. Kubernetes
+// annotations are desired inputs, never proof that an exact proxy SVID exists.
+type IdentityRegistry interface {
+	RegistrationReady(context.Context, domain.WorkloadIdentity, string) (bool, error)
+}
 
 type Config struct {
 	Cluster              string
@@ -47,14 +53,17 @@ type Config struct {
 	RetryPeriod          time.Duration
 	MutationCallLifetime time.Duration
 	IdentityFence        IdentityFence
+	IdentityRegistry     IdentityRegistry
 }
 
 type Adapter struct {
 	config       Config
 	client       kubernetes.Interface
 	coordination coordinationv1.CoordinationV1Interface
-	informer     cache.SharedIndexInformer
+	informers    []cache.SharedIndexInformer
 	startOnce    sync.Once
+	sequenceMu   sync.Mutex
+	sequence     uint64
 	started      chan struct{}
 }
 
@@ -71,18 +80,24 @@ func NewInCluster(config Config) (*Adapter, error) {
 }
 
 func New(client kubernetes.Interface, config Config) (*Adapter, error) {
-	if client == nil || config.Cluster == "" || config.Namespace == "" || config.ProxyPort == 0 || config.ObservationTTL <= 0 || config.ObservationTTL > 10*time.Minute || config.ResyncPeriod < time.Second || config.LeaseNamespace == "" || config.LeaseName == "" || config.Holder == "" || config.LeaseDuration <= 0 || config.RenewDeadline <= 0 || config.RetryPeriod <= 0 || config.RenewDeadline >= config.LeaseDuration || config.RetryPeriod >= config.RenewDeadline {
+	if client == nil || config.Cluster == "" || config.Namespace == "" || config.ProxyPort == 0 || config.ObservationTTL <= 0 || config.ObservationTTL > 10*time.Minute || config.ResyncPeriod < time.Second || config.LeaseNamespace == "" || config.LeaseName == "" || config.Holder == "" || config.LeaseDuration <= 0 || config.RenewDeadline <= 0 || config.RetryPeriod <= 0 || config.RenewDeadline >= config.LeaseDuration || config.RetryPeriod >= config.RenewDeadline || config.IdentityRegistry == nil {
 		return nil, errors.New("invalid Kubernetes adapter configuration")
 	}
 	factory := informers.NewSharedInformerFactoryWithOptions(client, config.ResyncPeriod,
 		informers.WithNamespace(config.Namespace),
 		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = config.LabelSelector
 			options.FieldSelector = fields.Everything().String()
 		}))
 	return &Adapter{
 		config: config, client: client, coordination: client.CoordinationV1(),
-		informer: factory.Core().V1().Pods().Informer(), started: make(chan struct{}),
+		informers: []cache.SharedIndexInformer{
+			factory.Core().V1().Pods().Informer(),
+			factory.Core().V1().Services().Informer(),
+			factory.Discovery().V1().EndpointSlices().Informer(),
+			factory.Apps().V1().Deployments().Informer(),
+			factory.Apps().V1().StatefulSets().Informer(),
+		},
+		started: make(chan struct{}),
 	}, nil
 }
 
@@ -94,16 +109,19 @@ func (a *Adapter) Run(ctx context.Context, sink func(domain.ResourceKey)) error 
 	if sink == nil {
 		return errors.New("nil reconcile sink")
 	}
-	_, err := a.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(object any) { a.enqueueObject(object, sink) },
-		UpdateFunc: func(_, current any) { a.enqueueObject(current, sink) },
-		DeleteFunc: func(object any) { a.enqueueDeleted(object, sink) },
-	})
-	if err != nil {
-		return fmt.Errorf("register Pod event handler: %w", err)
+	for _, informer := range a.informers {
+		if _, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    func(object any) { a.enqueueObject(object, sink) },
+			UpdateFunc: func(_, current any) { a.enqueueObject(current, sink) },
+			DeleteFunc: func(object any) { a.enqueueDeleted(object, sink) },
+		}); err != nil {
+			return fmt.Errorf("register discovery event handler: %w", err)
+		}
 	}
 	a.startOnce.Do(func() { close(a.started) })
-	go a.informer.Run(ctx.Done())
+	for _, informer := range a.informers {
+		go informer.Run(ctx.Done())
+	}
 	ticker := time.NewTicker(a.config.ResyncPeriod)
 	defer ticker.Stop()
 	for {
@@ -124,8 +142,10 @@ func (a *Adapter) WaitForSync(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	if !cache.WaitForCacheSync(ctx.Done(), a.informer.HasSynced) {
-		return errors.New("Pod informer cache did not synchronize")
+	for _, informer := range a.informers {
+		if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
+			return errors.New("discovery informer cache did not synchronize")
+		}
 	}
 	return nil
 }
@@ -161,28 +181,7 @@ func (a *Adapter) enqueueServices(ctx context.Context, sink func(domain.Resource
 }
 
 func (a *Adapter) Reconcile(ctx context.Context, key domain.ResourceKey) (domain.ResourceState, error) {
-	if service, err := a.client.CoreV1().Services(key.Namespace()).Get(ctx, key.Name(), metav1.GetOptions{}); err == nil {
-		if service.Annotations[annotationEnabled] == "true" {
-			return a.reconcileService(ctx, key)
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return domain.ResourceState{}, fmt.Errorf("read Service level state: %w", err)
-	}
-	pod, err := a.client.CoreV1().Pods(key.Namespace()).Get(ctx, key.Name(), metav1.GetOptions{})
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return domain.NewResourceState(a.config.Cluster, key, nil)
-		}
-		return domain.ResourceState{}, fmt.Errorf("read Pod level state: %w", err)
-	}
-	projection, eligible, err := a.projection(pod)
-	if err != nil {
-		return domain.ResourceState{}, err
-	}
-	if !eligible {
-		return domain.NewResourceState(a.config.Cluster, key, nil)
-	}
-	return domain.NewResourceState(a.config.Cluster, key, []domain.BackendProjection{projection})
+	return a.reconcileService(ctx, key)
 }
 
 func (a *Adapter) Elect(ctx context.Context, callback func(context.Context) error) error {
@@ -221,22 +220,55 @@ func (a *Adapter) Elect(ctx context.Context, callback func(context.Context) erro
 }
 
 func (a *Adapter) enqueueObject(object any, sink func(domain.ResourceKey)) {
-	key, err := cache.MetaNamespaceKeyFunc(object)
-	if err == nil {
-		a.enqueueKey(key, sink)
+	switch value := object.(type) {
+	case *corev1.Service:
+		if value.Annotations[annotationEnabled] == "true" && value.Spec.ClusterIP == corev1.ClusterIPNone {
+			a.enqueueNamespaced(value.Namespace, value.Name, sink)
+		}
+	case *discoveryv1.EndpointSlice:
+		a.enqueueNamespaced(value.Namespace, value.Labels[discoveryv1.LabelServiceName], sink)
+	case *corev1.Pod:
+		a.enqueueServicesSelecting(value, sink)
+	case *appsv1.Deployment:
+		a.enqueueServicesSelecting(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: value.Namespace, Labels: value.Spec.Template.Labels}}, sink)
+	case *appsv1.StatefulSet:
+		a.enqueueServicesSelecting(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: value.Namespace, Labels: value.Spec.Template.Labels}}, sink)
+	case metav1.Object:
+		a.enqueueNamespaced(value.GetNamespace(), value.GetName(), sink)
 	}
 }
 
 func (a *Adapter) enqueueDeleted(object any, sink func(domain.ResourceKey)) {
-	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(object)
-	if err == nil {
-		a.enqueueKey(key, sink)
+	if tombstone, ok := object.(cache.DeletedFinalStateUnknown); ok {
+		object = tombstone.Obj
+	}
+	a.enqueueObject(object, sink)
+}
+
+func (a *Adapter) enqueueServicesSelecting(pod *corev1.Pod, sink func(domain.ResourceKey)) {
+	var objects []any
+	if len(a.informers) > 1 {
+		objects = a.informers[1].GetStore().List()
+	} else {
+		services, err := a.client.CoreV1().Services(pod.Namespace).List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			return
+		}
+		objects = make([]any, 0, len(services.Items))
+		for i := range services.Items {
+			objects = append(objects, &services.Items[i])
+		}
+	}
+	for _, object := range objects {
+		service, ok := object.(*corev1.Service)
+		if ok && service.Namespace == pod.Namespace && service.Annotations[annotationEnabled] == "true" && service.Spec.ClusterIP == corev1.ClusterIPNone && serviceSelects(service, pod) {
+			a.enqueueNamespaced(service.Namespace, service.Name, sink)
+		}
 	}
 }
 
-func (a *Adapter) enqueueKey(value string, sink func(domain.ResourceKey)) {
-	namespace, name, err := cache.SplitMetaNamespaceKey(value)
-	if err != nil {
+func (a *Adapter) enqueueNamespaced(namespace, name string, sink func(domain.ResourceKey)) {
+	if namespace == "" || name == "" {
 		return
 	}
 	key, err := domain.NewResourceKey(namespace, name)
@@ -245,8 +277,8 @@ func (a *Adapter) enqueueKey(value string, sink func(domain.ResourceKey)) {
 	}
 }
 
-func (a *Adapter) projection(pod *corev1.Pod) (domain.BackendProjection, bool, error) {
-	if pod.DeletionTimestamp != nil || pod.Status.PodIP == "" || pod.Annotations[annotationProxyReady] != "true" || !podReady(pod) {
+func (a *Adapter) projection(ctx context.Context, pod *corev1.Pod) (domain.BackendProjection, bool, error) {
+	if pod.DeletionTimestamp != nil || pod.Status.PodIP == "" || !podReady(pod) {
 		return domain.BackendProjection{}, false, nil
 	}
 	model := pod.Annotations[annotationModel]
@@ -271,6 +303,16 @@ func (a *Adapter) projection(pod *corev1.Pod) (domain.BackendProjection, bool, e
 		return domain.BackendProjection{}, false, nil
 	}
 	endpoint := "https://" + net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(a.config.ProxyPort)))
+	if a.config.IdentityRegistry == nil {
+		return domain.BackendProjection{}, false, nil
+	}
+	registered, err := a.config.IdentityRegistry.RegistrationReady(ctx, identity, endpoint)
+	if err != nil {
+		return domain.BackendProjection{}, false, fmt.Errorf("verify attested proxy registration: %w", err)
+	}
+	if !registered {
+		return domain.BackendProjection{}, false, nil
+	}
 	projection, err := domain.NewBackendProjection(domain.BackendProjectionParams{
 		Identity: identity, Model: model, Endpoint: endpoint,
 		ConfiguredSlots: uint32(slots), FreshFor: a.config.ObservationTTL,
@@ -279,6 +321,13 @@ func (a *Adapter) projection(pod *corev1.Pod) (domain.BackendProjection, bool, e
 		return domain.BackendProjection{}, false, nil
 	}
 	return projection, true, nil
+}
+
+func (a *Adapter) nextSourceSequence() domain.SourceSequence {
+	a.sequenceMu.Lock()
+	defer a.sequenceMu.Unlock()
+	a.sequence++
+	return domain.SourceSequence(a.sequence)
 }
 
 func podReady(pod *corev1.Pod) bool {
