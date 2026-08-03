@@ -8,6 +8,7 @@ import (
 
 	"github.com/BizerNotNull/474-Prudentia/internal/domain"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type authoritativeDebt struct {
@@ -95,6 +96,8 @@ func (c *Catalog) ResolveCapacityDebt(ctx context.Context, cmd domain.DebtResolu
 	var evidence [sha256.Size]byte
 	var writer domain.WriterGeneration
 	var actor [sha256.Size]byte
+	var proofRequestID, manifestID string
+	var acknowledgementSequence uint64
 	switch cmd.Kind() {
 	case domain.DebtResolutionIdentityGone:
 		proof, ok := cmd.IdentityGoneProof()
@@ -111,8 +114,11 @@ func (c *Catalog) ResolveCapacityDebt(ctx context.Context, cmd domain.DebtResolu
 			return domain.ErrInvalidDebtEvidence
 		}
 		identity = proof.Identity()
+		proofRequestID = proof.RequestID()
+		manifestID = proof.ManifestID()
+		acknowledgementSequence = proof.AcknowledgementSequence()
 		evidence = proof.EvidenceHash()
-		actor = sha256.Sum256([]byte(proof.ManifestID()))
+		actor = sha256.Sum256([]byte(manifestID))
 	default:
 		return domain.ErrInvalidDebtEvidence
 	}
@@ -125,8 +131,19 @@ func (c *Catalog) ResolveCapacityDebt(ctx context.Context, cmd domain.DebtResolu
 	if err != nil {
 		return err
 	}
-	if initial.reservationID != cmd.ReservationID() || !initial.identity.Equal(identity) {
+	if initial.reservationID != cmd.ReservationID() || !initial.identity.Equal(identity) ||
+		(proofRequestID != "" && proofRequestID != initial.requestID) {
 		return domain.ErrCapacityDebtConflict
+	}
+	if manifestID != "" {
+		var enabled bool
+		if err := tx.QueryRow(ctx, `SELECT termination_capabilities IS NOT NULL
+			FROM capability_manifests
+			WHERE manifest_id=$1 AND valid_from<=transaction_timestamp()
+			  AND valid_until>transaction_timestamp()
+			ORDER BY manifest_version DESC LIMIT 1`, manifestID).Scan(&enabled); err != nil || !enabled {
+			return domain.ErrInvalidDebtEvidence
+		}
 	}
 	if writer != 0 {
 		if err := lockWriter(ctx, tx, identity.Cluster(), writer); err != nil {
@@ -148,7 +165,23 @@ func (c *Catalog) ResolveCapacityDebt(ctx context.Context, cmd domain.DebtResolu
 	if err := resolveDebtCounters(ctx, tx, current); err != nil {
 		return err
 	}
-	tag, err := tx.Exec(ctx, `UPDATE orphaned_capacity_debts SET state=$2,resolution_evidence_type=$3,resolution_evidence_hash=$4,resolution_actor_hash=$5,resolved_at=transaction_timestamp(),updated_at=transaction_timestamp() WHERE debt_id=$1 AND state='active'`, cmd.DebtID(), resolvedState, kind, evidence[:], actor[:])
+	var tag pgconn.CommandTag
+	if acknowledgementSequence != 0 {
+		tag, err = tx.Exec(ctx, `UPDATE orphaned_capacity_debts
+			SET state=$2,resolution_evidence_type=$3,resolution_evidence_hash=$4,
+			    resolution_actor_hash=$5,provider_ack_sequence=$6,
+			    resolved_at=transaction_timestamp(),updated_at=transaction_timestamp()
+			WHERE debt_id=$1 AND state='active'
+			  AND (provider_ack_sequence IS NULL OR provider_ack_sequence<$6)`,
+			cmd.DebtID(), resolvedState, kind, evidence[:], actor[:], acknowledgementSequence)
+	} else {
+		tag, err = tx.Exec(ctx, `UPDATE orphaned_capacity_debts
+			SET state=$2,resolution_evidence_type=$3,resolution_evidence_hash=$4,
+			    resolution_actor_hash=$5,resolved_at=transaction_timestamp(),
+			    updated_at=transaction_timestamp()
+			WHERE debt_id=$1 AND state='active'`,
+			cmd.DebtID(), resolvedState, kind, evidence[:], actor[:])
+	}
 	if err != nil {
 		return err
 	}
