@@ -2,6 +2,7 @@ package functional_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 
 	"encoding/json"
@@ -256,9 +257,15 @@ func TestCandidateSwitchRoundTripsThroughSchedulerGRPC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	digest := sha256.Sum256([]byte("candidate-switch-command"))
+	digestCandidate, err := domain.NewRequestDigestCandidate(1, digest[:])
+	if err != nil {
+		t.Fatal(err)
+	}
 	command, err := domain.NewScheduleCommand(domain.ScheduleParams{
 		RequestID: "req_switch", AttemptID: "att_switch", Tenant: "tenant-a",
-		Model: "model-a", SlotCost: 1, ExecutionBudget: time.Minute,
+		DigestCandidates: []domain.RequestDigestCandidate{digestCandidate}, DigestWriteVersion: 1,
+		Model: "model-a", SlotCost: 1, Features: domain.EmptyFeatureSet(), ExecutionBudget: time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
