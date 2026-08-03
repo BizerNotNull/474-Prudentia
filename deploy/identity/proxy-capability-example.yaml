@@ -1,0 +1,79 @@
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: prudentia-gateway
+spec:
+  spiffeIDTemplate: spiffe://example.invalid/ns/{{ .PodMeta.Namespace }}/sa/gateway
+  podSelector: {matchLabels: {app.kubernetes.io/name: gateway}}
+  workloadSelectorTemplates: ["k8s:ns:prudentia-system", "k8s:sa:gateway"]
+  ttl: 3600
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: prudentia-inference-proxy
+  annotations:
+    prudentia.io/identity-contract: issuer must attest Pod UID plus endpoint and recovery epochs; reusable DNS or service-account identity alone is insufficient
+spec:
+  spiffeIDTemplate: spiffe://example.invalid/inference/ns/{{ .PodMeta.Namespace }}/pod/{{ .PodMeta.UID }}
+  podSelector: {matchLabels: {prudentia.io/component: identity-proxy}}
+  workloadSelectorTemplates: ["k8s:ns:prudentia-inference", "k8s:pod-uid:{{ .PodMeta.UID }}"]
+  ttl: 900
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prudentia-vllm-capability-v1
+  namespace: prudentia-inference
+  annotations:
+    prudentia.io/signature-required: detached signature and exact image/proxy digests must be verified before readiness
+    prudentia.io/manifest-digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+data:
+  manifest.json: |
+    {
+      "schemaVersion": 1,
+      "image": "ghcr.io/example/vllm@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "proxyImage": "ghcr.io/example/prudentia-proxy@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "routes": ["/v1/chat/completions", "/health", "/metrics"],
+      "identityProfile": "spiffe-pod-uid-endpoint-recovery-v1",
+      "metricsAllowlist": ["vllm:num_requests_running", "vllm:gpu_cache_usage_perc"],
+      "apcIsolation": "tenant-private",
+      "terminationAcknowledgement": false,
+      "fleetQuiescenceProof": false
+    }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prudentia-vllm-example
+  namespace: prudentia-inference
+  labels: {prudentia.io/managed-owner: controller}
+  annotations:
+    prudentia.io/operation-token: example-replaced-transactionally
+    prudentia.io/operation-generation: "1"
+    prudentia.io/admission-closed: "true"
+spec:
+  serviceName: prudentia-vllm-example
+  replicas: 1
+  selector: {matchLabels: {app: prudentia-vllm-example}}
+  template:
+    metadata:
+      labels: {app: prudentia-vllm-example, prudentia.io/managed-owner: controller, prudentia.io/component: identity-proxy}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+      - name: identity-proxy
+        image: ghcr.io/example/prudentia-proxy@sha256:0000000000000000000000000000000000000000000000000000000000000000
+        args: ["--listen=:9443", "--upstream=http://127.0.0.1:8000", "--require-pod-uid", "--require-endpoint-epoch", "--require-recovery-epoch"]
+        ports: [{name: proxy-mtls, containerPort: 9443}]
+        env:
+        - {name: POD_UID, valueFrom: {fieldRef: {fieldPath: metadata.uid}}}
+        - {name: ENDPOINT_EPOCH, valueFrom: {fieldRef: {fieldPath: metadata.annotations['prudentia.io/endpoint-epoch']}}}
+        - {name: RECOVERY_EPOCH, valueFrom: {fieldRef: {fieldPath: metadata.annotations['prudentia.io/recovery-epoch']}}}
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      - name: vllm
+        image: ghcr.io/example/vllm@sha256:0000000000000000000000000000000000000000000000000000000000000000
+        args: ["--host=127.0.0.1", "--port=8000"]
+        ports: [{name: loopback-only, containerPort: 8000}]
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}

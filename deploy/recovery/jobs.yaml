@@ -1,0 +1,109 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: prudentia-ledger-backup
+  namespace: prudentia-operations
+  annotations:
+    prudentia.io/backup-contract: bounded custom-format whole-database backup; repository retention is count-bounded and restore is never sufficient to reopen dispatch
+spec:
+  schedule: "17 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 1900
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata: {labels: {prudentia.io/role: backup-operator}}
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+          containers:
+          - name: backup
+            image: ghcr.io/example/prudentia-postgres-tools@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            command: [/opt/prudentia/scripts/backup.sh]
+            env:
+            - {name: PGDATABASE, valueFrom: {secretKeyRef: {name: backup-postgres, key: dsn}}}
+            - {name: OUTPUT_DIR, value: /backup}
+            - {name: BACKUP_TIMEOUT_SECONDS, value: "1800"}
+            - {name: RETENTION_COUNT, value: "14"}
+            volumeMounts: [{name: backup, mountPath: /backup}]
+            securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumes: [{name: backup, persistentVolumeClaim: {claimName: prudentia-backup}}]
+---
+# Template only: an operator creates a uniquely named Job from this suspended
+# definition after an external control has blocked ingress and dispatch and
+# mounted a proof file containing exactly "ingress=closed dispatch=closed".
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prudentia-pitr-fence-restore-template
+  namespace: prudentia-operations
+  annotations:
+    prudentia.io/template-only: "true"
+    prudentia.io/recovery-order: infrastructure fence; verify backup; fence current DB; restore; write unique closed epoch; acquire controller generation; terminate old identities; roll certificates and fleet; relist and rebuild; reconcile; prove; reopen
+spec:
+  suspend: true
+  activeDeadlineSeconds: 3600
+  backoffLimit: 0
+  template:
+    metadata: {labels: {prudentia.io/role: recovery-operator}}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+      - name: fence-restore
+        image: ghcr.io/example/prudentia-postgres-tools@sha256:0000000000000000000000000000000000000000000000000000000000000000
+        command: [/opt/prudentia/scripts/recover.sh, fence-restore]
+        env:
+        - {name: PGDATABASE, valueFrom: {secretKeyRef: {name: recovery-postgres, key: dsn}}}
+        - {name: CLUSTER_ID, value: replace-me}
+        - {name: RECOVERY_EPOCH, value: replace-with-unique-monotonic-epoch}
+        - {name: ACTOR_IDENTITY_SHA256, value: replace-with-authenticated-actor-hash}
+        - {name: SERVICE_IDENTITY_SHA256, value: replace-with-recovery-service-hash}
+        - {name: INFRASTRUCTURE_FENCE_PROOF, value: /proof/infra-fence}
+        - {name: BACKUP_FILE, value: /backup/replace-me.dump}
+        volumeMounts: [{name: proof, mountPath: /proof, readOnly: true}, {name: backup, mountPath: /backup, readOnly: true}]
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      volumes:
+      - {name: proof, secret: {secretName: recovery-infrastructure-fence-proof}}
+      - {name: backup, persistentVolumeClaim: {claimName: prudentia-backup}}
+---
+# This second template cannot reopen from a restored row. The script verifies a
+# bounded fleet proof and database facts for the exact closed recovery epoch.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prudentia-pitr-reopen-template
+  namespace: prudentia-operations
+  annotations:
+    prudentia.io/template-only: "true"
+    prudentia.io/reopen-proof: requires zero old identities, new controller generation, current-epoch registry and capacity rebuild, restored-row reconciliation, and immutable proof digest
+spec:
+  suspend: true
+  activeDeadlineSeconds: 600
+  backoffLimit: 0
+  template:
+    metadata: {labels: {prudentia.io/role: recovery-operator}}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+      - name: reopen
+        image: ghcr.io/example/prudentia-postgres-tools@sha256:0000000000000000000000000000000000000000000000000000000000000000
+        command: [/opt/prudentia/scripts/recover.sh, reopen]
+        env:
+        - {name: PGDATABASE, valueFrom: {secretKeyRef: {name: recovery-postgres, key: dsn}}}
+        - {name: CLUSTER_ID, value: replace-me}
+        - {name: RECOVERY_EPOCH, value: replace-with-fenced-epoch}
+        - {name: ACTOR_IDENTITY_SHA256, value: replace-with-authenticated-actor-hash}
+        - {name: SERVICE_IDENTITY_SHA256, value: replace-with-recovery-service-hash}
+        - {name: FLEET_REBUILD_PROOF, value: /proof/fleet-rebuild.json}
+        volumeMounts: [{name: proof, mountPath: /proof, readOnly: true}]
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      volumes: [{name: proof, secret: {secretName: recovery-fleet-rebuild-proof}}]

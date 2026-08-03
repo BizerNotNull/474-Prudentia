@@ -1,0 +1,93 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: prudentia-system}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: gateway, namespace: prudentia-system}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: gateway}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-system}}
+    ports: [{port: 8443, protocol: TCP}]
+  egress:
+  - to: [{podSelector: {matchLabels: {app.kubernetes.io/name: scheduler}}}]
+    ports: [{port: 9443, protocol: TCP}]
+  - to:
+    - namespaceSelector: {matchLabels: {prudentia.io/inference-namespace: "true"}}
+      podSelector: {matchLabels: {prudentia.io/component: identity-proxy}}
+    ports: [{port: 9443, protocol: TCP}]
+  - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}}]
+    ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+  - to: [{namespaceSelector: {matchLabels: {prudentia.io/telemetry: "true"}}}]
+    ports: [{port: 4317, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: scheduler-request, namespace: prudentia-system}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: scheduler}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from: [{podSelector: {matchLabels: {app.kubernetes.io/name: gateway}}}]
+    ports: [{port: 9443, protocol: TCP}]
+  - from:
+    - namespaceSelector: {matchLabels: {prudentia.io/operator-path: "true"}}
+      podSelector: {matchLabels: {prudentia.io/role: recovery-operator}}
+    ports: [{port: 9444, protocol: TCP}]
+  egress:
+  - to:
+    - namespaceSelector: {matchLabels: {prudentia.io/database: "true"}}
+      podSelector: {matchLabels: {app.kubernetes.io/name: postgresql}}
+    ports: [{port: 5432, protocol: TCP}]
+  - to: [{namespaceSelector: {matchLabels: {prudentia.io/telemetry: "true"}}}]
+    ports: [{port: 4317, protocol: TCP}]
+  - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}}]
+    ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: controller, namespace: prudentia-system}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: controller}}
+  policyTypes: [Ingress, Egress]
+  egress:
+  - to:
+    - namespaceSelector: {matchLabels: {prudentia.io/database: "true"}}
+      podSelector: {matchLabels: {app.kubernetes.io/name: postgresql}}
+    ports: [{port: 5432, protocol: TCP}]
+  - to:
+    - namespaceSelector: {matchLabels: {prudentia.io/inference-namespace: "true"}}
+      podSelector: {matchLabels: {prudentia.io/component: identity-proxy}}
+    ports: [{port: 9443, protocol: TCP}]
+  - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}}]
+    ports: [{port: 443, protocol: TCP}, {port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+  - to: [{namespaceSelector: {matchLabels: {prudentia.io/telemetry: "true"}}}]
+    ports: [{port: 4317, protocol: TCP}]
+---
+# Apply in the database namespace: PostgreSQL accepts only scheduler,
+# controller, backup, and recovery identities; gateway has no credential or path.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: prudentia-postgresql-boundary, namespace: prudentia-database}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: postgresql}}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: prudentia-system}}
+      podSelector:
+        matchExpressions:
+        - {key: app.kubernetes.io/name, operator: In, values: [scheduler, controller]}
+    ports: [{port: 5432, protocol: TCP}]
+  - from:
+    - namespaceSelector: {matchLabels: {prudentia.io/operator-path: "true"}}
+      podSelector:
+        matchExpressions:
+        - {key: prudentia.io/role, operator: In, values: [backup-operator, recovery-operator]}
+    ports: [{port: 5432, protocol: TCP}]
