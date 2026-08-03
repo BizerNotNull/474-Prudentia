@@ -73,6 +73,58 @@ func (Priority) EnumDescriptor() ([]byte, []int) {
 	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{0}
 }
 
+type CachePolicy int32
+
+const (
+	CachePolicy_CACHE_POLICY_UNSPECIFIED        CachePolicy = 0
+	CachePolicy_CACHE_POLICY_DISABLED           CachePolicy = 1
+	CachePolicy_CACHE_POLICY_PREFER             CachePolicy = 2
+	CachePolicy_CACHE_POLICY_REQUIRE_COMPATIBLE CachePolicy = 3
+)
+
+// Enum value maps for CachePolicy.
+var (
+	CachePolicy_name = map[int32]string{
+		0: "CACHE_POLICY_UNSPECIFIED",
+		1: "CACHE_POLICY_DISABLED",
+		2: "CACHE_POLICY_PREFER",
+		3: "CACHE_POLICY_REQUIRE_COMPATIBLE",
+	}
+	CachePolicy_value = map[string]int32{
+		"CACHE_POLICY_UNSPECIFIED":        0,
+		"CACHE_POLICY_DISABLED":           1,
+		"CACHE_POLICY_PREFER":             2,
+		"CACHE_POLICY_REQUIRE_COMPATIBLE": 3,
+	}
+)
+
+func (x CachePolicy) Enum() *CachePolicy {
+	p := new(CachePolicy)
+	*p = x
+	return p
+}
+
+func (x CachePolicy) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (CachePolicy) Descriptor() protoreflect.EnumDescriptor {
+	return file_api_scheduler_v1_scheduler_proto_enumTypes[1].Descriptor()
+}
+
+func (CachePolicy) Type() protoreflect.EnumType {
+	return &file_api_scheduler_v1_scheduler_proto_enumTypes[1]
+}
+
+func (x CachePolicy) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use CachePolicy.Descriptor instead.
+func (CachePolicy) EnumDescriptor() ([]byte, []int) {
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{1}
+}
+
 type RerankReason int32
 
 const (
@@ -103,11 +155,11 @@ func (x RerankReason) String() string {
 }
 
 func (RerankReason) Descriptor() protoreflect.EnumDescriptor {
-	return file_api_scheduler_v1_scheduler_proto_enumTypes[1].Descriptor()
+	return file_api_scheduler_v1_scheduler_proto_enumTypes[2].Descriptor()
 }
 
 func (RerankReason) Type() protoreflect.EnumType {
-	return &file_api_scheduler_v1_scheduler_proto_enumTypes[1]
+	return &file_api_scheduler_v1_scheduler_proto_enumTypes[2]
 }
 
 func (x RerankReason) Number() protoreflect.EnumNumber {
@@ -116,7 +168,7 @@ func (x RerankReason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use RerankReason.Descriptor instead.
 func (RerankReason) EnumDescriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{1}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{2}
 }
 
 type GiveUpReason int32
@@ -155,11 +207,11 @@ func (x GiveUpReason) String() string {
 }
 
 func (GiveUpReason) Descriptor() protoreflect.EnumDescriptor {
-	return file_api_scheduler_v1_scheduler_proto_enumTypes[2].Descriptor()
+	return file_api_scheduler_v1_scheduler_proto_enumTypes[3].Descriptor()
 }
 
 func (GiveUpReason) Type() protoreflect.EnumType {
-	return &file_api_scheduler_v1_scheduler_proto_enumTypes[2]
+	return &file_api_scheduler_v1_scheduler_proto_enumTypes[3]
 }
 
 func (x GiveUpReason) Number() protoreflect.EnumNumber {
@@ -168,7 +220,7 @@ func (x GiveUpReason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use GiveUpReason.Descriptor instead.
 func (GiveUpReason) EnumDescriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{2}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{3}
 }
 
 type TerminalProof int32
@@ -210,11 +262,11 @@ func (x TerminalProof) String() string {
 }
 
 func (TerminalProof) Descriptor() protoreflect.EnumDescriptor {
-	return file_api_scheduler_v1_scheduler_proto_enumTypes[3].Descriptor()
+	return file_api_scheduler_v1_scheduler_proto_enumTypes[4].Descriptor()
 }
 
 func (TerminalProof) Type() protoreflect.EnumType {
-	return &file_api_scheduler_v1_scheduler_proto_enumTypes[3]
+	return &file_api_scheduler_v1_scheduler_proto_enumTypes[4]
 }
 
 func (x TerminalProof) Number() protoreflect.EnumNumber {
@@ -223,7 +275,7 @@ func (x TerminalProof) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TerminalProof.Descriptor instead.
 func (TerminalProof) EnumDescriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{3}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{4}
 }
 
 type AmbiguousCause int32
@@ -262,11 +314,11 @@ func (x AmbiguousCause) String() string {
 }
 
 func (AmbiguousCause) Descriptor() protoreflect.EnumDescriptor {
-	return file_api_scheduler_v1_scheduler_proto_enumTypes[4].Descriptor()
+	return file_api_scheduler_v1_scheduler_proto_enumTypes[5].Descriptor()
 }
 
 func (AmbiguousCause) Type() protoreflect.EnumType {
-	return &file_api_scheduler_v1_scheduler_proto_enumTypes[4]
+	return &file_api_scheduler_v1_scheduler_proto_enumTypes[5]
 }
 
 func (x AmbiguousCause) Number() protoreflect.EnumNumber {
@@ -275,7 +327,7 @@ func (x AmbiguousCause) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use AmbiguousCause.Descriptor instead.
 func (AmbiguousCause) EnumDescriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{4}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{5}
 }
 
 type ErrorCode int32
@@ -341,11 +393,11 @@ func (x ErrorCode) String() string {
 }
 
 func (ErrorCode) Descriptor() protoreflect.EnumDescriptor {
-	return file_api_scheduler_v1_scheduler_proto_enumTypes[5].Descriptor()
+	return file_api_scheduler_v1_scheduler_proto_enumTypes[6].Descriptor()
 }
 
 func (ErrorCode) Type() protoreflect.EnumType {
-	return &file_api_scheduler_v1_scheduler_proto_enumTypes[5]
+	return &file_api_scheduler_v1_scheduler_proto_enumTypes[6]
 }
 
 func (x ErrorCode) Number() protoreflect.EnumNumber {
@@ -354,7 +406,7 @@ func (x ErrorCode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ErrorCode.Descriptor instead.
 func (ErrorCode) EnumDescriptor() ([]byte, []int) {
-	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{5}
+	return file_api_scheduler_v1_scheduler_proto_rawDescGZIP(), []int{6}
 }
 
 // Candidate counts are bounded to four and hmac_sha256 is exactly 32 bytes.
@@ -535,7 +587,8 @@ type ScheduleRequest struct {
 	// Version 1 defines the complete ScheduleRequest field semantics.
 	SchemaVersion uint32 `protobuf:"varint,13,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
 	// Version 1 defines execution_budget_ms as a total wall-clock budget.
-	BudgetSchemaVersion uint32 `protobuf:"varint,14,opt,name=budget_schema_version,json=budgetSchemaVersion,proto3" json:"budget_schema_version,omitempty"`
+	BudgetSchemaVersion uint32      `protobuf:"varint,14,opt,name=budget_schema_version,json=budgetSchemaVersion,proto3" json:"budget_schema_version,omitempty"`
+	CachePolicy         CachePolicy `protobuf:"varint,15,opt,name=cache_policy,json=cachePolicy,proto3,enum=prudentia.scheduler.v1.CachePolicy" json:"cache_policy,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
 }
@@ -666,6 +719,13 @@ func (x *ScheduleRequest) GetBudgetSchemaVersion() uint32 {
 		return x.BudgetSchemaVersion
 	}
 	return 0
+}
+
+func (x *ScheduleRequest) GetCachePolicy() CachePolicy {
+	if x != nil {
+		return x.CachePolicy
+	}
+	return CachePolicy_CACHE_POLICY_UNSPECIFIED
 }
 
 type ReservationRef struct {
@@ -1471,7 +1531,7 @@ const file_api_scheduler_v1_scheduler_proto_rawDesc = "" +
 	"\n" +
 	"FeatureSet\x12%\n" +
 	"\x0eschema_version\x18\x01 \x01(\rR\rschemaVersion\x12\x12\n" +
-	"\x04bits\x18\x02 \x01(\x04R\x04bits\"\xe7\x05\n" +
+	"\x04bits\x18\x02 \x01(\x04R\x04bits\"\xaf\x06\n" +
 	"\x0fScheduleRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1d\n" +
@@ -1489,7 +1549,8 @@ const file_api_scheduler_v1_scheduler_proto_rawDesc = "" +
 	"\bfeatures\x18\v \x01(\v2\".prudentia.scheduler.v1.FeatureSetR\bfeatures\x12<\n" +
 	"\bpriority\x18\f \x01(\x0e2 .prudentia.scheduler.v1.PriorityR\bpriority\x12%\n" +
 	"\x0eschema_version\x18\r \x01(\rR\rschemaVersion\x122\n" +
-	"\x15budget_schema_version\x18\x0e \x01(\rR\x13budgetSchemaVersion\"\x9e\x01\n" +
+	"\x15budget_schema_version\x18\x0e \x01(\rR\x13budgetSchemaVersion\x12F\n" +
+	"\fcache_policy\x18\x0f \x01(\x0e2#.prudentia.scheduler.v1.CachePolicyR\vcachePolicy\"\x9e\x01\n" +
 	"\x0eReservationRef\x12%\n" +
 	"\x0ereservation_id\x18\x01 \x01(\tR\rreservationId\x12\x1e\n" +
 	"\n" +
@@ -1550,7 +1611,12 @@ const file_api_scheduler_v1_scheduler_proto_rawDesc = "" +
 	"\x14PRIORITY_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13PRIORITY_BACKGROUND\x10\x01\x12\x13\n" +
 	"\x0fPRIORITY_NORMAL\x10\x02\x12\x11\n" +
-	"\rPRIORITY_HIGH\x10\x03*M\n" +
+	"\rPRIORITY_HIGH\x10\x03*\x84\x01\n" +
+	"\vCachePolicy\x12\x1c\n" +
+	"\x18CACHE_POLICY_UNSPECIFIED\x10\x00\x12\x19\n" +
+	"\x15CACHE_POLICY_DISABLED\x10\x01\x12\x17\n" +
+	"\x13CACHE_POLICY_PREFER\x10\x02\x12#\n" +
+	"\x1fCACHE_POLICY_REQUIRE_COMPATIBLE\x10\x03*M\n" +
 	"\fRerankReason\x12\x1d\n" +
 	"\x19RERANK_REASON_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aRERANK_REASON_STALE_TARGET\x10\x01*\x94\x01\n" +
@@ -1605,69 +1671,71 @@ func file_api_scheduler_v1_scheduler_proto_rawDescGZIP() []byte {
 	return file_api_scheduler_v1_scheduler_proto_rawDescData
 }
 
-var file_api_scheduler_v1_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
+var file_api_scheduler_v1_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 7)
 var file_api_scheduler_v1_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_api_scheduler_v1_scheduler_proto_goTypes = []any{
 	(Priority)(0),                        // 0: prudentia.scheduler.v1.Priority
-	(RerankReason)(0),                    // 1: prudentia.scheduler.v1.RerankReason
-	(GiveUpReason)(0),                    // 2: prudentia.scheduler.v1.GiveUpReason
-	(TerminalProof)(0),                   // 3: prudentia.scheduler.v1.TerminalProof
-	(AmbiguousCause)(0),                  // 4: prudentia.scheduler.v1.AmbiguousCause
-	(ErrorCode)(0),                       // 5: prudentia.scheduler.v1.ErrorCode
-	(*IdempotencyLookupCandidate)(nil),   // 6: prudentia.scheduler.v1.IdempotencyLookupCandidate
-	(*RequestDigestCandidate)(nil),       // 7: prudentia.scheduler.v1.RequestDigestCandidate
-	(*FeatureSet)(nil),                   // 8: prudentia.scheduler.v1.FeatureSet
-	(*ScheduleRequest)(nil),              // 9: prudentia.scheduler.v1.ScheduleRequest
-	(*ReservationRef)(nil),               // 10: prudentia.scheduler.v1.ReservationRef
-	(*Reservation)(nil),                  // 11: prudentia.scheduler.v1.Reservation
-	(*ScheduleResponse)(nil),             // 12: prudentia.scheduler.v1.ScheduleResponse
-	(*PrepareDispatchRequest)(nil),       // 13: prudentia.scheduler.v1.PrepareDispatchRequest
-	(*WorkloadIdentity)(nil),             // 14: prudentia.scheduler.v1.WorkloadIdentity
-	(*DispatchTarget)(nil),               // 15: prudentia.scheduler.v1.DispatchTarget
-	(*PrepareDispatchResponse)(nil),      // 16: prudentia.scheduler.v1.PrepareDispatchResponse
-	(*AbandonBeforeDispatchRequest)(nil), // 17: prudentia.scheduler.v1.AbandonBeforeDispatchRequest
-	(*GiveUpBeforeDispatchRequest)(nil),  // 18: prudentia.scheduler.v1.GiveUpBeforeDispatchRequest
-	(*FinalizeRequest)(nil),              // 19: prudentia.scheduler.v1.FinalizeRequest
-	(*MarkAmbiguousRequest)(nil),         // 20: prudentia.scheduler.v1.MarkAmbiguousRequest
-	(*ErrorDetail)(nil),                  // 21: prudentia.scheduler.v1.ErrorDetail
-	(*Empty)(nil),                        // 22: prudentia.scheduler.v1.Empty
+	(CachePolicy)(0),                     // 1: prudentia.scheduler.v1.CachePolicy
+	(RerankReason)(0),                    // 2: prudentia.scheduler.v1.RerankReason
+	(GiveUpReason)(0),                    // 3: prudentia.scheduler.v1.GiveUpReason
+	(TerminalProof)(0),                   // 4: prudentia.scheduler.v1.TerminalProof
+	(AmbiguousCause)(0),                  // 5: prudentia.scheduler.v1.AmbiguousCause
+	(ErrorCode)(0),                       // 6: prudentia.scheduler.v1.ErrorCode
+	(*IdempotencyLookupCandidate)(nil),   // 7: prudentia.scheduler.v1.IdempotencyLookupCandidate
+	(*RequestDigestCandidate)(nil),       // 8: prudentia.scheduler.v1.RequestDigestCandidate
+	(*FeatureSet)(nil),                   // 9: prudentia.scheduler.v1.FeatureSet
+	(*ScheduleRequest)(nil),              // 10: prudentia.scheduler.v1.ScheduleRequest
+	(*ReservationRef)(nil),               // 11: prudentia.scheduler.v1.ReservationRef
+	(*Reservation)(nil),                  // 12: prudentia.scheduler.v1.Reservation
+	(*ScheduleResponse)(nil),             // 13: prudentia.scheduler.v1.ScheduleResponse
+	(*PrepareDispatchRequest)(nil),       // 14: prudentia.scheduler.v1.PrepareDispatchRequest
+	(*WorkloadIdentity)(nil),             // 15: prudentia.scheduler.v1.WorkloadIdentity
+	(*DispatchTarget)(nil),               // 16: prudentia.scheduler.v1.DispatchTarget
+	(*PrepareDispatchResponse)(nil),      // 17: prudentia.scheduler.v1.PrepareDispatchResponse
+	(*AbandonBeforeDispatchRequest)(nil), // 18: prudentia.scheduler.v1.AbandonBeforeDispatchRequest
+	(*GiveUpBeforeDispatchRequest)(nil),  // 19: prudentia.scheduler.v1.GiveUpBeforeDispatchRequest
+	(*FinalizeRequest)(nil),              // 20: prudentia.scheduler.v1.FinalizeRequest
+	(*MarkAmbiguousRequest)(nil),         // 21: prudentia.scheduler.v1.MarkAmbiguousRequest
+	(*ErrorDetail)(nil),                  // 22: prudentia.scheduler.v1.ErrorDetail
+	(*Empty)(nil),                        // 23: prudentia.scheduler.v1.Empty
 }
 var file_api_scheduler_v1_scheduler_proto_depIdxs = []int32{
-	6,  // 0: prudentia.scheduler.v1.ScheduleRequest.idempotency_lookup_candidates:type_name -> prudentia.scheduler.v1.IdempotencyLookupCandidate
-	7,  // 1: prudentia.scheduler.v1.ScheduleRequest.digest_candidates:type_name -> prudentia.scheduler.v1.RequestDigestCandidate
-	8,  // 2: prudentia.scheduler.v1.ScheduleRequest.features:type_name -> prudentia.scheduler.v1.FeatureSet
+	7,  // 0: prudentia.scheduler.v1.ScheduleRequest.idempotency_lookup_candidates:type_name -> prudentia.scheduler.v1.IdempotencyLookupCandidate
+	8,  // 1: prudentia.scheduler.v1.ScheduleRequest.digest_candidates:type_name -> prudentia.scheduler.v1.RequestDigestCandidate
+	9,  // 2: prudentia.scheduler.v1.ScheduleRequest.features:type_name -> prudentia.scheduler.v1.FeatureSet
 	0,  // 3: prudentia.scheduler.v1.ScheduleRequest.priority:type_name -> prudentia.scheduler.v1.Priority
-	10, // 4: prudentia.scheduler.v1.Reservation.ref:type_name -> prudentia.scheduler.v1.ReservationRef
-	11, // 5: prudentia.scheduler.v1.ScheduleResponse.reservation:type_name -> prudentia.scheduler.v1.Reservation
-	10, // 6: prudentia.scheduler.v1.PrepareDispatchRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
-	14, // 7: prudentia.scheduler.v1.DispatchTarget.identity:type_name -> prudentia.scheduler.v1.WorkloadIdentity
-	15, // 8: prudentia.scheduler.v1.PrepareDispatchResponse.target:type_name -> prudentia.scheduler.v1.DispatchTarget
-	10, // 9: prudentia.scheduler.v1.AbandonBeforeDispatchRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
-	1,  // 10: prudentia.scheduler.v1.AbandonBeforeDispatchRequest.reason:type_name -> prudentia.scheduler.v1.RerankReason
-	10, // 11: prudentia.scheduler.v1.GiveUpBeforeDispatchRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
-	2,  // 12: prudentia.scheduler.v1.GiveUpBeforeDispatchRequest.reason:type_name -> prudentia.scheduler.v1.GiveUpReason
-	10, // 13: prudentia.scheduler.v1.FinalizeRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
-	3,  // 14: prudentia.scheduler.v1.FinalizeRequest.proof:type_name -> prudentia.scheduler.v1.TerminalProof
-	10, // 15: prudentia.scheduler.v1.MarkAmbiguousRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
-	4,  // 16: prudentia.scheduler.v1.MarkAmbiguousRequest.cause:type_name -> prudentia.scheduler.v1.AmbiguousCause
-	5,  // 17: prudentia.scheduler.v1.ErrorDetail.code:type_name -> prudentia.scheduler.v1.ErrorCode
-	9,  // 18: prudentia.scheduler.v1.SchedulerService.Schedule:input_type -> prudentia.scheduler.v1.ScheduleRequest
-	13, // 19: prudentia.scheduler.v1.SchedulerService.PrepareDispatch:input_type -> prudentia.scheduler.v1.PrepareDispatchRequest
-	17, // 20: prudentia.scheduler.v1.SchedulerService.AbandonBeforeDispatch:input_type -> prudentia.scheduler.v1.AbandonBeforeDispatchRequest
-	18, // 21: prudentia.scheduler.v1.SchedulerService.GiveUpBeforeDispatch:input_type -> prudentia.scheduler.v1.GiveUpBeforeDispatchRequest
-	19, // 22: prudentia.scheduler.v1.SchedulerService.Finalize:input_type -> prudentia.scheduler.v1.FinalizeRequest
-	20, // 23: prudentia.scheduler.v1.SchedulerService.MarkAmbiguous:input_type -> prudentia.scheduler.v1.MarkAmbiguousRequest
-	12, // 24: prudentia.scheduler.v1.SchedulerService.Schedule:output_type -> prudentia.scheduler.v1.ScheduleResponse
-	16, // 25: prudentia.scheduler.v1.SchedulerService.PrepareDispatch:output_type -> prudentia.scheduler.v1.PrepareDispatchResponse
-	22, // 26: prudentia.scheduler.v1.SchedulerService.AbandonBeforeDispatch:output_type -> prudentia.scheduler.v1.Empty
-	22, // 27: prudentia.scheduler.v1.SchedulerService.GiveUpBeforeDispatch:output_type -> prudentia.scheduler.v1.Empty
-	22, // 28: prudentia.scheduler.v1.SchedulerService.Finalize:output_type -> prudentia.scheduler.v1.Empty
-	22, // 29: prudentia.scheduler.v1.SchedulerService.MarkAmbiguous:output_type -> prudentia.scheduler.v1.Empty
-	24, // [24:30] is the sub-list for method output_type
-	18, // [18:24] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	1,  // 4: prudentia.scheduler.v1.ScheduleRequest.cache_policy:type_name -> prudentia.scheduler.v1.CachePolicy
+	11, // 5: prudentia.scheduler.v1.Reservation.ref:type_name -> prudentia.scheduler.v1.ReservationRef
+	12, // 6: prudentia.scheduler.v1.ScheduleResponse.reservation:type_name -> prudentia.scheduler.v1.Reservation
+	11, // 7: prudentia.scheduler.v1.PrepareDispatchRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
+	15, // 8: prudentia.scheduler.v1.DispatchTarget.identity:type_name -> prudentia.scheduler.v1.WorkloadIdentity
+	16, // 9: prudentia.scheduler.v1.PrepareDispatchResponse.target:type_name -> prudentia.scheduler.v1.DispatchTarget
+	11, // 10: prudentia.scheduler.v1.AbandonBeforeDispatchRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
+	2,  // 11: prudentia.scheduler.v1.AbandonBeforeDispatchRequest.reason:type_name -> prudentia.scheduler.v1.RerankReason
+	11, // 12: prudentia.scheduler.v1.GiveUpBeforeDispatchRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
+	3,  // 13: prudentia.scheduler.v1.GiveUpBeforeDispatchRequest.reason:type_name -> prudentia.scheduler.v1.GiveUpReason
+	11, // 14: prudentia.scheduler.v1.FinalizeRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
+	4,  // 15: prudentia.scheduler.v1.FinalizeRequest.proof:type_name -> prudentia.scheduler.v1.TerminalProof
+	11, // 16: prudentia.scheduler.v1.MarkAmbiguousRequest.ref:type_name -> prudentia.scheduler.v1.ReservationRef
+	5,  // 17: prudentia.scheduler.v1.MarkAmbiguousRequest.cause:type_name -> prudentia.scheduler.v1.AmbiguousCause
+	6,  // 18: prudentia.scheduler.v1.ErrorDetail.code:type_name -> prudentia.scheduler.v1.ErrorCode
+	10, // 19: prudentia.scheduler.v1.SchedulerService.Schedule:input_type -> prudentia.scheduler.v1.ScheduleRequest
+	14, // 20: prudentia.scheduler.v1.SchedulerService.PrepareDispatch:input_type -> prudentia.scheduler.v1.PrepareDispatchRequest
+	18, // 21: prudentia.scheduler.v1.SchedulerService.AbandonBeforeDispatch:input_type -> prudentia.scheduler.v1.AbandonBeforeDispatchRequest
+	19, // 22: prudentia.scheduler.v1.SchedulerService.GiveUpBeforeDispatch:input_type -> prudentia.scheduler.v1.GiveUpBeforeDispatchRequest
+	20, // 23: prudentia.scheduler.v1.SchedulerService.Finalize:input_type -> prudentia.scheduler.v1.FinalizeRequest
+	21, // 24: prudentia.scheduler.v1.SchedulerService.MarkAmbiguous:input_type -> prudentia.scheduler.v1.MarkAmbiguousRequest
+	13, // 25: prudentia.scheduler.v1.SchedulerService.Schedule:output_type -> prudentia.scheduler.v1.ScheduleResponse
+	17, // 26: prudentia.scheduler.v1.SchedulerService.PrepareDispatch:output_type -> prudentia.scheduler.v1.PrepareDispatchResponse
+	23, // 27: prudentia.scheduler.v1.SchedulerService.AbandonBeforeDispatch:output_type -> prudentia.scheduler.v1.Empty
+	23, // 28: prudentia.scheduler.v1.SchedulerService.GiveUpBeforeDispatch:output_type -> prudentia.scheduler.v1.Empty
+	23, // 29: prudentia.scheduler.v1.SchedulerService.Finalize:output_type -> prudentia.scheduler.v1.Empty
+	23, // 30: prudentia.scheduler.v1.SchedulerService.MarkAmbiguous:output_type -> prudentia.scheduler.v1.Empty
+	25, // [25:31] is the sub-list for method output_type
+	19, // [19:25] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_api_scheduler_v1_scheduler_proto_init() }
@@ -1680,7 +1748,7 @@ func file_api_scheduler_v1_scheduler_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_scheduler_v1_scheduler_proto_rawDesc), len(file_api_scheduler_v1_scheduler_proto_rawDesc)),
-			NumEnums:      6,
+			NumEnums:      7,
 			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   1,

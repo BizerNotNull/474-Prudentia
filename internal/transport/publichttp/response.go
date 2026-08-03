@@ -3,9 +3,11 @@ package publichttp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/BizerNotNull/474-Prudentia/internal/domain"
 )
@@ -15,19 +17,26 @@ type StreamSink interface {
 }
 
 type SSESink struct {
-	writer   http.ResponseWriter
-	flusher  http.Flusher
-	id       string
-	started  bool
-	terminal bool
+	writer     http.ResponseWriter
+	controller *http.ResponseController
+	id         string
+	model      string
+	created    int64
+	started    bool
+	terminal   bool
 }
 
-func NewSSESink(w http.ResponseWriter, id string) (*SSESink, error) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+func NewSSESink(w http.ResponseWriter, id string, model ...string) (*SSESink, error) {
+	if _, ok := w.(http.Flusher); !ok {
 		return nil, domain.NewPublicError(domain.ErrorInternal)
 	}
-	return &SSESink{writer: w, flusher: flusher, id: id}, nil
+	modelName := "unknown"
+	if len(model) == 1 && model[0] != "" {
+		modelName = model[0]
+	} else if len(model) > 1 {
+		return nil, domain.NewPublicError(domain.ErrorInternal)
+	}
+	return &SSESink{writer: w, controller: http.NewResponseController(w), id: id, model: modelName, created: time.Now().Unix()}, nil
 }
 
 func (s *SSESink) Started() bool { return s.started }
@@ -46,6 +55,8 @@ func (s *SSESink) Write(ctx context.Context, event domain.StreamEvent) error {
 		payload = map[string]any{
 			"id":      s.id,
 			"object":  "chat.completion.chunk",
+			"created": s.created,
+			"model":   s.model,
 			"choices": []any{map[string]any{"index": 0, "delta": map[string]string{"content": event.Delta()}, "finish_reason": nil}},
 		}
 	case domain.StreamEventUsage:
@@ -55,6 +66,8 @@ func (s *SSESink) Write(ctx context.Context, event domain.StreamEvent) error {
 		payload = map[string]any{
 			"id":      s.id,
 			"object":  "chat.completion.chunk",
+			"created": s.created,
+			"model":   s.model,
 			"choices": []any{},
 			"usage":   event.Usage(),
 		}
@@ -66,6 +79,8 @@ func (s *SSESink) Write(ctx context.Context, event domain.StreamEvent) error {
 		payload = map[string]any{
 			"id":      s.id,
 			"object":  "chat.completion.chunk",
+			"created": s.created,
+			"model":   s.model,
 			"choices": []any{map[string]any{"index": 0, "delta": map[string]string{}, "finish_reason": "stop"}},
 		}
 		terminal = true
@@ -75,6 +90,9 @@ func (s *SSESink) Write(ctx context.Context, event domain.StreamEvent) error {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return domain.NewPublicError(domain.ErrorInternal)
+	}
+	if err := s.setWriteDeadline(ctx); err != nil {
+		return err
 	}
 	if !s.started {
 		s.writer.Header().Set("Content-Type", "text/event-stream")
@@ -92,8 +110,23 @@ func (s *SSESink) Write(ctx context.Context, event domain.StreamEvent) error {
 		}
 		s.terminal = true
 	}
-	s.flusher.Flush()
+	if err := s.controller.Flush(); err != nil {
+		return err
+	}
 	return ctx.Err()
+}
+
+const maxSynchronousWrite = 5 * time.Second
+
+func (s *SSESink) setWriteDeadline(ctx context.Context) error {
+	deadline := time.Now().Add(maxSynchronousWrite)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := s.controller.SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	return nil
 }
 
 type NonStreamingCollector struct {
@@ -162,9 +195,10 @@ func EncodeNonStreaming(w http.ResponseWriter, id, model string, result Completi
 		return domain.NewPublicError(domain.ErrorInternal)
 	}
 	response := map[string]any{
-		"id":     id,
-		"object": "chat.completion",
-		"model":  model,
+		"id":      id,
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model,
 		"choices": []any{map[string]any{
 			"index":         0,
 			"message":       map[string]string{"role": "assistant", "content": result.Content},
@@ -202,6 +236,18 @@ func WritePublicError(w http.ResponseWriter, id string, err error) {
 		status, code, message = http.StatusConflict, "request_in_progress", "The idempotent request is still in progress."
 	case domain.ErrorRequestNotReplayable:
 		status, code, message = http.StatusConflict, "request_not_replayable", "The completed request has no replayable stored response."
+	case domain.ErrorNoCapacity:
+		status, code, message = http.StatusServiceUnavailable, "no_capacity", "No inference capacity is currently available."
+	case domain.ErrorBackendUnavailable:
+		status, code, message = http.StatusBadGateway, "backend_unavailable", "The inference backend is unavailable."
+	case domain.ErrorDeadlineExceeded:
+		status, code, message = http.StatusGatewayTimeout, "deadline_exceeded", "The inference deadline was exceeded."
+	case domain.ErrorRateLimited:
+		status, code, message = http.StatusTooManyRequests, "rate_limited", "The request was rate limited."
+	case domain.ErrorRecoveryFenced:
+		status, code, message = http.StatusServiceUnavailable, "recovery_fenced", "Inference is temporarily fenced for recovery."
+	case domain.ErrorRetryWindowClosed:
+		status, code, message = http.StatusConflict, "retry_window_closed", "The request retry window is closed."
 	case domain.ErrorUnavailable:
 		status, code, message = http.StatusServiceUnavailable, "service_unavailable", "Inference is temporarily unavailable."
 	}

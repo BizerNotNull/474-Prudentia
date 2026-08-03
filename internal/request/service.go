@@ -25,6 +25,13 @@ type Provider interface {
 	Infer(context.Context, domain.DispatchTarget, domain.AuthorizedRequest, publichttp.StreamSink) error
 }
 
+// CachePreparer performs optional cache work against a reservation without
+// authorizing provider dispatch. Returning an error is advisory for Prefer and
+// terminal-before-dispatch for RequireCompatible.
+type CachePreparer interface {
+	Prepare(context.Context, domain.ReservationRef, domain.AuthorizedRequest) error
+}
+
 type DispatchEvidence uint8
 
 const (
@@ -53,6 +60,7 @@ func NewNotSentError(cause error) error {
 type Service struct {
 	scheduler       Scheduler
 	provider        Provider
+	cache           CachePreparer
 	idempotency     idempotencyDeriver
 	executionBudget time.Duration
 	cleanupTimeout  time.Duration
@@ -60,15 +68,22 @@ type Service struct {
 
 const maxPreDispatchReranks = 3
 
-func NewService(scheduler Scheduler, provider Provider, idempotencyConfig IdempotencyConfig, executionBudget, cleanupTimeout time.Duration) (*Service, error) {
-	if scheduler == nil || provider == nil || executionBudget <= 0 || executionBudget > 30*time.Minute || cleanupTimeout <= 0 || cleanupTimeout > 30*time.Second {
+func NewService(scheduler Scheduler, provider Provider, idempotencyConfig IdempotencyConfig, executionBudget, cleanupTimeout time.Duration, cache ...CachePreparer) (*Service, error) {
+	if scheduler == nil || provider == nil || len(cache) > 1 || executionBudget <= 0 || executionBudget > 30*time.Minute || cleanupTimeout <= 0 || cleanupTimeout > 30*time.Second {
 		return nil, errors.New("invalid inference service configuration")
 	}
 	idempotency, err := newIdempotencyDeriver(idempotencyConfig)
 	if err != nil {
 		return nil, err
 	}
-	return &Service{scheduler: scheduler, provider: provider, idempotency: idempotency, executionBudget: executionBudget, cleanupTimeout: cleanupTimeout}, nil
+	service := &Service{scheduler: scheduler, provider: provider, idempotency: idempotency, executionBudget: executionBudget, cleanupTimeout: cleanupTimeout}
+	if len(cache) == 1 {
+		if cache[0] == nil {
+			return nil, errors.New("invalid cache preparer")
+		}
+		service.cache = cache[0]
+	}
+	return service, nil
 }
 
 func (s *Service) Infer(ctx context.Context, requestID string, idempotencyKey []byte, request domain.AuthorizedRequest, _ domain.ResponseMode, sink publichttp.StreamSink) error {
@@ -89,7 +104,8 @@ func (s *Service) Infer(ctx context.Context, requestID string, idempotencyKey []
 	}
 	params := domain.ScheduleParams{
 		RequestID: requestID, AttemptID: attemptID, Tenant: request.Tenant(), Model: request.Request().Model(),
-		SlotCost: 1, Features: request.Request().Features(), ExecutionBudget: budget,
+		SlotCost: 1, Features: request.Request().Features(), Priority: request.Request().Priority(),
+		CachePolicy: request.Request().CachePolicy(), ExecutionBudget: budget,
 		DigestCandidates: digestCandidates, DigestWriteVersion: s.idempotency.digestWriteVersion,
 	}
 	if len(lookupCandidates) != 0 {
@@ -111,6 +127,10 @@ func (s *Service) Infer(ctx context.Context, requestID string, idempotencyKey []
 			return publicSchedulingError(scheduleErr)
 		}
 		ref = reservation.Ref()
+		if cacheErr := s.prepareCache(inferCtx, ref, request); cacheErr != nil {
+			s.cleanupGiveUp(ref, giveUpReason(inferCtx, cacheErr))
+			return publicSchedulingError(cacheErr)
+		}
 		target, prepareErr := s.scheduler.PrepareDispatch(inferCtx, ref)
 		if prepareErr == nil {
 			return s.dispatch(inferCtx, ref, target, request, sink)
@@ -127,22 +147,69 @@ func (s *Service) Infer(ctx context.Context, requestID string, idempotencyKey []
 }
 
 func (s *Service) dispatch(ctx context.Context, ref domain.ReservationRef, target domain.DispatchTarget, request domain.AuthorizedRequest, sink publichttp.StreamSink) error {
-	if err := s.provider.Infer(ctx, target, request, sink); err != nil {
-		var dispatchErr *DispatchError
-		if errors.As(err, &dispatchErr) && (dispatchErr.Evidence == DispatchEvidenceNotSent || dispatchErr.NotSent) {
-			_ = s.cleanupFinalize(ref, domain.TerminalProofNotSent)
+	tracked := &terminalTrackingSink{next: sink}
+	if err := s.provider.Infer(ctx, target, request, tracked); err != nil {
+		if proof, ok := tracked.TerminalProof(); ok {
+			if finalizeErr := s.cleanupFinalize(ref, proof); finalizeErr != nil {
+				return domain.NewPublicError(domain.ErrorInternal)
+			}
 		} else {
-			s.cleanupAmbiguous(ref, ambiguousCause(ctx, err))
+			var dispatchErr *DispatchError
+			if errors.As(err, &dispatchErr) && (dispatchErr.Evidence == DispatchEvidenceNotSent || dispatchErr.NotSent) {
+				_ = s.cleanupFinalize(ref, domain.TerminalProofNotSent)
+			} else {
+				s.cleanupAmbiguous(ref, ambiguousCause(ctx, err))
+			}
 		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return domain.NewPublicError(domain.ErrorDeadlineExceeded)
+		}
+		if errors.Is(err, context.Canceled) {
 			return err
 		}
-		return domain.NewPublicError(domain.ErrorUnavailable)
+		return domain.NewPublicError(domain.ErrorBackendUnavailable)
 	}
-	if err := s.cleanupFinalize(ref, domain.TerminalProofProviderFinish); err != nil {
+	proof, ok := tracked.TerminalProof()
+	if !ok {
+		proof = domain.TerminalProofProviderFinish
+	}
+	if err := s.cleanupFinalize(ref, proof); err != nil {
 		return domain.NewPublicError(domain.ErrorInternal)
 	}
 	return nil
+}
+
+func (s *Service) prepareCache(ctx context.Context, ref domain.ReservationRef, request domain.AuthorizedRequest) error {
+	policy := request.Request().CachePolicy()
+	if policy == domain.CachePolicyDisabled {
+		return nil
+	}
+	if s.cache == nil {
+		if policy == domain.CachePolicyRequireCompatible {
+			return domain.NewPublicError(domain.ErrorBackendUnavailable)
+		}
+		return nil
+	}
+	if err := s.cache.Prepare(ctx, ref, request); err != nil && policy == domain.CachePolicyRequireCompatible {
+		return domain.NewPublicError(domain.ErrorBackendUnavailable)
+	}
+	return nil
+}
+
+type terminalTrackingSink struct {
+	next  publichttp.StreamSink
+	proof domain.TerminalProof
+}
+
+func (s *terminalTrackingSink) Write(ctx context.Context, event domain.StreamEvent) error {
+	if proof, ok := event.TerminalProof(); ok {
+		s.proof = proof
+	}
+	return s.next.Write(ctx, event)
+}
+
+func (s *terminalTrackingSink) TerminalProof() (domain.TerminalProof, bool) {
+	return s.proof, s.proof.Valid()
 }
 
 func (s *Service) cleanupAbandon(ref domain.ReservationRef, reason domain.RerankReason) error {
@@ -170,6 +237,10 @@ func (s *Service) cleanupAmbiguous(ref domain.ReservationRef, cause domain.Ambig
 }
 
 func publicSchedulingError(err error) error {
+	var publicErr *domain.PublicError
+	if errors.As(err, &publicErr) {
+		return err
+	}
 	switch {
 	case errors.Is(err, domain.ErrIdempotencyConflict):
 		return domain.NewPublicError(domain.ErrorIdempotencyConflict)
@@ -177,14 +248,19 @@ func publicSchedulingError(err error) error {
 		return domain.NewPublicError(domain.ErrorRequestInProgress)
 	case errors.Is(err, domain.ErrRequestNotReplayable):
 		return domain.NewPublicError(domain.ErrorRequestNotReplayable)
-	}
-	if errors.Is(err, domain.ErrNoCapacity) || errors.Is(err, domain.ErrStaleTarget) || errors.Is(err, domain.ErrInvalidState) {
-		return domain.NewPublicError(domain.ErrorUnavailable)
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	case errors.Is(err, domain.ErrNoCapacity):
+		return domain.NewPublicError(domain.ErrorNoCapacity)
+	case errors.Is(err, domain.ErrStaleTarget):
+		return domain.NewPublicError(domain.ErrorRecoveryFenced)
+	case errors.Is(err, domain.ErrInvalidState):
+		return domain.NewPublicError(domain.ErrorRetryWindowClosed)
+	case errors.Is(err, context.DeadlineExceeded):
+		return domain.NewPublicError(domain.ErrorDeadlineExceeded)
+	case errors.Is(err, context.Canceled):
 		return err
+	default:
+		return domain.NewPublicError(domain.ErrorInternal)
 	}
-	return domain.NewPublicError(domain.ErrorInternal)
 }
 
 func giveUpReason(ctx context.Context, err error) domain.GiveUpReason {

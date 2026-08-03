@@ -12,11 +12,15 @@ import (
 )
 
 type recordingScheduler struct {
-	ref       domain.ReservationRef
-	target    domain.DispatchTarget
-	finalized domain.TerminalProof
-	ambiguous domain.AmbiguousCause
-	command   domain.ScheduleCommand
+	ref            domain.ReservationRef
+	target         domain.DispatchTarget
+	finalized      domain.TerminalProof
+	ambiguous      domain.AmbiguousCause
+	command        domain.ScheduleCommand
+	prepareCalls   int
+	giveUpCalls    int
+	finalizeCalls  int
+	ambiguousCalls int
 }
 
 func newRecordingScheduler(t *testing.T) *recordingScheduler {
@@ -40,6 +44,7 @@ func (s *recordingScheduler) Schedule(_ context.Context, command domain.Schedule
 	return domain.NewReservation(s.ref), nil
 }
 func (s *recordingScheduler) PrepareDispatch(context.Context, domain.ReservationRef) (domain.DispatchTarget, error) {
+	s.prepareCalls++
 	return s.target, nil
 }
 func (s *recordingScheduler) AbandonBeforeDispatch(context.Context, domain.ReservationRef, domain.RerankReason) error {
@@ -47,14 +52,17 @@ func (s *recordingScheduler) AbandonBeforeDispatch(context.Context, domain.Reser
 }
 
 func (s *recordingScheduler) GiveUpBeforeDispatch(context.Context, domain.ReservationRef, domain.GiveUpReason) error {
+	s.giveUpCalls++
 	return nil
 }
 func (s *recordingScheduler) Finalize(_ context.Context, _ domain.ReservationRef, proof domain.TerminalProof) error {
 	s.finalized = proof
+	s.finalizeCalls++
 	return nil
 }
 func (s *recordingScheduler) MarkAmbiguous(_ context.Context, _ domain.ReservationRef, cause domain.AmbiguousCause) error {
 	s.ambiguous = cause
+	s.ambiguousCalls++
 	return nil
 }
 
@@ -62,6 +70,37 @@ type failingProvider struct{ err error }
 
 func (p failingProvider) Infer(context.Context, domain.DispatchTarget, domain.AuthorizedRequest, publichttp.StreamSink) error {
 	return p.err
+}
+
+type countingFailureProvider struct {
+	calls int
+	err   error
+}
+
+func (p *countingFailureProvider) Infer(context.Context, domain.DispatchTarget, domain.AuthorizedRequest, publichttp.StreamSink) error {
+	p.calls++
+	return p.err
+}
+
+type terminalThenDeliveryErrorProvider struct{ calls int }
+
+func (p *terminalThenDeliveryErrorProvider) Infer(ctx context.Context, _ domain.DispatchTarget, _ domain.AuthorizedRequest, sink publichttp.StreamSink) error {
+	p.calls++
+	return sink.Write(ctx, domain.NewTerminalEvent())
+}
+
+type failingSink struct{ err error }
+
+func (s failingSink) Write(context.Context, domain.StreamEvent) error { return s.err }
+
+type recordingCache struct {
+	calls int
+	err   error
+}
+
+func (c *recordingCache) Prepare(context.Context, domain.ReservationRef, domain.AuthorizedRequest) error {
+	c.calls++
+	return c.err
 }
 
 type switchingScheduler struct {
@@ -141,20 +180,57 @@ type discardSink struct{}
 func (discardSink) Write(context.Context, domain.StreamEvent) error { return nil }
 
 func authorizedRequest(t *testing.T) domain.AuthorizedRequest {
+	return authorizedRequestWithCache(t, domain.CachePolicyDisabled)
+}
+
+func authorizedRequestWithCache(t *testing.T, policy domain.CachePolicy) domain.AuthorizedRequest {
 	t.Helper()
-	principal, err := domain.NewPrincipal("tenant", []string{"model"})
+	features, err := domain.NewFeatureSet(domain.FeatureVersion1, 1<<domain.FeaturePrefixCache)
 	if err != nil {
 		t.Fatal(err)
 	}
-	inference, err := domain.NewInferenceRequest(domain.InferenceRequestParams{
-		Model: "model", Messages: []domain.MessageParams{{Role: "user", Content: "prompt"}},
-		MaxCompletionTokens: 16, Priority: domain.PriorityNormal, Features: domain.EmptyFeatureSet(),
-		CachePolicy: domain.CachePolicyDisabled, ExecutionBudget: time.Minute,
+	principal, err := domain.NewPrincipalFromParams(domain.PrincipalParams{
+		Subject: "subject", Tenant: mustTenant(t, "tenant"), Models: []domain.ModelKey{mustModel(t, "model")},
+		Features: features, MaxPriority: domain.PriorityNormal, CachePolicies: []domain.CachePolicy{domain.CachePolicyDisabled, domain.CachePolicyPrefer, domain.CachePolicyRequireCompatible},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return domain.NewAuthorizedRequest(principal, inference)
+	requestFeatures := domain.EmptyFeatureSet()
+	if policy != domain.CachePolicyDisabled {
+		requestFeatures = features
+	}
+	inference, err := domain.NewInferenceRequest(domain.InferenceRequestParams{
+		Model: "model", Messages: []domain.MessageParams{{Role: "user", Content: "prompt"}},
+		MaxCompletionTokens: 16, Priority: domain.PriorityNormal, Features: requestFeatures,
+		CachePolicy: policy, ExecutionBudget: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorized, err := domain.NewCheckedAuthorizedRequest(principal, inference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return authorized
+}
+
+func mustTenant(t *testing.T, value string) domain.TenantScope {
+	t.Helper()
+	tenant, err := domain.NewTenantScope(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tenant
+}
+
+func mustModel(t *testing.T, value string) domain.ModelKey {
+	t.Helper()
+	model, err := domain.NewModelKey(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return model
 }
 
 func idempotencyConfig() requestapp.IdempotencyConfig {
@@ -194,14 +270,26 @@ func TestTransportFailureAfterBodyMayBeSentCreatesAmbiguousDebt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Infer(context.Background(), "req_test", nil, authorizedRequest(t), domain.ResponseModeNonStreaming, discardSink{}); domain.ErrorKindOf(err) != domain.ErrorUnavailable {
-		t.Fatalf("error = %v, want unavailable", err)
+	if err := service.Infer(context.Background(), "req_test", nil, authorizedRequest(t), domain.ResponseModeNonStreaming, discardSink{}); domain.ErrorKindOf(err) != domain.ErrorBackendUnavailable {
+		t.Fatalf("error = %v, want backend unavailable", err)
 	}
 	if scheduler.ambiguous != domain.AmbiguousTransport || scheduler.finalized != 0 {
 		t.Fatalf("ambiguous = %v, finalized = %v", scheduler.ambiguous, scheduler.finalized)
 	}
 }
 
+func TestAmbiguousDispatchUsesOneCleanupTransitionAndNeverReposts(t *testing.T) {
+	scheduler := newRecordingScheduler(t)
+	provider := &countingFailureProvider{err: errors.New("connection reset")}
+	service, err := requestapp.NewService(scheduler, provider, idempotencyConfig(), time.Minute, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = service.Infer(context.Background(), "req_once", nil, authorizedRequest(t), domain.ResponseModeNonStreaming, discardSink{})
+	if provider.calls != 1 || scheduler.ambiguousCalls != 1 || scheduler.finalizeCalls != 0 {
+		t.Fatalf("provider=%d ambiguous=%d finalize=%d", provider.calls, scheduler.ambiguousCalls, scheduler.finalizeCalls)
+	}
+}
 func TestDefinitiveNotSentFailureReleasesReservation(t *testing.T) {
 	scheduler := newRecordingScheduler(t)
 	service, err := requestapp.NewService(scheduler, failingProvider{err: requestapp.NewNotSentError(errors.New("identity mismatch"))}, idempotencyConfig(), time.Minute, time.Second)
@@ -211,6 +299,65 @@ func TestDefinitiveNotSentFailureReleasesReservation(t *testing.T) {
 	_ = service.Infer(context.Background(), "req_test", nil, authorizedRequest(t), domain.ResponseModeNonStreaming, discardSink{})
 	if scheduler.finalized != domain.TerminalProofNotSent || scheduler.ambiguous != 0 {
 		t.Fatalf("finalized = %v, ambiguous = %v", scheduler.finalized, scheduler.ambiguous)
+	}
+}
+
+func TestValidTerminalFinalizesBeforeDeliveryError(t *testing.T) {
+	scheduler := newRecordingScheduler(t)
+	provider := &terminalThenDeliveryErrorProvider{}
+	service, err := requestapp.NewService(scheduler, provider, idempotencyConfig(), time.Minute, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryErr := errors.New("client disconnected")
+	err = service.Infer(context.Background(), "req_terminal_delivery", nil, authorizedRequest(t), domain.ResponseModeStreaming, failingSink{err: deliveryErr})
+	if domain.ErrorKindOf(err) != domain.ErrorBackendUnavailable {
+		t.Fatalf("error = %v, want backend unavailable", err)
+	}
+	if scheduler.finalized != domain.TerminalProofProviderFinish || scheduler.finalizeCalls != 1 || scheduler.ambiguousCalls != 0 || provider.calls != 1 {
+		t.Fatalf("finalized=%v finalize calls=%d ambiguous calls=%d provider calls=%d", scheduler.finalized, scheduler.finalizeCalls, scheduler.ambiguousCalls, provider.calls)
+	}
+}
+
+func TestCachePreparationPolicyBeforeDispatch(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		policy       domain.CachePolicy
+		withCache    bool
+		cacheErr     error
+		wantCalls    int
+		wantPrepare  int
+		wantGiveUp   int
+		wantProvider int
+		wantError    bool
+	}{
+		{name: "disabled cold default", policy: domain.CachePolicyDisabled, wantPrepare: 1, wantProvider: 1},
+		{name: "prefer outage falls back cold", policy: domain.CachePolicyPrefer, withCache: true, cacheErr: errors.New("cache unavailable"), wantCalls: 1, wantPrepare: 1, wantProvider: 1},
+		{name: "require without port fails closed", policy: domain.CachePolicyRequireCompatible, wantGiveUp: 1, wantError: true},
+		{name: "require outage fails before prepare", policy: domain.CachePolicyRequireCompatible, withCache: true, cacheErr: errors.New("cache unavailable"), wantCalls: 1, wantGiveUp: 1, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheduler := newRecordingScheduler(t)
+			provider := &countingProvider{}
+			cache := &recordingCache{err: test.cacheErr}
+			var service *requestapp.Service
+			var err error
+			if test.withCache {
+				service, err = requestapp.NewService(scheduler, provider, idempotencyConfig(), time.Minute, time.Second, cache)
+			} else {
+				service, err = requestapp.NewService(scheduler, provider, idempotencyConfig(), time.Minute, time.Second)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = service.Infer(context.Background(), "req_cache", nil, authorizedRequestWithCache(t, test.policy), domain.ResponseModeNonStreaming, discardSink{})
+			if (err != nil) != test.wantError {
+				t.Fatalf("error=%v wantError=%v", err, test.wantError)
+			}
+			if cache.calls != test.wantCalls || scheduler.prepareCalls != test.wantPrepare || scheduler.giveUpCalls != test.wantGiveUp || provider.calls != test.wantProvider {
+				t.Fatalf("cache=%d prepare=%d giveup=%d provider=%d", cache.calls, scheduler.prepareCalls, scheduler.giveUpCalls, provider.calls)
+			}
+		})
 	}
 }
 
@@ -253,6 +400,21 @@ func TestInferIncludesDigestCandidatesWithoutIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestInferPropagatesAuthorizedSchedulingPolicy(t *testing.T) {
+	scheduler := newRecordingScheduler(t)
+	cache := &recordingCache{}
+	service, err := requestapp.NewService(scheduler, failingProvider{err: requestapp.NewNotSentError(errors.New("not sent"))}, idempotencyConfig(), time.Minute, time.Second, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorized := authorizedRequestWithCache(t, domain.CachePolicyPrefer)
+	_ = service.Infer(context.Background(), "req_policy", nil, authorized, domain.ResponseModeNonStreaming, discardSink{})
+	command := scheduler.command
+	if command.Priority() != authorized.Request().Priority() || command.CachePolicy() != domain.CachePolicyPrefer || command.Features().Bits() != authorized.Request().Features().Bits() {
+		t.Fatalf("command priority=%v cache=%v features=%d", command.Priority(), command.CachePolicy(), command.Features().Bits())
+	}
+}
+
 func TestInferAbandonsStaleCandidateAndDispatchesNextGeneration(t *testing.T) {
 	scheduler := newSwitchingScheduler(t, 2)
 	provider := &countingProvider{}
@@ -285,8 +447,8 @@ func TestInferBoundsCandidateSwitchesAndTerminallyGivesUpLatestRef(t *testing.T)
 	}
 
 	err = service.Infer(context.Background(), "req_exhausted", nil, authorizedRequest(t), domain.ResponseModeNonStreaming, discardSink{})
-	if domain.ErrorKindOf(err) != domain.ErrorUnavailable {
-		t.Fatalf("error = %v, want unavailable", err)
+	if domain.ErrorKindOf(err) != domain.ErrorRecoveryFenced {
+		t.Fatalf("error = %v, want recovery fenced", err)
 	}
 	if scheduler.scheduleCalls != 4 || scheduler.prepareCalls != 4 || len(scheduler.abandoned) != 3 {
 		t.Fatalf("schedule calls = %d, prepare calls = %d, abandonments = %v", scheduler.scheduleCalls, scheduler.prepareCalls, scheduler.abandoned)

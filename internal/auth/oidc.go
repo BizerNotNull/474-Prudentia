@@ -50,15 +50,18 @@ func newIssuerVerifier(cfg OIDCConfig) (*issuerVerifier, error) {
 		return nil, errUnauthenticated
 	}
 	issuerURL, err := url.Parse(cfg.Issuer)
-	if err != nil || issuerURL.Scheme != "https" && issuerURL.Scheme != "http" || issuerURL.Host == "" {
+	if err != nil || issuerURL.Scheme != "https" || issuerURL.Host == "" || issuerURL.User != nil || issuerURL.RawQuery != "" || issuerURL.Fragment != "" {
 		return nil, errUnauthenticated
 	}
 	jwksURL, err := url.Parse(cfg.JWKSURL)
-	if err != nil || jwksURL.Scheme != "https" && jwksURL.Scheme != "http" || jwksURL.Host == "" {
+	if err != nil || jwksURL.Scheme != "https" || jwksURL.Host == "" || jwksURL.User != nil || jwksURL.Fragment != "" {
 		return nil, errUnauthenticated
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{}
+	}
+	if transport, ok := cfg.HTTPClient.Transport.(*http.Transport); ok && transport.TLSClientConfig != nil && transport.TLSClientConfig.InsecureSkipVerify {
+		return nil, errUnauthenticated
 	}
 	client := *cfg.HTTPClient
 	if client.Timeout == 0 {
@@ -221,8 +224,13 @@ func (v *issuerVerifier) key(ctx context.Context, kid string) (crypto.PublicKey,
 	defer v.mu.Unlock()
 	now := v.config.Clock()
 	key, exists := v.keys[kid]
-	if exists && now.Sub(v.refreshed) < v.config.RefreshInterval {
-		return key, nil
+	if now.Sub(v.refreshed) < v.config.RefreshInterval {
+		if exists {
+			return key, nil
+		}
+		if !v.refreshed.IsZero() {
+			return nil, errUnauthenticated
+		}
 	}
 	if err := v.refreshLocked(ctx, now); err != nil {
 		return nil, err

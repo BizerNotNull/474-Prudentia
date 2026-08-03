@@ -22,11 +22,13 @@ type fakeInferer struct {
 	err            error
 	requestID      string
 	idempotencyKey []byte
+	authorized     domain.AuthorizedRequest
 }
 
-func (f *fakeInferer) Infer(ctx context.Context, requestID string, idempotencyKey []byte, _ domain.AuthorizedRequest, _ domain.ResponseMode, sink publichttp.StreamSink) error {
+func (f *fakeInferer) Infer(ctx context.Context, requestID string, idempotencyKey []byte, authorized domain.AuthorizedRequest, _ domain.ResponseMode, sink publichttp.StreamSink) error {
 	f.requestID = requestID
 	f.idempotencyKey = append([]byte(nil), idempotencyKey...)
+	f.authorized = authorized
 	f.calls++
 	if f.err != nil {
 		return f.err
@@ -45,6 +47,7 @@ func newTestHandler(t *testing.T, inferer publichttp.Inferer) http.Handler {
 	t.Helper()
 	authenticator, err := auth.NewAuthenticator([]auth.APIKey{{
 		Token: testToken, Tenant: "tenant-a", Models: []string{"model-a"},
+		Features: []domain.Feature{domain.FeatureStreaming, domain.FeatureUsage},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -89,6 +92,47 @@ func TestChatRejectsUnknownFieldBeforeInference(t *testing.T) {
 	}
 	if inferer.calls != 0 {
 		t.Fatalf("inference calls = %d, want 0", inferer.calls)
+	}
+}
+
+func TestChatDecodesOfficialOpenAISubsetFixtures(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		body      string
+		wantUsage bool
+	}{
+		{name: "nonstreaming", body: `{"model":"model-a","messages":[{"role":"system","content":"Be concise."},{"role":"user","content":"hello"}],"max_completion_tokens":32}`},
+		{name: "streaming usage", body: `{"model":"model-a","messages":[{"role":"user","content":"hello"}],"stream":true,"stream_options":{"include_usage":true},"max_completion_tokens":32}`, wantUsage: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			inferer := &fakeInferer{}
+			response := chatRequest(t, newTestHandler(t, inferer), testToken, test.body)
+			if response.Code != http.StatusOK || inferer.calls != 1 {
+				t.Fatalf("status=%d calls=%d body=%s", response.Code, inferer.calls, response.Body.String())
+			}
+			if got := inferer.authorized.Request().Features().Has(domain.FeatureUsage); got != test.wantUsage {
+				t.Fatalf("usage feature=%v want=%v", got, test.wantUsage)
+			}
+			var payload map[string]any
+			if !strings.Contains(test.body, `"stream":true`) {
+				if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+					t.Fatal(err)
+				}
+				if payload["model"] != "model-a" || payload["created"] == nil {
+					t.Fatalf("incomplete official response: %s", response.Body.String())
+				}
+			} else if !strings.Contains(response.Body.String(), `"model":"model-a"`) || !strings.Contains(response.Body.String(), `"created":`) {
+				t.Fatalf("incomplete official stream: %s", response.Body.String())
+			}
+		})
+	}
+}
+
+func TestChatRejectsUnknownNestedOfficialField(t *testing.T) {
+	inferer := &fakeInferer{}
+	response := chatRequest(t, newTestHandler(t, inferer), testToken, `{"model":"model-a","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true,"future_option":true}}`)
+	if response.Code != http.StatusBadRequest || inferer.calls != 0 {
+		t.Fatalf("status=%d calls=%d", response.Code, inferer.calls)
 	}
 }
 

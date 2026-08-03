@@ -80,12 +80,12 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) serveStreaming(w http.ResponseWriter, r *http.Request, id string, idempotencyKey []byte, request domain.AuthorizedRequest) {
-	sink, err := NewSSESink(w, id)
+	sink, err := NewSSESink(w, id, request.Request().Model())
 	if err != nil {
 		WritePublicError(w, id, err)
 		return
 	}
-	err = h.inferer.Infer(r.Context(), id, idempotencyKey, request, domain.ResponseModeStreaming, sink)
+	err = h.inferer.Infer(r.Context(), id, idempotencyKey, request, domain.ResponseModeStreaming, filterUsage(sink, request.Request().Features()))
 	if err != nil && !sink.Started() {
 		WritePublicError(w, id, err)
 	}
@@ -93,7 +93,7 @@ func (h *Handler) serveStreaming(w http.ResponseWriter, r *http.Request, id stri
 
 func (h *Handler) serveNonStreaming(w http.ResponseWriter, r *http.Request, id string, idempotencyKey []byte, request domain.AuthorizedRequest) {
 	collector := NewNonStreamingCollector(h.limits.MaxOutputBytes, h.limits.MaxStreamEvents)
-	if err := h.inferer.Infer(r.Context(), id, idempotencyKey, request, domain.ResponseModeNonStreaming, collector); err != nil {
+	if err := h.inferer.Infer(r.Context(), id, idempotencyKey, request, domain.ResponseModeNonStreaming, filterUsage(collector, request.Request().Features())); err != nil {
 		WritePublicError(w, id, err)
 		return
 	}
@@ -105,6 +105,22 @@ func (h *Handler) serveNonStreaming(w http.ResponseWriter, r *http.Request, id s
 	if err := EncodeNonStreaming(w, id, request.Request().Model(), result); err != nil {
 		return
 	}
+}
+
+type usageFilter struct {
+	next  StreamSink
+	allow bool
+}
+
+func filterUsage(next StreamSink, features domain.FeatureSet) StreamSink {
+	return usageFilter{next: next, allow: features.Has(domain.FeatureUsage)}
+}
+
+func (s usageFilter) Write(ctx context.Context, event domain.StreamEvent) error {
+	if event.Kind() == domain.StreamEventUsage && !s.allow {
+		return nil
+	}
+	return s.next.Write(ctx, event)
 }
 
 func takeIdempotencyKey(r *http.Request) ([]byte, error) {
