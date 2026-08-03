@@ -110,7 +110,9 @@ func (c *Catalog) RecordObservation(ctx context.Context, generation domain.Write
 		DO UPDATE SET writer_generation=EXCLUDED.writer_generation,source_sequence=EXCLUDED.source_sequence,
 		accepted_at=EXCLUDED.accepted_at,expires_at=EXCLUDED.expires_at,
 		normalized_payload=EXCLUDED.normalized_payload,diagnostic_source_time=EXCLUDED.diagnostic_source_time
-		WHERE source_observations.source_sequence < EXCLUDED.source_sequence
+		WHERE source_observations.writer_generation < EXCLUDED.writer_generation
+		   OR (source_observations.writer_generation = EXCLUDED.writer_generation
+		       AND source_observations.source_sequence < EXCLUDED.source_sequence)
 		RETURNING source_sequence,accepted_at,expires_at`,
 		id.Cluster(), id.Namespace(), id.LogicalEngine(), id.PodUID(), id.EndpointEpoch(), id.RecoveryEpoch(),
 		kind, generation, o.Stamp().Sequence().Uint64(), now, expires, payload, sourceTime).Scan(&sequence, &acceptedAt, &expiresAt)
@@ -168,8 +170,16 @@ func (c *Catalog) SyncCapacityProjection(ctx context.Context, generation domain.
 	} else if err != nil {
 		return 0, fmt.Errorf("lock exact capacity: %w", err)
 	}
+	workloadDraining, err := lockApplicableDrains(ctx, tx, id)
+	if err != nil {
+		return 0, fmt.Errorf("lock applicable drain intents: %w", err)
+	}
+	admissionLimit := p.AdmissionLimit()
+	if workloadDraining {
+		admissionLimit = 0
+	}
 	if uint64(p.PreviousVersion()) != currentVersion ||
-		uint64(p.AdmissionLimit()) < uint64(reserved+orphaned) ||
+		(!workloadDraining && uint64(admissionLimit) < uint64(reserved+orphaned)) ||
 		uint64(p.ConfiguredSlots()) < uint64(reserved+orphaned) {
 		return 0, domain.ErrInvalidState
 	}
@@ -179,7 +189,7 @@ func (c *Catalog) SyncCapacityProjection(ctx context.Context, generation domain.
 		ON CONFLICT (cluster_id,namespace,logical_engine,pod_uid,endpoint_epoch,recovery_epoch)
 		DO UPDATE SET physical_slots=EXCLUDED.physical_slots,admission_limit=EXCLUDED.admission_limit,
 		projection_version=EXCLUDED.projection_version,retired=false,updated_at=transaction_timestamp()`,
-		id.Cluster(), id.Namespace(), id.LogicalEngine(), id.PodUID(), id.EndpointEpoch(), id.RecoveryEpoch(), p.ConfiguredSlots(), p.AdmissionLimit(), newVersion)
+		id.Cluster(), id.Namespace(), id.LogicalEngine(), id.PodUID(), id.EndpointEpoch(), id.RecoveryEpoch(), p.ConfiguredSlots(), admissionLimit, newVersion)
 	if err != nil {
 		return 0, fmt.Errorf("sync exact capacity: %w", err)
 	}

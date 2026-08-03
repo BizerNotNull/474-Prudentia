@@ -61,9 +61,23 @@ func (c *Catalog) SweepReservationStates(ctx context.Context, limit int) (SweepR
 		var reservationID, state string
 		var p domain.WorkloadIdentityParams
 		err := tx.QueryRow(ctx, `SELECT reservation_id,state,cluster_id,namespace,logical_engine,pod_uid,endpoint_epoch,recovery_epoch FROM reservations WHERE request_id=$1 AND is_current FOR UPDATE`, value.id).Scan(&reservationID, &state, &p.Cluster, &p.Namespace, &p.LogicalEngine, &p.PodUID, &p.EndpointEpoch, &p.RecoveryEpoch)
-		if value.stage == "rerank_pending" && err == pgx.ErrNoRows {
-			if grantState != "retained_rerank" {
+		if value.stage == "rerank_pending" {
+			if err != nil && err != pgx.ErrNoRows {
+				return SweepResult{}, err
+			}
+			if grantState != "retained_rerank" || (err == nil && state != "abandoned_rerank") {
 				return SweepResult{}, domain.ErrInvalidState
+			}
+			if err == nil {
+				proofHash := sha256Bytes("classification\x00" + reservationID)
+				if _, err := tx.Exec(ctx, `UPDATE reservations
+					SET state='released',is_current=false,terminal_proof_kind='classification',
+					    terminal_proof_hash=$2,terminal_at=transaction_timestamp(),
+					    updated_at=transaction_timestamp()
+					WHERE reservation_id=$1 AND state='abandoned_rerank'`,
+					reservationID, proofHash); err != nil {
+					return SweepResult{}, err
+				}
 			}
 			if err := releaseClassifiedGrant(ctx, tx, value.id, tenant, cost); err != nil {
 				return SweepResult{}, err
