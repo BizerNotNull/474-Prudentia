@@ -36,7 +36,7 @@ func TestSchedulerRequestPlaneContract(t *testing.T) {
 		"idempotency_lookup_candidates": 4, "lookup_write_version": 5,
 		"digest_candidates": 6, "digest_write_version": 7, "model": 8,
 		"slot_cost": 9, "execution_budget_ms": 10, "features": 11,
-		"priority": 12, "schema_version": 13, "budget_schema_version": 14,
+		"priority": 12, "schema_version": 13, "budget_schema_version": 14, "cache_policy": 15,
 	})
 	for _, name := range []protoreflect.Name{
 		"ScheduleRequest",

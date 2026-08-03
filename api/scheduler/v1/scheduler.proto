@@ -39,6 +39,13 @@ enum Priority {
   PRIORITY_HIGH = 3;
 }
 
+enum CachePolicy {
+  CACHE_POLICY_UNSPECIFIED = 0;
+  CACHE_POLICY_DISABLED = 1;
+  CACHE_POLICY_PREFER = 2;
+  CACHE_POLICY_REQUIRE_COMPATIBLE = 3;
+}
+
 message ScheduleRequest {
   // Request identifiers, tenant_scope, and model are bounded by the v1 codec.
   string request_id = 1;
@@ -58,6 +65,7 @@ message ScheduleRequest {
   uint32 schema_version = 13;
   // Version 1 defines execution_budget_ms as a total wall-clock budget.
   uint32 budget_schema_version = 14;
+  CachePolicy cache_policy = 15;
 }
 
 message ReservationRef {

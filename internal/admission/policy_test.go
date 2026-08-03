@@ -33,3 +33,26 @@ func TestPolicyPureBoundaryDecisions(t *testing.T) {
 		t.Fatalf("overload error=%v", err)
 	}
 }
+
+func TestPolicyUsesPropagatedPriority(t *testing.T) {
+	tenant, _ := domain.NewTenantScope("tenant-a")
+	features := domain.EmptyFeatureSet()
+	digest, _ := domain.NewRequestDigestCandidate(1, make([]byte, 32))
+	command, err := domain.NewScheduleCommand(domain.ScheduleParams{
+		RequestID: "req_high", AttemptID: "att_high", Tenant: tenant.Value(),
+		DigestCandidates: []domain.RequestDigestCandidate{digest}, DigestWriteVersion: 1,
+		Model: "model-a", SlotCost: 1, Features: features, Priority: domain.PriorityHigh,
+		CachePolicy: domain.CachePolicyDisabled, ExecutionBudget: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := admission.TenantPolicy{
+		Tenant: tenant, AllowedFeatures: features, MaxPriority: domain.PriorityNormal,
+		MaxActiveSlots: 2, MaxOutstandingSlots: 2, MinExecutionBudget: time.Second, MaxExecutionBudget: 2 * time.Minute,
+	}
+	usage := admission.UsageSnapshot{Tenant: tenant}
+	if _, err := (admission.Policy{}).Evaluate(command, policy, usage); !errors.Is(err, admission.ErrPriorityDenied) {
+		t.Fatalf("priority error=%v", err)
+	}
+}

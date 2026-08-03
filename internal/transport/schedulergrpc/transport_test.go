@@ -52,7 +52,7 @@ func (*schedulerStub) MarkAmbiguous(context.Context, domain.ReservationRef, doma
 
 func validScheduleRequest() *schedulerv1.ScheduleRequest {
 	digest := make([]byte, 32)
-	return &schedulerv1.ScheduleRequest{RequestId: "request-1", AttemptId: "attempt-1", TenantScope: []byte("tenant"), DigestCandidates: []*schedulerv1.RequestDigestCandidate{{DigestVersion: 1, HmacSha256: digest}}, DigestWriteVersion: 1, Model: "model", SlotCost: 1, ExecutionBudgetMs: 1000, Features: &schedulerv1.FeatureSet{SchemaVersion: 1}, Priority: schedulerv1.Priority_PRIORITY_NORMAL, SchemaVersion: 1, BudgetSchemaVersion: 1}
+	return &schedulerv1.ScheduleRequest{RequestId: "request-1", AttemptId: "attempt-1", TenantScope: []byte("tenant"), DigestCandidates: []*schedulerv1.RequestDigestCandidate{{DigestVersion: 1, HmacSha256: digest}}, DigestWriteVersion: 1, Model: "model", SlotCost: 1, ExecutionBudgetMs: 1000, Features: &schedulerv1.FeatureSet{SchemaVersion: 1}, Priority: schedulerv1.Priority_PRIORITY_NORMAL, CachePolicy: schedulerv1.CachePolicy_CACHE_POLICY_DISABLED, SchemaVersion: 1, BudgetSchemaVersion: 1}
 }
 
 func TestCodecFailsClosedAndRedactsErrors(t *testing.T) {
@@ -61,6 +61,33 @@ func TestCodecFailsClosedAndRedactsErrors(t *testing.T) {
 	request.Priority = schedulerv1.Priority(99)
 	if _, err := codec.DecodeSchedule(request); err == nil {
 		t.Fatal("unknown priority accepted")
+	}
+	for wire, want := range map[schedulerv1.Priority]domain.Priority{
+		schedulerv1.Priority_PRIORITY_BACKGROUND: domain.PriorityBackground,
+		schedulerv1.Priority_PRIORITY_HIGH:       domain.PriorityHigh,
+	} {
+		request = validScheduleRequest()
+		request.Priority = wire
+		command, err := codec.DecodeSchedule(request)
+		if err != nil || command.Priority() != want {
+			t.Fatalf("priority %v decoded as %v, err=%v", wire, command.Priority(), err)
+		}
+	}
+	for wire, want := range map[schedulerv1.CachePolicy]domain.CachePolicy{
+		schedulerv1.CachePolicy_CACHE_POLICY_PREFER:             domain.CachePolicyPrefer,
+		schedulerv1.CachePolicy_CACHE_POLICY_REQUIRE_COMPATIBLE: domain.CachePolicyRequireCompatible,
+	} {
+		request = validScheduleRequest()
+		request.CachePolicy = wire
+		command, err := codec.DecodeSchedule(request)
+		if err != nil || command.CachePolicy() != want {
+			t.Fatalf("cache policy %v decoded as %v, err=%v", wire, command.CachePolicy(), err)
+		}
+	}
+	request = validScheduleRequest()
+	request.CachePolicy = schedulerv1.CachePolicy(99)
+	if _, err := codec.DecodeSchedule(request); err == nil {
+		t.Fatal("unknown cache policy accepted")
 	}
 	request = validScheduleRequest()
 	request.SchemaVersion = 2
