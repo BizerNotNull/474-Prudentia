@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -36,738 +35,208 @@ type backendCapacity struct {
 	orphaned int
 }
 
-func TestPreDispatchRerankTransactions(t *testing.T) {
+func TestAuthoritativeLedgerCutover(t *testing.T) {
 	ctx := context.Background()
 	root := repositoryRoot(t)
 	migrations, err := filepath.Glob(filepath.Join(root, "migrations", "*.up.sql"))
 	if err != nil {
-		t.Fatalf("find migrations: %v", err)
-	}
-	if len(migrations) == 0 {
-		t.Fatal("find migrations: no up migrations")
+		t.Fatal(err)
 	}
 	sort.Strings(migrations)
 	pool := startPostgres(t, migrations)
 	store, err := postgresadapter.NewSchedulerStore(pool, []byte(testCapabilityKey))
 	if err != nil {
-		t.Fatalf("create scheduler store: %v", err)
+		t.Fatal(err)
+	}
+	actor := sha256.Sum256([]byte("functional-ledger"))
+	if _, err := pool.Exec(ctx, `INSERT INTO system_admission_state(
+		cluster_id,recovery_epoch,admission_state,dispatch_state,schema_write_version,
+		lookup_write_version,digest_write_version,capability_kek_write_version,
+		capability_comparison_write_version,classification_policy_version,
+		cleanup_policy_version,changed_by_hash)
+		VALUES('cluster-a',1,'open','open',9,1,1,1,1,1,1,$1)
+		ON CONFLICT(cluster_id) DO NOTHING`, actor[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO system_lookup_read_versions VALUES('cluster-a',1) ON CONFLICT DO NOTHING;
+		INSERT INTO system_digest_read_versions VALUES('cluster-a',1) ON CONFLICT DO NOTHING;
+		INSERT INTO capability_manifests(manifest_id,manifest_version,image_digest,proxy_digest,
+		supported_routes,supported_fields,response_parsers,identity_profile,apc_isolation_mode,
+		termination_capabilities,signature_algorithm,signature_key_version,signature,valid_from,valid_until)
+		VALUES('functional',1,'sha256:image','sha256:proxy','[]','{}','[]','{}','disabled',
+		'{}','test',1,decode('01','hex'),'-infinity','infinity') ON CONFLICT DO NOTHING`); err != nil {
+		t.Fatal(err)
+	}
+	reset := func(t *testing.T) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `DELETE FROM orphaned_capacity_debts;
+			DELETE FROM admission_grants; DELETE FROM reservations; DELETE FROM request_records;
+			DELETE FROM drain_intents; DELETE FROM instance_projections;
+			DELETE FROM source_observations; DELETE FROM instance_capacity; DELETE FROM tenant_counters;
+			UPDATE system_admission_state SET admission_state='open',dispatch_state='open',
+			  fenced_at=NULL,fenced_by_hash=NULL,reopened_at=transaction_timestamp()
+			  WHERE cluster_id='cluster-a'`); err != nil {
+			t.Fatal(err)
+		}
+		insertTenant(t, pool, "tenant-a", 2)
+	}
+	seed := func(t *testing.T, id domain.WorkloadIdentity) {
+		t.Helper()
+		model := sha256.Sum256([]byte("model-a"))
+		config := sha256.Sum256([]byte("config"))
+		member := sha256.Sum256([]byte(id.PodUID()))
+		if _, err := pool.Exec(ctx, `INSERT INTO instance_capacity(
+			cluster_id,namespace,logical_engine,pod_uid,endpoint_epoch,recovery_epoch,
+			physical_slots,admission_limit,projection_version)
+			VALUES($1,$2,$3,$4,$5,$6,2,2,1)`,
+			id.Cluster(), id.Namespace(), id.LogicalEngine(), id.PodUID(),
+			id.EndpointEpoch(), id.RecoveryEpoch()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO instance_projections(
+			cluster_id,namespace,logical_engine,pod_uid,endpoint_epoch,recovery_epoch,
+			normalized_proxy_endpoint,model_fingerprint,config_fingerprint,membership_fingerprint,
+			capability_manifest_id,capability_manifest_version,source_stamps,health,projection_version)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'functional',1,'{}','healthy',1)`,
+			id.Cluster(), id.Namespace(), id.LogicalEngine(), id.PodUID(),
+			id.EndpointEpoch(), id.RecoveryEpoch(), "https://"+id.PodUID()+".invalid",
+			model[:], config[:], member[:]); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	t.Run("stale candidate reranks with generation fencing", func(t *testing.T) {
-		resetSchedulerLedger(t, pool)
-		backendA := testIdentity(t, "pod-a", 1)
-		backendB := testIdentity(t, "pod-b", 1)
-		insertBackend(t, pool, backendA)
-		insertBackend(t, pool, backendB)
-		command := testScheduleCommand(t, "request-stale", "attempt-stale", "tenant-a")
-
-		first, err := store.TryReserve(ctx, command, backendA)
+	t.Run("same-attempt capability recovery and last slot", func(t *testing.T) {
+		reset(t)
+		id := testIdentity(t, "pod-last", 1)
+		seed(t, id)
+		cmd := testScheduleCommand(t, "request-last", "attempt-last", "tenant-a")
+		reservation, err := store.TryReserve(ctx, cmd, id)
 		if err != nil {
-			t.Fatalf("reserve backend A: %v", err)
+			t.Fatal(err)
 		}
-		ref1 := first.Ref()
-		row1 := readReservation(t, pool, ref1.ID())
-		assertReservation(t, row1, "reserved", 1, "pod-a", ref1)
-		assertCapacity(t, pool, backendA, backendCapacity{reserved: 2})
-
-		if _, err := pool.Exec(ctx, `UPDATE scheduler_backends SET healthy=false WHERE pod_uid=$1`, "pod-a"); err != nil {
-			t.Fatalf("mark backend A unhealthy: %v", err)
+		recovered, found, err := store.LookupReservation(ctx, cmd)
+		if err != nil || !found || recovered.Ref().ID() != reservation.Ref().ID() ||
+			!bytes.Equal(recovered.Ref().Capability(), reservation.Ref().Capability()) {
+			t.Fatalf("same-attempt recovery mismatch: found=%v err=%v", found, err)
 		}
-		if _, err := store.PrepareDispatch(ctx, ref1); !errors.Is(err, domain.ErrStaleTarget) {
-			t.Fatalf("prepare stale backend: got %v, want %v", err, domain.ErrStaleTarget)
-		}
-		assertReservation(t, readReservation(t, pool, ref1.ID()), "reserved", 1, "pod-a", ref1)
-		assertCapacity(t, pool, backendA, backendCapacity{reserved: 2})
-
-		if err := store.AbandonBeforeDispatch(ctx, ref1, domain.RerankStaleTarget); err != nil {
-			t.Fatalf("abandon stale backend: %v", err)
-		}
-		assertReservation(t, readReservation(t, pool, ref1.ID()), "abandoned_rerank", 1, "pod-a", ref1)
-		assertCapacity(t, pool, backendA, backendCapacity{})
-		if err := store.AbandonBeforeDispatch(ctx, ref1, domain.RerankStaleTarget); err != nil {
-			t.Fatalf("repeat stale abandonment: %v", err)
-		}
-		assertCapacity(t, pool, backendA, backendCapacity{})
-
-		second, err := store.TryReserve(ctx, command, backendB)
-		if err != nil {
-			t.Fatalf("rerank to backend B: %v", err)
-		}
-		ref2 := second.Ref()
-		row2 := readReservation(t, pool, ref2.ID())
-		if ref2.ID() != ref1.ID() {
-			t.Fatalf("rerank reservation ID changed: got %q, want %q", ref2.ID(), ref1.ID())
-		}
-		if count := reservationCount(t, pool, command.RequestID()); count != 1 {
-			t.Fatalf("reservation row count: got %d, want 1", count)
-		}
-		assertReservation(t, row2, "reserved", 2, "pod-b", ref2)
-		if !row2.executionDeadline.Equal(row1.executionDeadline) {
-			t.Fatalf("execution deadline reset: got %s, want %s", row2.executionDeadline, row1.executionDeadline)
-		}
-		if bytes.Equal(ref1.Capability(), ref2.Capability()) {
-			t.Fatal("rerank reused the generation 1 capability")
-		}
-		if bytes.Equal(row1.capabilityHash, row2.capabilityHash) {
-			t.Fatal("rerank reused the generation 1 capability hash")
-		}
-		assertCapacity(t, pool, backendA, backendCapacity{})
-		assertCapacity(t, pool, backendB, backendCapacity{reserved: 2})
-
-		if err := store.GiveUpBeforeDispatch(ctx, ref1, domain.GiveUpReranksExhausted); !errors.Is(err, domain.ErrInvalidReference) {
-			t.Fatalf("give up with stale generation: got %v, want %v", err, domain.ErrInvalidReference)
-		}
-		assertReservation(t, readReservation(t, pool, ref2.ID()), "reserved", 2, "pod-b", ref2)
-		assertCapacity(t, pool, backendB, backendCapacity{reserved: 2})
-		if err := store.GiveUpBeforeDispatch(ctx, ref2, domain.GiveUpReranksExhausted); err != nil {
-			t.Fatalf("give up latest generation: %v", err)
-		}
-		assertReservation(t, readReservation(t, pool, ref2.ID()), "given_up", 2, "pod-b", ref2)
-		assertCapacity(t, pool, backendB, backendCapacity{})
-		if err := store.GiveUpBeforeDispatch(ctx, ref2, domain.GiveUpReranksExhausted); err != nil {
-			t.Fatalf("repeat latest give-up: %v", err)
-		}
-		assertCapacity(t, pool, backendB, backendCapacity{})
-	})
-
-	t.Run("retained rerank terminal give-up is exact once", func(t *testing.T) {
-		cases := []struct {
-			name   string
-			reason domain.GiveUpReason
-		}{
-			{name: "canceled", reason: domain.GiveUpCanceled},
-			{name: "budget expired", reason: domain.GiveUpBudgetExpired},
-			{name: "reranks exhausted concurrently", reason: domain.GiveUpReranksExhausted},
-		}
-		for index, testCase := range cases {
-			t.Run(testCase.name, func(t *testing.T) {
-				resetSchedulerLedger(t, pool)
-				backend := testIdentity(t, fmt.Sprintf("pod-retained-%d", index), 1)
-				insertBackend(t, pool, backend)
-				command := testScheduleCommand(t, fmt.Sprintf("request-retained-%d", index), fmt.Sprintf("attempt-retained-%d", index), "tenant-retained")
-				reservation, err := store.TryReserve(ctx, command, backend)
-				if err != nil {
-					t.Fatalf("reserve retained rerank: %v", err)
-				}
-				ref := reservation.Ref()
-				if err := store.AbandonBeforeDispatch(ctx, ref, domain.RerankStaleTarget); err != nil {
-					t.Fatalf("abandon retained rerank: %v", err)
-				}
-
-				if testCase.reason == domain.GiveUpReranksExhausted {
-					start := make(chan struct{})
-					errorsByCall := make([]error, 2)
-					var calls sync.WaitGroup
-					calls.Add(2)
-					for call := range errorsByCall {
-						go func(call int) {
-							defer calls.Done()
-							<-start
-							errorsByCall[call] = store.GiveUpBeforeDispatch(ctx, ref, testCase.reason)
-						}(call)
-					}
-					close(start)
-					calls.Wait()
-					for call, err := range errorsByCall {
-						if err != nil {
-							t.Fatalf("concurrent give-up call %d: %v", call, err)
-						}
-					}
-				} else if err := store.GiveUpBeforeDispatch(ctx, ref, testCase.reason); err != nil {
-					t.Fatalf("give up retained rerank: %v", err)
-				}
-
-				assertReservation(t, readReservation(t, pool, ref.ID()), "given_up", 1, backend.PodUID(), ref)
-				if count := reservationCount(t, pool, command.RequestID()); count != 1 {
-					t.Fatalf("reservation row count: got %d, want 1", count)
-				}
-				assertCapacity(t, pool, backend, backendCapacity{})
-			})
+		if _, err := store.TryReserve(ctx, testScheduleCommand(t, "request-loser", "attempt-loser", "tenant-a"), id); !errors.Is(err, domain.ErrNoCapacity) {
+			t.Fatalf("last-slot loser: %v", err)
 		}
 	})
 
-	t.Run("mismatched rerank command rolls back", func(t *testing.T) {
-		resetSchedulerLedger(t, pool)
-		backendA := testIdentity(t, "pod-rollback-a", 1)
-		backendB := testIdentity(t, "pod-rollback-b", 1)
-		insertBackend(t, pool, backendA)
-		insertBackend(t, pool, backendB)
-		command := testScheduleCommand(t, "request-rollback", "attempt-rollback", "tenant-a")
-		reservation, err := store.TryReserve(ctx, command, backendA)
-		if err != nil {
-			t.Fatalf("reserve rollback fixture: %v", err)
+	t.Run("exact drain row blocks reserve", func(t *testing.T) {
+		reset(t)
+		id := testIdentity(t, "pod-drain", 1)
+		seed(t, id)
+		if _, err := pool.Exec(ctx, `INSERT INTO drain_intents(
+			drain_id,cluster_id,namespace,logical_engine,pod_uid,endpoint_epoch,recovery_epoch,
+			scope_kind,state,reason,writer_generation)
+			VALUES('drain-functional',$1,$2,$3,$4,$5,$6,'exact_identity','active','test',1)`,
+			id.Cluster(), id.Namespace(), id.LogicalEngine(), id.PodUID(),
+			id.EndpointEpoch(), id.RecoveryEpoch()); err != nil {
+			t.Fatal(err)
 		}
-		ref := reservation.Ref()
-		if err := store.AbandonBeforeDispatch(ctx, ref, domain.RerankStaleTarget); err != nil {
-			t.Fatalf("abandon rollback fixture: %v", err)
-		}
-		mismatched := testScheduleCommand(t, command.RequestID(), command.AttemptID(), "tenant-b")
-		if _, err := store.TryReserve(ctx, mismatched, backendB); !errors.Is(err, domain.ErrInvalidState) {
-			t.Fatalf("reserve mismatched command: got %v, want %v", err, domain.ErrInvalidState)
-		}
-		assertReservation(t, readReservation(t, pool, ref.ID()), "abandoned_rerank", 1, backendA.PodUID(), ref)
-		assertCapacity(t, pool, backendA, backendCapacity{})
-		assertCapacity(t, pool, backendB, backendCapacity{})
-	})
-
-	t.Run("dispatch authorization fails closed", func(t *testing.T) {
-		resetSchedulerLedger(t, pool)
-		backend := testIdentity(t, "pod-authorized", 1)
-		insertBackend(t, pool, backend)
-		command := testScheduleCommand(t, "request-authorized", "attempt-authorized", "tenant-a")
-		reservation, err := store.TryReserve(ctx, command, backend)
-		if err != nil {
-			t.Fatalf("reserve authorized fixture: %v", err)
-		}
-		ref := reservation.Ref()
-		if _, err := store.PrepareDispatch(ctx, ref); err != nil {
-			t.Fatalf("prepare dispatch: %v", err)
-		}
-		if err := store.AbandonBeforeDispatch(ctx, ref, domain.RerankStaleTarget); !errors.Is(err, domain.ErrInvalidState) {
-			t.Fatalf("abandon authorized reservation: got %v, want %v", err, domain.ErrInvalidState)
-		}
-		if err := store.GiveUpBeforeDispatch(ctx, ref, domain.GiveUpCanceled); !errors.Is(err, domain.ErrInvalidState) {
-			t.Fatalf("give up authorized reservation: got %v, want %v", err, domain.ErrInvalidState)
-		}
-		assertReservation(t, readReservation(t, pool, ref.ID()), "dispatch_authorized", 1, backend.PodUID(), ref)
-		assertCapacity(t, pool, backend, backendCapacity{reserved: 2})
-	})
-
-	t.Run("database time classifies expired reservations", func(t *testing.T) {
-		resetSchedulerLedger(t, pool)
-		reservedBackend := testIdentity(t, "pod-expired-reserved", 1)
-		abandonedBackend := testIdentity(t, "pod-expired-abandoned", 1)
-		authorizedBackend := testIdentity(t, "pod-expired-authorized", 1)
-		for _, backend := range []domain.WorkloadIdentity{reservedBackend, abandonedBackend, authorizedBackend} {
-			insertBackend(t, pool, backend)
-		}
-
-		reserved, err := store.TryReserve(ctx, testScheduleCommand(t, "request-expired-reserved", "attempt-expired-reserved", "tenant-a"), reservedBackend)
-		if err != nil {
-			t.Fatalf("reserve expired reserved fixture: %v", err)
-		}
-		abandoned, err := store.TryReserve(ctx, testScheduleCommand(t, "request-expired-abandoned", "attempt-expired-abandoned", "tenant-a"), abandonedBackend)
-		if err != nil {
-			t.Fatalf("reserve expired abandoned fixture: %v", err)
-		}
-		if err := store.AbandonBeforeDispatch(ctx, abandoned.Ref(), domain.RerankStaleTarget); err != nil {
-			t.Fatalf("abandon expired fixture: %v", err)
-		}
-		authorized, err := store.TryReserve(ctx, testScheduleCommand(t, "request-expired-authorized", "attempt-expired-authorized", "tenant-a"), authorizedBackend)
-		if err != nil {
-			t.Fatalf("reserve expired authorized fixture: %v", err)
-		}
-		if _, err := store.PrepareDispatch(ctx, authorized.Ref()); err != nil {
-			t.Fatalf("authorize expired fixture: %v", err)
-		}
-		if _, err := pool.Exec(ctx, `UPDATE scheduler_reservations SET execution_deadline=clock_timestamp()-interval '1 second'`); err != nil {
-			t.Fatalf("expire reservations: %v", err)
-		}
-
-		classified, err := store.ClassifyExpired(ctx, 10)
-		if err != nil {
-			t.Fatalf("classify expired reservations: %v", err)
-		}
-		if classified != 3 {
-			t.Fatalf("classified reservations: got %d, want 3", classified)
-		}
-		assertReservation(t, readReservation(t, pool, reserved.Ref().ID()), "given_up", 1, reservedBackend.PodUID(), reserved.Ref())
-		assertReservation(t, readReservation(t, pool, abandoned.Ref().ID()), "given_up", 1, abandonedBackend.PodUID(), abandoned.Ref())
-		assertReservation(t, readReservation(t, pool, authorized.Ref().ID()), "orphaned", 1, authorizedBackend.PodUID(), authorized.Ref())
-		assertCapacity(t, pool, reservedBackend, backendCapacity{})
-		assertCapacity(t, pool, abandonedBackend, backendCapacity{})
-		assertCapacity(t, pool, authorizedBackend, backendCapacity{orphaned: 2})
-		assertActiveDebt(t, pool, authorized.Ref().ID(), authorizedBackend, "tenant-a", "classification_timeout", 2)
-		if got := capacityDebtCount(t, pool); got != 1 {
-			t.Fatalf("classified debt count = %d, want 1", got)
-		}
-
-		classified, err = store.ClassifyExpired(ctx, 10)
-		if err != nil {
-			t.Fatalf("repeat expired classification: %v", err)
-		}
-		if classified != 0 {
-			t.Fatalf("repeat classified reservations: got %d, want 0", classified)
-		}
-		assertCapacity(t, pool, reservedBackend, backendCapacity{})
-		assertCapacity(t, pool, abandonedBackend, backendCapacity{})
-		assertCapacity(t, pool, authorizedBackend, backendCapacity{orphaned: 2})
-		if got := capacityDebtCount(t, pool); got != 1 {
-			t.Fatalf("repeat classification debt count = %d, want 1", got)
+		if _, err := store.TryReserve(ctx, testScheduleCommand(t, "request-drain", "attempt-drain", "tenant-a"), id); !errors.Is(err, domain.ErrNoCapacity) {
+			t.Fatalf("reserve crossed drain: %v", err)
 		}
 	})
 
-	t.Run("tenant last grant is serialized across scheduler replicas", func(t *testing.T) {
-		resetSchedulerLedger(t, pool)
-		insertTenant(t, pool, "tenant-contended", 2)
-		backendA := testIdentity(t, "pod-tenant-contended-a", 1)
-		backendB := testIdentity(t, "pod-tenant-contended-b", 1)
-		insertBackend(t, pool, backendA)
-		insertBackend(t, pool, backendB)
-		replicaB, err := postgresadapter.NewSchedulerStore(pool, []byte(testCapabilityKey))
+	t.Run("retained grant give-up and sweep", func(t *testing.T) {
+		reset(t)
+		id := testIdentity(t, "pod-retained", 1)
+		seed(t, id)
+		cmd := testScheduleCommand(t, "request-retained", "attempt-retained", "tenant-a")
+		reservation, err := store.TryReserve(ctx, cmd, id)
 		if err != nil {
-			t.Fatalf("create second scheduler store: %v", err)
+			t.Fatal(err)
 		}
-		commands := []domain.ScheduleCommand{
-			testScheduleCommand(t, "request-tenant-contended-a", "attempt-tenant-contended-a", "tenant-contended"),
-			testScheduleCommand(t, "request-tenant-contended-b", "attempt-tenant-contended-b", "tenant-contended"),
+		if err := store.AbandonBeforeDispatch(ctx, reservation.Ref(), domain.RerankStaleTarget); err != nil {
+			t.Fatal(err)
 		}
-		stores := []*postgresadapter.SchedulerStore{store, replicaB}
-		backends := []domain.WorkloadIdentity{backendA, backendB}
-		start := make(chan struct{})
-		results := make([]error, 2)
-		var calls sync.WaitGroup
-		calls.Add(2)
-		for call := range results {
-			go func(call int) {
-				defer calls.Done()
-				<-start
-				_, results[call] = stores[call].TryReserve(ctx, commands[call], backends[call])
-			}(call)
+		if _, err := pool.Exec(ctx, `UPDATE request_records SET classification_after=transaction_timestamp()-interval '1 second'
+			WHERE request_id=$1`, cmd.RequestID()); err != nil {
+			t.Fatal(err)
 		}
-		close(start)
-		calls.Wait()
-		successes := 0
-		losers := 0
-		for call, err := range results {
-			if err == nil {
-				successes++
-				continue
-			}
-			losers++
-			if !errors.Is(err, domain.ErrNoCapacity) {
-				t.Fatalf("tenant grant contender %d: got %v, want %v", call, err, domain.ErrNoCapacity)
-			}
-		}
-		if successes != 1 || losers != 1 {
-			t.Fatalf("tenant grant contenders: got successes=%d losers=%d, want 1 each; errors=%v", successes, losers, results)
-		}
-		assertTenantUsage(t, pool, "tenant-contended", 2, 0)
-		if count := admissionGrantCount(t, pool); count != 1 {
-			t.Fatalf("admission grant count: got %d, want 1", count)
+		if result, err := store.SweepReservationStates(ctx, 10); err != nil || result.GivenUp != 1 {
+			t.Fatalf("retained sweep: result=%+v err=%v", result, err)
 		}
 	})
 
-	t.Run("backend last slot is not oversold", func(t *testing.T) {
-		resetSchedulerLedger(t, pool)
-		backend := testIdentity(t, "pod-slot-contended", 1)
-		insertBackend(t, pool, backend)
-		if _, err := pool.Exec(ctx, `UPDATE scheduler_backends SET admission_limit=2 WHERE pod_uid=$1`, backend.PodUID()); err != nil {
-			t.Fatalf("set last-slot capacity: %v", err)
-		}
-		replicaB, err := postgresadapter.NewSchedulerStore(pool, []byte(testCapabilityKey))
+	t.Run("ambiguity debt persists and recovery fence closes admission and dispatch", func(t *testing.T) {
+		reset(t)
+		id := testIdentity(t, "pod-debt", 1)
+		seed(t, id)
+		cmd := testScheduleCommand(t, "request-debt", "attempt-debt", "tenant-a")
+		reservation, err := store.TryReserve(ctx, cmd, id)
 		if err != nil {
-			t.Fatalf("create second scheduler store: %v", err)
+			t.Fatal(err)
 		}
-		commands := []domain.ScheduleCommand{
-			testScheduleCommand(t, "request-slot-contended-a", "attempt-slot-contended-a", "tenant-a"),
-			testScheduleCommand(t, "request-slot-contended-b", "attempt-slot-contended-b", "tenant-b"),
+		if _, err := store.PrepareDispatch(ctx, reservation.Ref()); err != nil {
+			t.Fatal(err)
 		}
-		stores := []*postgresadapter.SchedulerStore{store, replicaB}
-		start := make(chan struct{})
-		results := make([]error, 2)
-		var calls sync.WaitGroup
-		calls.Add(2)
-		for call := range results {
-			go func(call int) {
-				defer calls.Done()
-				<-start
-				_, results[call] = stores[call].TryReserve(ctx, commands[call], backend)
-			}(call)
+		if err := store.MarkAmbiguous(ctx, reservation.Ref(), domain.AmbiguousTransport); err != nil {
+			t.Fatal(err)
 		}
-		close(start)
-		calls.Wait()
-		successes := 0
-		losers := 0
-		for call, err := range results {
-			if err == nil {
-				successes++
-				continue
-			}
-			losers++
-			if !errors.Is(err, domain.ErrNoCapacity) {
-				t.Fatalf("backend contender %d: got %v, want %v", call, err, domain.ErrNoCapacity)
-			}
+		var debts int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM orphaned_capacity_debts
+			WHERE reservation_id=$1 AND state='active'`, reservation.Ref().ID()).Scan(&debts); err != nil || debts != 1 {
+			t.Fatalf("authoritative debt missing: count=%d err=%v", debts, err)
 		}
-		if successes != 1 || losers != 1 {
-			t.Fatalf("backend contenders: got successes=%d losers=%d, want 1 each; errors=%v", successes, losers, results)
+		if _, err := pool.Exec(ctx, `UPDATE system_admission_state SET admission_state='fenced',
+			dispatch_state='fenced',fenced_at=transaction_timestamp(),fenced_by_hash=$2
+			WHERE cluster_id=$1`, id.Cluster(), actor[:]); err != nil {
+			t.Fatal(err)
 		}
-		assertCapacity(t, pool, backend, backendCapacity{reserved: 2})
-		if count := admissionGrantCount(t, pool); count != 1 {
-			t.Fatalf("admission grant count: got %d, want 1", count)
-		}
-		tenants := []string{"tenant-a", "tenant-b"}
-		for contender, tenant := range tenants {
-			wantActive := 0
-			if results[contender] == nil {
-				wantActive = 2
-			}
-			assertTenantUsage(t, pool, tenant, wantActive, 0)
+		if _, err := store.TryReserve(ctx, testScheduleCommand(t, "request-fenced", "attempt-fenced", "tenant-a"), id); !errors.Is(err, domain.ErrInvalidState) {
+			t.Fatalf("recovery admission fence: %v", err)
 		}
 	})
 
-	t.Run("rerank reuses one tenant grant across candidates", func(t *testing.T) {
-		resetSchedulerLedger(t, pool)
-		backends := []domain.WorkloadIdentity{
-			testIdentity(t, "pod-rerank-reuse-a", 1),
-			testIdentity(t, "pod-rerank-reuse-b", 1),
-			testIdentity(t, "pod-rerank-reuse-c", 1),
-		}
-		for _, backend := range backends {
-			insertBackend(t, pool, backend)
-		}
-		command := testScheduleCommand(t, "request-rerank-reuse", "attempt-rerank-reuse", "tenant-a")
-		reservation, err := store.TryReserve(ctx, command, backends[0])
+	t.Run("envelope key rotation retains old reads and writes current version", func(t *testing.T) {
+		reset(t)
+		id := testIdentity(t, "pod-rotation", 1)
+		seed(t, id)
+		keyring, err := postgresadapter.NewLocalCapabilityKeyring(
+			map[uint32][]byte{1: []byte(testCapabilityKey), 2: []byte("abcdef0123456789abcdef0123456789")},
+			map[uint32][]byte{1: []byte(testCapabilityKey), 2: []byte("fedcba9876543210fedcba9876543210")},
+		)
 		if err != nil {
-			t.Fatalf("initial reserve: %v", err)
+			t.Fatal(err)
 		}
-		ref := reservation.Ref()
-		for index := 1; index < len(backends); index++ {
-			if err := store.AbandonBeforeDispatch(ctx, ref, domain.RerankStaleTarget); err != nil {
-				t.Fatalf("abandon candidate %d: %v", index, err)
-			}
-			assertTenantUsage(t, pool, "tenant-a", 2, 0)
-			next, err := store.TryReserve(ctx, command, backends[index])
-			if err != nil {
-				t.Fatalf("reserve candidate %d: %v", index, err)
-			}
-			ref = next.Ref()
-		}
-		assertTenantUsage(t, pool, "tenant-a", 2, 0)
-		if count := admissionGrantCount(t, pool); count != 1 {
-			t.Fatalf("admission grant count: got %d, want 1", count)
-		}
-		assertGrantState(t, pool, ref.ID(), "active_reserved")
-	})
-
-	t.Run("terminal give-up releases tenant and backend exactly once", func(t *testing.T) {
-		resetSchedulerLedger(t, pool)
-		backend := testIdentity(t, "pod-give-up-exact-once", 1)
-		insertBackend(t, pool, backend)
-		reservation, err := store.TryReserve(ctx,
-			testScheduleCommand(t, "request-give-up-exact-once", "attempt-give-up-exact-once", "tenant-a"), backend)
+		catalog, err := postgresadapter.NewCatalog(pool, keyring)
 		if err != nil {
-			t.Fatalf("reserve give-up fixture: %v", err)
+			t.Fatal(err)
 		}
-		ref := reservation.Ref()
-		start := make(chan struct{})
-		results := make([]error, 4)
-		var calls sync.WaitGroup
-		calls.Add(len(results))
-		for call := range results {
-			go func(call int) {
-				defer calls.Done()
-				<-start
-				results[call] = store.GiveUpBeforeDispatch(ctx, ref, domain.GiveUpCanceled)
-			}(call)
+		if _, err := pool.Exec(ctx, `UPDATE system_admission_state
+			SET digest_write_version=2,capability_kek_write_version=2,
+			    capability_comparison_write_version=2
+			WHERE cluster_id='cluster-a';
+			INSERT INTO system_digest_read_versions VALUES('cluster-a',2) ON CONFLICT DO NOTHING`); err != nil {
+			t.Fatal(err)
 		}
-		close(start)
-		calls.Wait()
-		for call, err := range results {
-			if err != nil {
-				t.Fatalf("give-up call %d: %v", call, err)
-			}
-		}
-		assertCapacity(t, pool, backend, backendCapacity{})
-		assertTenantUsage(t, pool, "tenant-a", 0, 0)
-		assertGrantState(t, pool, ref.ID(), "released")
-	})
-
-	t.Run("ambiguous dispatch moves both contributions to orphaned", func(t *testing.T) {
-		resetSchedulerLedger(t, pool)
-		backend := testIdentity(t, "pod-ambiguous-debt", 1)
-		insertBackend(t, pool, backend)
-		reservation, err := store.TryReserve(ctx,
-			testScheduleCommand(t, "request-ambiguous-debt", "attempt-ambiguous-debt", "tenant-a"), backend)
-		if err != nil {
-			t.Fatalf("reserve ambiguous fixture: %v", err)
-		}
-		ref := reservation.Ref()
-		if _, err := store.PrepareDispatch(ctx, ref); err != nil {
-			t.Fatalf("prepare ambiguous fixture: %v", err)
-		}
-		if err := store.MarkAmbiguous(ctx, ref, domain.AmbiguousTransport); err != nil {
-			t.Fatalf("mark ambiguous: %v", err)
-		}
-		if err := store.MarkAmbiguous(ctx, ref, domain.AmbiguousTransport); err != nil {
-			t.Fatalf("repeat mark ambiguous: %v", err)
-		}
-		assertCapacity(t, pool, backend, backendCapacity{orphaned: 2})
-		assertTenantUsage(t, pool, "tenant-a", 0, 2)
-		assertGrantState(t, pool, ref.ID(), "orphaned")
-		assertActiveDebt(t, pool, ref.ID(), backend, "tenant-a", "ambiguous_transport", 2)
-		if got := capacityDebtCount(t, pool); got != 1 {
-			t.Fatalf("ambiguous debt count = %d, want 1", got)
-		}
-	})
-
-	t.Run("identity-gone resolution is exact and idempotent", func(t *testing.T) {
-		resetSchedulerLedger(t, pool)
-		backend := testIdentity(t, "pod-debt-resolution", 7)
-		insertBackend(t, pool, backend)
-		command := testIdempotentScheduleCommand(t, "request-debt-resolution", "attempt-debt-resolution", "tenant-a")
-		reservation, err := store.TryReserve(ctx, command, backend)
-		if err != nil {
-			t.Fatalf("reserve debt resolution fixture: %v", err)
-		}
-		ref := reservation.Ref()
-		if _, err := store.PrepareDispatch(ctx, ref); err != nil {
-			t.Fatalf("prepare debt resolution fixture: %v", err)
-		}
-		if err := store.MarkAmbiguous(ctx, ref, domain.AmbiguousProtocol); err != nil {
-			t.Fatalf("orphan debt resolution fixture: %v", err)
-		}
-		replay := testIdempotentScheduleCommand(t, command.RequestID(), "attempt-debt-replay", "tenant-a")
-		if _, _, err := store.LookupReservation(ctx, replay); !errors.Is(err, domain.ErrRequestInProgress) {
-			t.Fatalf("active debt replay error = %v, want ErrRequestInProgress", err)
-		}
-		catalog, err := postgresadapter.NewControllerCatalog(pool)
-		if err != nil {
-			t.Fatalf("create controller catalog: %v", err)
-		}
-		generation, err := catalog.AcquireControllerWriterGeneration(ctx, backend.Cluster(), "resolver-a")
-		if err != nil {
-			t.Fatalf("acquire resolver generation: %v", err)
-		}
-		resolution := testDebtResolution(t, ref.ID(), backend, generation, "proof-a")
-		if err := catalog.ResolveCapacityDebt(ctx, resolution); err != nil {
-			t.Fatalf("resolve capacity debt: %v", err)
-		}
-		if err := catalog.ResolveCapacityDebt(ctx, resolution); err != nil {
-			t.Fatalf("repeat capacity debt resolution: %v", err)
-		}
-		assertResolvedDebt(t, pool, ref.ID(), resolution.Proof().EvidenceHash())
-		assertCapacity(t, pool, backend, backendCapacity{})
-		assertTenantUsage(t, pool, "tenant-a", 0, 0)
-		assertGrantState(t, pool, ref.ID(), "released")
-		assertReservation(t, readReservation(t, pool, ref.ID()), "orphaned", 1, backend.PodUID(), ref)
-		if _, _, err := store.LookupReservation(ctx, replay); !errors.Is(err, domain.ErrRequestNotReplayable) {
-			t.Fatalf("resolved debt replay error = %v, want ErrRequestNotReplayable", err)
-		}
-
-		conflict := testDebtResolution(t, ref.ID(), backend, generation, "proof-b")
-		if err := catalog.ResolveCapacityDebt(ctx, conflict); !errors.Is(err, domain.ErrCapacityDebtConflict) {
-			t.Fatalf("conflicting proof error = %v, want ErrCapacityDebtConflict", err)
-		}
-		missing := testDebtResolutionFor(t, "debt_missing", ref.ID(), backend, generation, "proof-a")
-		if err := catalog.ResolveCapacityDebt(ctx, missing); !errors.Is(err, domain.ErrCapacityDebtNotFound) {
-			t.Fatalf("missing debt error = %v, want ErrCapacityDebtNotFound", err)
-		}
-		wrongReservation := testDebtResolutionFor(t, resolution.DebtID(), "wrong-reservation", backend, generation, "proof-a")
-		if err := catalog.ResolveCapacityDebt(ctx, wrongReservation); !errors.Is(err, domain.ErrInvalidReference) {
-			t.Fatalf("wrong reservation error = %v, want ErrInvalidReference", err)
-		}
-		for name, wrongIdentity := range map[string]domain.WorkloadIdentity{
-			"namespace":      alteredIdentity(t, backend, "wrong", backend.PodUID(), backend.EndpointEpoch(), backend.RecoveryEpoch()),
-			"pod uid":        alteredIdentity(t, backend, backend.Namespace(), "wrong-pod", backend.EndpointEpoch(), backend.RecoveryEpoch()),
-			"endpoint epoch": alteredIdentity(t, backend, backend.Namespace(), backend.PodUID(), backend.EndpointEpoch()+1, backend.RecoveryEpoch()),
-			"recovery epoch": alteredIdentity(t, backend, backend.Namespace(), backend.PodUID(), backend.EndpointEpoch(), backend.RecoveryEpoch()+1),
-		} {
-			t.Run("reject wrong "+name, func(t *testing.T) {
-				wrong := testDebtResolutionFor(t, resolution.DebtID(), ref.ID(), wrongIdentity, generation, "proof-a")
-				if err := catalog.ResolveCapacityDebt(ctx, wrong); !errors.Is(err, domain.ErrInvalidReference) {
-					t.Fatalf("wrong identity error = %v, want ErrInvalidReference", err)
-				}
-			})
-		}
-		newGeneration, err := catalog.AcquireControllerWriterGeneration(ctx, backend.Cluster(), "resolver-b")
-		if err != nil {
-			t.Fatalf("advance resolver generation: %v", err)
-		}
-		if newGeneration == generation {
-			t.Fatal("writer generation did not advance")
-		}
-		if err := catalog.ResolveCapacityDebt(ctx, resolution); !errors.Is(err, domain.ErrStaleWriterGeneration) {
-			t.Fatalf("stale duplicate error = %v, want ErrStaleWriterGeneration", err)
-		}
-		assertResolvedDebt(t, pool, ref.ID(), resolution.Proof().EvidenceHash())
-		assertCapacity(t, pool, backend, backendCapacity{})
-		assertTenantUsage(t, pool, "tenant-a", 0, 0)
-	})
-
-	t.Run("concurrent identical identity-gone proofs release once", func(t *testing.T) {
-		resetSchedulerLedger(t, pool)
-		backend := testIdentity(t, "pod-debt-concurrent", 8)
-		insertBackend(t, pool, backend)
-		reservation, err := store.TryReserve(ctx,
-			testScheduleCommand(t, "request-debt-concurrent", "attempt-debt-concurrent", "tenant-a"), backend)
-		if err != nil {
-			t.Fatalf("reserve concurrent debt fixture: %v", err)
-		}
-		ref := reservation.Ref()
-		if _, err := store.PrepareDispatch(ctx, ref); err != nil {
-			t.Fatalf("prepare concurrent debt fixture: %v", err)
-		}
-		if err := store.MarkAmbiguous(ctx, ref, domain.AmbiguousCanceled); err != nil {
-			t.Fatalf("orphan concurrent debt fixture: %v", err)
-		}
-		catalog, err := postgresadapter.NewControllerCatalog(pool)
-		if err != nil {
-			t.Fatalf("create controller catalog: %v", err)
-		}
-		generation, err := catalog.AcquireControllerWriterGeneration(ctx, backend.Cluster(), "resolver-concurrent")
-		if err != nil {
-			t.Fatalf("acquire concurrent resolver generation: %v", err)
-		}
-		resolution := testDebtResolution(t, ref.ID(), backend, generation, "proof-concurrent")
-		results := make([]error, 2)
-		start := make(chan struct{})
-		var calls sync.WaitGroup
-		for call := range results {
-			calls.Add(1)
-			go func(call int) {
-				defer calls.Done()
-				<-start
-				results[call] = catalog.ResolveCapacityDebt(ctx, resolution)
-			}(call)
-		}
-		close(start)
-		calls.Wait()
-		for call, err := range results {
-			if err != nil {
-				t.Fatalf("concurrent resolve call %d: %v", call, err)
-			}
-		}
-		assertResolvedDebt(t, pool, ref.ID(), resolution.Proof().EvidenceHash())
-		assertCapacity(t, pool, backend, backendCapacity{})
-		assertTenantUsage(t, pool, "tenant-a", 0, 0)
-		assertGrantState(t, pool, ref.ID(), "released")
-	})
-
-	t.Run("resolver rejects inconsistent non-orphaned reservation atomically", func(t *testing.T) {
-		resetSchedulerLedger(t, pool)
-		backend := testIdentity(t, "pod-debt-inconsistent", 9)
-		insertBackend(t, pool, backend)
-		reservation, err := store.TryReserve(ctx,
-			testScheduleCommand(t, "request-debt-inconsistent", "attempt-debt-inconsistent", "tenant-a"), backend)
-		if err != nil {
-			t.Fatalf("reserve inconsistent debt fixture: %v", err)
-		}
-		ref := reservation.Ref()
-		if _, err := store.PrepareDispatch(ctx, ref); err != nil {
-			t.Fatalf("prepare inconsistent debt fixture: %v", err)
-		}
-		if err := store.MarkAmbiguous(ctx, ref, domain.AmbiguousTransport); err != nil {
-			t.Fatalf("orphan inconsistent debt fixture: %v", err)
-		}
-		if _, err := pool.Exec(ctx, `UPDATE scheduler_reservations SET state='dispatch_authorized' WHERE reservation_id=$1`, ref.ID()); err != nil {
-			t.Fatalf("corrupt reservation state fixture: %v", err)
-		}
-		catalog, err := postgresadapter.NewControllerCatalog(pool)
-		if err != nil {
-			t.Fatalf("create controller catalog: %v", err)
-		}
-		generation, err := catalog.AcquireControllerWriterGeneration(ctx, backend.Cluster(), "resolver-inconsistent")
-		if err != nil {
-			t.Fatalf("acquire inconsistent resolver generation: %v", err)
-		}
-		resolution := testDebtResolution(t, ref.ID(), backend, generation, "proof-inconsistent")
-		if err := catalog.ResolveCapacityDebt(ctx, resolution); !errors.Is(err, domain.ErrInvalidState) {
-			t.Fatalf("inconsistent reservation error = %v, want ErrInvalidState", err)
-		}
-		assertActiveDebt(t, pool, ref.ID(), backend, "tenant-a", "ambiguous_transport", 2)
-		assertCapacity(t, pool, backend, backendCapacity{orphaned: 2})
-		assertTenantUsage(t, pool, "tenant-a", 0, 2)
-		assertGrantState(t, pool, ref.ID(), "orphaned")
-	})
-
-	t.Run("another scheduler replica recovers capability and finalizes", func(t *testing.T) {
-		resetSchedulerLedger(t, pool)
-		backend := testIdentity(t, "pod-replica-recovery", 1)
-		insertBackend(t, pool, backend)
-		command := testScheduleCommand(t, "request-replica-recovery", "attempt-replica-recovery", "tenant-a")
-		reservation, err := store.TryReserve(ctx, command, backend)
-		if err != nil {
-			t.Fatalf("reserve on replica A: %v", err)
-		}
-		replicaB, err := postgresadapter.NewSchedulerStore(pool, []byte(testCapabilityKey))
-		if err != nil {
-			t.Fatalf("create replica B: %v", err)
-		}
-		recovered, found, err := replicaB.LookupReservation(ctx, command)
-		if err != nil || !found {
-			t.Fatalf("recover on replica B: found=%v err=%v", found, err)
-		}
-		if !bytes.Equal(recovered.Ref().Capability(), reservation.Ref().Capability()) {
-			t.Fatal("replica B recovered a different capability")
-		}
-		if _, err := replicaB.PrepareDispatch(ctx, recovered.Ref()); err != nil {
-			t.Fatalf("prepare on replica B: %v", err)
-		}
-		if err := replicaB.Finalize(ctx, recovered.Ref(), domain.TerminalProofProviderFinish); err != nil {
-			t.Fatalf("finalize on replica B: %v", err)
-		}
-		assertCapacity(t, pool, backend, backendCapacity{})
-		assertTenantUsage(t, pool, "tenant-a", 0, 0)
-		assertGrantState(t, pool, recovered.Ref().ID(), "released")
-	})
-
-	t.Run("failed reservation stages roll back every contribution", func(t *testing.T) {
-		t.Run("tenant limit", func(t *testing.T) {
-			resetSchedulerLedger(t, pool)
-			insertTenant(t, pool, "tenant-denied", 0)
-			backend := testIdentity(t, "pod-rollback-tenant", 1)
-			insertBackend(t, pool, backend)
-			_, err := store.TryReserve(ctx,
-				testScheduleCommand(t, "request-rollback-tenant", "attempt-rollback-tenant", "tenant-denied"), backend)
-			if !errors.Is(err, domain.ErrNoCapacity) {
-				t.Fatalf("tenant-limit reserve: got %v, want %v", err, domain.ErrNoCapacity)
-			}
-			assertEmptyContributions(t, pool, backend, "tenant-denied")
+		digest1Value := sha256.Sum256([]byte("rotation-v1"))
+		digest2Value := sha256.Sum256([]byte("rotation-v2"))
+		digest1, _ := domain.NewRequestDigestCandidate(1, digest1Value[:])
+		digest2, _ := domain.NewRequestDigestCandidate(2, digest2Value[:])
+		cmd, err := domain.NewScheduleCommand(domain.ScheduleParams{
+			RequestID: "request-rotation", AttemptID: "attempt-rotation", Tenant: "tenant-a",
+			DigestCandidates: []domain.RequestDigestCandidate{digest1, digest2}, DigestWriteVersion: 2,
+			Model: "model-a", SlotCost: 2, ExecutionBudget: time.Minute,
 		})
-
-		t.Run("backend capacity", func(t *testing.T) {
-			resetSchedulerLedger(t, pool)
-			backend := testIdentity(t, "pod-rollback-capacity", 1)
-			insertBackend(t, pool, backend)
-			if _, err := pool.Exec(ctx, `UPDATE scheduler_backends SET admission_limit=0 WHERE pod_uid=$1`, backend.PodUID()); err != nil {
-				t.Fatalf("close backend admission: %v", err)
-			}
-			_, err := store.TryReserve(ctx,
-				testScheduleCommand(t, "request-rollback-capacity", "attempt-rollback-capacity", "tenant-a"), backend)
-			if !errors.Is(err, domain.ErrNoCapacity) {
-				t.Fatalf("capacity reserve: got %v, want %v", err, domain.ErrNoCapacity)
-			}
-			assertEmptyContributions(t, pool, backend, "tenant-a")
-		})
-
-		for _, failure := range []struct {
-			name  string
-			table string
-		}{
-			{name: "reservation persistence", table: "scheduler_reservations"},
-			{name: "grant persistence", table: "admission_grants"},
-		} {
-			t.Run(failure.name, func(t *testing.T) {
-				resetSchedulerLedger(t, pool)
-				backend := testIdentity(t, "pod-rollback-"+strings.ReplaceAll(failure.name, " ", "-"), 1)
-				insertBackend(t, pool, backend)
-				if _, err := pool.Exec(ctx, `CREATE OR REPLACE FUNCTION fail_scheduler_insert() RETURNS trigger
-					LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected insert failure'; END $$`); err != nil {
-					t.Fatalf("create failure function: %v", err)
-				}
-				triggerName := "fail_" + strings.ReplaceAll(failure.table, "_", "")
-				if _, err := pool.Exec(ctx, fmt.Sprintf(`CREATE TRIGGER %s BEFORE INSERT ON %s
-					FOR EACH ROW EXECUTE FUNCTION fail_scheduler_insert()`, triggerName, failure.table)); err != nil {
-					t.Fatalf("create failure trigger: %v", err)
-				}
-				t.Cleanup(func() {
-					_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, triggerName, failure.table))
-					_, _ = pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS fail_scheduler_insert()`)
-				})
-				_, err := store.TryReserve(ctx,
-					testScheduleCommand(t, "request-"+triggerName, "attempt-"+triggerName, "tenant-a"), backend)
-				if err == nil {
-					t.Fatal("reserve unexpectedly succeeded with injected insert failure")
-				}
-				assertEmptyContributions(t, pool, backend, "tenant-a")
-				if _, err := pool.Exec(ctx, fmt.Sprintf(`DROP TRIGGER %s ON %s`, triggerName, failure.table)); err != nil {
-					t.Fatalf("drop failure trigger: %v", err)
-				}
-				if _, err := pool.Exec(ctx, `DROP FUNCTION fail_scheduler_insert()`); err != nil {
-					t.Fatalf("drop failure function: %v", err)
-				}
-			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reservation, err := catalog.SchedulerStore().TryReserve(ctx, cmd, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var kekVersion, comparisonVersion uint32
+		if err := pool.QueryRow(ctx, `SELECT capability_kek_version,
+			capability_comparison_version FROM reservations WHERE reservation_id=$1`,
+			reservation.Ref().ID()).Scan(&kekVersion, &comparisonVersion); err != nil ||
+			kekVersion != 2 || comparisonVersion != 2 {
+			t.Fatalf("capability rotation versions: kek=%d comparison=%d err=%v",
+				kekVersion, comparisonVersion, err)
 		}
 	})
 }
@@ -963,8 +432,14 @@ func postgresImage(t *testing.T, root string) string {
 
 func testScheduleCommand(t *testing.T, requestID, attemptID, tenant string) domain.ScheduleCommand {
 	t.Helper()
+	digestValue := sha256.Sum256([]byte(requestID + "\x00" + tenant))
+	digest, err := domain.NewRequestDigestCandidate(1, digestValue[:])
+	if err != nil {
+		t.Fatal(err)
+	}
 	command, err := domain.NewScheduleCommand(domain.ScheduleParams{
 		RequestID: requestID, AttemptID: attemptID, Tenant: tenant,
+		DigestCandidates: []domain.RequestDigestCandidate{digest}, DigestWriteVersion: 1,
 		Model: "model-a", SlotCost: 2, ExecutionBudget: 5 * time.Minute,
 	})
 	if err != nil {

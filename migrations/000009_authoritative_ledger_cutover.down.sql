@@ -1,0 +1,11 @@
+BEGIN;
+DROP TRIGGER IF EXISTS scheduler_crypto_versions_cutover_guard ON scheduler_crypto_versions;
+DROP TRIGGER IF EXISTS capacity_debts_cutover_guard ON capacity_debts;
+DROP TRIGGER IF EXISTS scheduler_reservations_cutover_guard ON scheduler_reservations;
+DROP FUNCTION IF EXISTS reject_legacy_ledger_write();
+DROP INDEX IF EXISTS admission_grants_reservation_nonnull_idx;
+ALTER TABLE request_records DROP COLUMN IF EXISTS terminal_result_hash;
+ALTER TABLE orphaned_capacity_debts DROP COLUMN IF EXISTS provider_ack_sequence;
+DROP TABLE IF EXISTS system_digest_read_versions;
+DROP TABLE IF EXISTS system_lookup_read_versions;
+COMMIT;
