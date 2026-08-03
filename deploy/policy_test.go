@@ -14,7 +14,7 @@ func artifact(t *testing.T, path string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(body)
+	return strings.ReplaceAll(string(body), "\r\n", "\n")
 }
 
 func TestImagesAreImmutableAndNeverLatest(t *testing.T) {
