@@ -14,6 +14,7 @@ import (
 	"github.com/BizerNotNull/474-Prudentia/internal/domain"
 	"github.com/BizerNotNull/474-Prudentia/internal/scheduling"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -288,8 +289,21 @@ func (s *SchedulerStore) existingReservation(ctx context.Context, tx pgx.Tx, cmd
 		}
 		if attempt != cmd.AttemptID() {
 			switch state {
-			case "reserved", "dispatch_authorized", "orphaned":
+			case "reserved", "dispatch_authorized":
 				return domain.Reservation{}, false, domain.ErrRequestInProgress
+			case "orphaned":
+				var debtState string
+				err := tx.QueryRow(ctx, `SELECT state FROM capacity_debts WHERE reservation_id=$1`, id).Scan(&debtState)
+				if err != nil {
+					return domain.Reservation{}, false, domain.ErrInvalidState
+				}
+				if debtState == "active" {
+					return domain.Reservation{}, false, domain.ErrRequestInProgress
+				}
+				if debtState == "resolved_identity_gone" {
+					return domain.Reservation{}, false, domain.ErrRequestNotReplayable
+				}
+				return domain.Reservation{}, false, domain.ErrInvalidState
 			default:
 				return domain.Reservation{}, false, domain.ErrRequestNotReplayable
 			}
@@ -506,14 +520,22 @@ func (s *SchedulerStore) Finalize(ctx context.Context, ref domain.ReservationRef
 	if proof != domain.TerminalProofProviderFinish && proof != domain.TerminalProofNotSent {
 		return domain.ErrInvalidState
 	}
-	return s.release(ctx, ref, "released", false, "dispatch_authorized")
+	return s.releaseTerminal(ctx, ref)
 }
 
 func (s *SchedulerStore) MarkAmbiguous(ctx context.Context, ref domain.ReservationRef, cause domain.AmbiguousCause) error {
-	if cause < domain.AmbiguousTransport || cause > domain.AmbiguousProtocol {
+	var debtCause string
+	switch cause {
+	case domain.AmbiguousTransport:
+		debtCause = "ambiguous_transport"
+	case domain.AmbiguousCanceled:
+		debtCause = "ambiguous_canceled"
+	case domain.AmbiguousProtocol:
+		debtCause = "ambiguous_protocol"
+	default:
 		return domain.ErrInvalidState
 	}
-	return s.release(ctx, ref, "orphaned", true, "dispatch_authorized")
+	return s.orphan(ctx, ref, debtCause)
 }
 
 func (s *SchedulerStore) ClassifyExpired(ctx context.Context, limit int) (int, error) {
@@ -578,8 +600,19 @@ func (s *SchedulerStore) ClassifyExpired(ctx context.Context, limit int) (int, e
 				return 0, err
 			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE scheduler_reservations SET state=$2, updated_at=clock_timestamp() WHERE reservation_id=$1`, item.id, terminal); err != nil {
+		tag, err := tx.Exec(ctx, `UPDATE scheduler_reservations
+			SET state=$2, updated_at=clock_timestamp()
+			WHERE reservation_id=$1 AND state=$3`, item.id, terminal, item.row.state)
+		if err != nil {
 			return 0, fmt.Errorf("classify expired reservation: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return 0, domain.ErrInvalidState
+		}
+		if terminal == "orphaned" {
+			if err := insertCapacityDebt(ctx, tx, item.row, "classification_timeout"); err != nil {
+				return 0, err
+			}
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -588,41 +621,122 @@ func (s *SchedulerStore) ClassifyExpired(ctx context.Context, limit int) (int, e
 	return len(expired), nil
 }
 
-func (s *SchedulerStore) release(ctx context.Context, ref domain.ReservationRef, terminal string, debt bool, allowed string) error {
+func (s *SchedulerStore) releaseTerminal(ctx context.Context, ref domain.ReservationRef) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("begin reservation transition: %w", err)
+		return fmt.Errorf("begin terminal reservation release: %w", err)
 	}
 	defer tx.Rollback(ctx)
 	row, err := lockReservation(ctx, tx, ref)
 	if err != nil {
 		return err
 	}
-	if row.state == terminal {
+	if row.state == "released" {
 		return tx.Commit(ctx)
 	}
-	if row.state != allowed {
+	if row.state != "dispatch_authorized" {
 		return domain.ErrInvalidState
 	}
-	orphanDelta := 0
-	grantState := "released"
-	counterEffect := grantCounterRelease
-	if debt {
-		orphanDelta = row.slotCost
-		grantState = "orphaned"
-		counterEffect = grantCounterOrphan
-	}
-	if err := transitionGrant(ctx, tx, row, "active_reserved", grantState, counterEffect); err != nil {
+	if err := transitionGrant(ctx, tx, row, "active_reserved", "released", grantCounterRelease); err != nil {
 		return err
 	}
-	if err := updateBackendCapacity(ctx, tx, row, orphanDelta); err != nil {
+	if err := updateBackendCapacity(ctx, tx, row, 0); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE scheduler_reservations SET state=$2, updated_at=clock_timestamp() WHERE reservation_id=$1`, ref.ID(), terminal); err != nil {
-		return fmt.Errorf("complete reservation transition: %w", err)
+	tag, err := tx.Exec(ctx, `UPDATE scheduler_reservations
+		SET state='released', updated_at=clock_timestamp()
+		WHERE reservation_id=$1 AND state='dispatch_authorized'`, ref.ID())
+	if err != nil {
+		return fmt.Errorf("complete terminal reservation release: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return domain.ErrInvalidState
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit reservation transition: %w", err)
+		return fmt.Errorf("commit terminal reservation release: %w", err)
+	}
+	return nil
+}
+
+func (s *SchedulerStore) orphan(ctx context.Context, ref domain.ReservationRef, cause string) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin orphan reservation transition: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	row, err := lockReservation(ctx, tx, ref)
+	if err != nil {
+		return err
+	}
+	if row.state == "orphaned" {
+		if err := insertCapacityDebt(ctx, tx, row, cause); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+	if row.state != "dispatch_authorized" {
+		return domain.ErrInvalidState
+	}
+	if err := transitionGrant(ctx, tx, row, "active_reserved", "orphaned", grantCounterOrphan); err != nil {
+		return err
+	}
+	if err := updateBackendCapacity(ctx, tx, row, row.slotCost); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE scheduler_reservations
+		SET state='orphaned', updated_at=clock_timestamp()
+		WHERE reservation_id=$1 AND state='dispatch_authorized'`, ref.ID())
+	if err != nil {
+		return fmt.Errorf("persist orphaned reservation: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return domain.ErrInvalidState
+	}
+	if err := insertCapacityDebt(ctx, tx, row, cause); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit orphan reservation transition: %w", err)
+	}
+	return nil
+}
+
+func insertCapacityDebt(ctx context.Context, tx pgx.Tx, row reservationRow, cause string) error {
+	debtID := "debt_" + row.reservationID
+	tag, err := tx.Exec(ctx, `INSERT INTO capacity_debts (
+		debt_id, reservation_id, tenant_hash, cluster, namespace, logical_engine, pod_uid,
+		endpoint_epoch, recovery_epoch, slot_cost, cause, state)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active')
+		ON CONFLICT DO NOTHING`,
+		debtID, row.reservationID, row.tenantHash, row.cluster, row.namespace, row.engine,
+		row.podUID, row.endpointEpoch, row.recoveryEpoch, row.slotCost, cause)
+	if err != nil {
+		return fmt.Errorf("insert capacity debt: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+
+	var (
+		reservationID, cluster, namespace, engine, podUID, storedCause, state string
+		tenantHash                                                            []byte
+		endpointEpoch, recoveryEpoch                                          uint64
+		slotCost                                                              int
+	)
+	err = tx.QueryRow(ctx, `SELECT reservation_id, tenant_hash, cluster, namespace, logical_engine,
+		pod_uid, endpoint_epoch, recovery_epoch, slot_cost, cause, state
+		FROM capacity_debts WHERE debt_id=$1 FOR UPDATE`, debtID).
+		Scan(&reservationID, &tenantHash, &cluster, &namespace, &engine, &podUID,
+			&endpointEpoch, &recoveryEpoch, &slotCost, &storedCause, &state)
+	if err != nil {
+		return domain.ErrInvalidState
+	}
+	if reservationID != row.reservationID || !equalBytes(tenantHash, row.tenantHash) ||
+		cluster != row.cluster || namespace != row.namespace || engine != row.engine ||
+		podUID != row.podUID || endpointEpoch != row.endpointEpoch ||
+		recoveryEpoch != row.recoveryEpoch || slotCost != row.slotCost ||
+		storedCause != cause || (state != "active" && state != "resolved_identity_gone") {
+		return domain.ErrInvalidState
 	}
 	return nil
 }
@@ -633,6 +747,7 @@ const (
 	grantCounterUnchanged grantCounterEffect = iota
 	grantCounterRelease
 	grantCounterOrphan
+	grantCounterResolveOrphan
 )
 
 func lockTenantCounter(ctx context.Context, tx pgx.Tx, tenantHash [32]byte, slotCost int, increment bool) error {
@@ -661,13 +776,23 @@ func lockTenantCounter(ctx context.Context, tx pgx.Tx, tenantHash [32]byte, slot
 }
 
 func transitionGrant(ctx context.Context, tx pgx.Tx, row reservationRow, from, to string, effect grantCounterEffect) error {
-	var activeGrants int
-	if effect != grantCounterUnchanged {
+	var contribution int
+	switch effect {
+	case grantCounterUnchanged:
+	case grantCounterRelease, grantCounterOrphan:
 		if err := tx.QueryRow(ctx, `SELECT active_grants
 			FROM tenant_counters WHERE tenant_hash=$1 FOR UPDATE`, row.tenantHash).
-			Scan(&activeGrants); err != nil {
-			return fmt.Errorf("lock tenant contribution: %w", err)
+			Scan(&contribution); err != nil {
+			return fmt.Errorf("lock active tenant contribution: %w", err)
 		}
+	case grantCounterResolveOrphan:
+		if err := tx.QueryRow(ctx, `SELECT orphaned_grants
+			FROM tenant_counters WHERE tenant_hash=$1 FOR UPDATE`, row.tenantHash).
+			Scan(&contribution); err != nil {
+			return fmt.Errorf("lock orphaned tenant contribution: %w", err)
+		}
+	default:
+		return domain.ErrInvalidState
 	}
 	var state string
 	var slotCost int
@@ -680,30 +805,43 @@ func transitionGrant(ctx context.Context, tx pgx.Tx, row reservationRow, from, t
 	if state != from || slotCost != row.slotCost || !equalBytes(tenantHash, row.tenantHash) {
 		return domain.ErrInvalidState
 	}
+
+	var tag pgconn.CommandTag
+	var err error
 	switch effect {
 	case grantCounterUnchanged:
 	case grantCounterRelease:
-		if activeGrants < slotCost {
+		if contribution < slotCost {
 			return domain.ErrInvalidState
 		}
-		if _, err := tx.Exec(ctx, `UPDATE tenant_counters
-			SET active_grants=active_grants-$2, version=version+1 WHERE tenant_hash=$1`,
-			row.tenantHash, slotCost); err != nil {
-			return fmt.Errorf("release tenant contribution: %w", err)
-		}
+		tag, err = tx.Exec(ctx, `UPDATE tenant_counters
+			SET active_grants=active_grants-$2, version=version+1
+			WHERE tenant_hash=$1 AND active_grants >= $2`, row.tenantHash, slotCost)
 	case grantCounterOrphan:
-		if activeGrants < slotCost {
+		if contribution < slotCost {
 			return domain.ErrInvalidState
 		}
-		if _, err := tx.Exec(ctx, `UPDATE tenant_counters
+		tag, err = tx.Exec(ctx, `UPDATE tenant_counters
 			SET active_grants=active_grants-$2, orphaned_grants=orphaned_grants+$2, version=version+1
-			WHERE tenant_hash=$1`, row.tenantHash, slotCost); err != nil {
-			return fmt.Errorf("orphan tenant contribution: %w", err)
+			WHERE tenant_hash=$1 AND active_grants >= $2`, row.tenantHash, slotCost)
+	case grantCounterResolveOrphan:
+		if contribution < slotCost {
+			return domain.ErrInvalidState
 		}
+		tag, err = tx.Exec(ctx, `UPDATE tenant_counters
+			SET orphaned_grants=orphaned_grants-$2, version=version+1
+			WHERE tenant_hash=$1 AND orphaned_grants >= $2`, row.tenantHash, slotCost)
 	default:
 		return domain.ErrInvalidState
 	}
-	tag, err := tx.Exec(ctx, `UPDATE admission_grants SET state=$2, updated_at=clock_timestamp()
+	if err != nil {
+		return fmt.Errorf("update tenant contribution: %w", err)
+	}
+	if effect != grantCounterUnchanged && tag.RowsAffected() != 1 {
+		return domain.ErrInvalidState
+	}
+
+	tag, err = tx.Exec(ctx, `UPDATE admission_grants SET state=$2, updated_at=clock_timestamp()
 		WHERE reservation_id=$1 AND state=$3`, row.reservationID, to, from)
 	if err != nil {
 		return fmt.Errorf("transition admission grant: %w", err)

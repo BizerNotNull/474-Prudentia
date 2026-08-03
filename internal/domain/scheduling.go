@@ -197,12 +197,13 @@ func NewWorkloadIdentity(p WorkloadIdentityParams) (WorkloadIdentity, error) {
 	return WorkloadIdentity{cluster: p.Cluster, namespace: p.Namespace, logicalEngine: p.LogicalEngine, podUID: p.PodUID, endpointEpoch: p.EndpointEpoch, recoveryEpoch: p.RecoveryEpoch}, nil
 }
 
-func (i WorkloadIdentity) Cluster() string       { return i.cluster }
-func (i WorkloadIdentity) Namespace() string     { return i.namespace }
-func (i WorkloadIdentity) LogicalEngine() string { return i.logicalEngine }
-func (i WorkloadIdentity) PodUID() string        { return i.podUID }
-func (i WorkloadIdentity) EndpointEpoch() uint64 { return i.endpointEpoch }
-func (i WorkloadIdentity) RecoveryEpoch() uint64 { return i.recoveryEpoch }
+func (i WorkloadIdentity) Cluster() string                   { return i.cluster }
+func (i WorkloadIdentity) Namespace() string                 { return i.namespace }
+func (i WorkloadIdentity) LogicalEngine() string             { return i.logicalEngine }
+func (i WorkloadIdentity) PodUID() string                    { return i.podUID }
+func (i WorkloadIdentity) EndpointEpoch() uint64             { return i.endpointEpoch }
+func (i WorkloadIdentity) RecoveryEpoch() uint64             { return i.recoveryEpoch }
+func (i WorkloadIdentity) Equal(other WorkloadIdentity) bool { return i == other }
 
 func (i WorkloadIdentity) SPIFFEID(trustDomain string) (*url.URL, error) {
 	if !boundedToken(trustDomain, 255) || strings.ContainsAny(trustDomain, "/?#") {
