@@ -15,7 +15,7 @@ const defaultProxyMaxRequestBytes int64 = 2 << 20
 
 type IdentityProxy struct {
 	ListenAddress           string
-	UpstreamURL             string
+	Upstream                *url.URL
 	TLSCertFile             string
 	TLSKeyFile              string
 	ServerCAFile            string
@@ -29,9 +29,17 @@ type IdentityProxy struct {
 }
 
 func LoadIdentityProxyFromEnv() (IdentityProxy, error) {
+	rawUpstream := strings.TrimSpace(os.Getenv("PRUDENTIA_PROXY_UPSTREAM"))
+	if rawUpstream == "" {
+		rawUpstream = "http://127.0.0.1:8000"
+	}
+	upstream, err := url.Parse(rawUpstream)
+	if err != nil || upstream.Scheme != "http" || upstream.User != nil || upstream.RawQuery != "" || upstream.Fragment != "" || upstream.Path != "" || !isLoopbackHost(upstream.Hostname()) || upstream.Port() == "" {
+		return IdentityProxy{}, errors.New("proxy upstream must be an explicit loopback HTTP endpoint")
+	}
 	cfg := IdentityProxy{
 		ListenAddress:       strings.TrimSpace(os.Getenv("PRUDENTIA_PROXY_LISTEN")),
-		UpstreamURL:         strings.TrimSpace(os.Getenv("PRUDENTIA_PROXY_UPSTREAM")),
+		Upstream:            upstream,
 		TLSCertFile:         strings.TrimSpace(os.Getenv("PRUDENTIA_PROXY_TLS_CERT")),
 		TLSKeyFile:          strings.TrimSpace(os.Getenv("PRUDENTIA_PROXY_TLS_KEY")),
 		ServerCAFile:        strings.TrimSpace(os.Getenv("PRUDENTIA_PROXY_SERVER_CA")),
@@ -43,9 +51,6 @@ func LoadIdentityProxyFromEnv() (IdentityProxy, error) {
 	}
 	if cfg.ListenAddress == "" {
 		cfg.ListenAddress = ":9443"
-	}
-	if cfg.UpstreamURL == "" {
-		cfg.UpstreamURL = "http://127.0.0.1:8000"
 	}
 	for _, raw := range strings.Split(os.Getenv("PRUDENTIA_PROXY_ALLOWED_GATEWAY_SPIFFE_IDS"), ",") {
 		if value := strings.TrimSpace(raw); value != "" {
@@ -72,10 +77,6 @@ func LoadIdentityProxyFromEnv() (IdentityProxy, error) {
 	cfg.Identity = identity
 	if _, _, err := net.SplitHostPort(cfg.ListenAddress); err != nil {
 		return IdentityProxy{}, errors.New("invalid proxy listen address")
-	}
-	upstream, err := url.Parse(cfg.UpstreamURL)
-	if err != nil || upstream.Scheme != "http" || upstream.User != nil || upstream.RawQuery != "" || upstream.Fragment != "" || upstream.Path != "" || !isLoopbackHost(upstream.Hostname()) || upstream.Port() == "" {
-		return IdentityProxy{}, errors.New("proxy upstream must be an explicit loopback HTTP endpoint")
 	}
 	if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" || cfg.ServerCAFile == "" || cfg.GatewayClientCAFile == "" || len(cfg.AllowedGatewaySPIFFEIDs) == 0 {
 		return IdentityProxy{}, errors.New("proxy mTLS configuration is required")

@@ -8,7 +8,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -30,14 +29,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	upstream, err := url.Parse(cfg.UpstreamURL)
-	if err != nil {
-		return errors.New("invalid proxy upstream")
-	}
 	proxyConfig, err := vllmadapter.LoadIdentityProxyConfig(
 		cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ServerCAFile, cfg.GatewayClientCAFile,
 		vllmadapter.IdentityProxyConfig{
-			Upstream: upstream, AllowedGatewaySPIFFEIDs: cfg.AllowedGatewaySPIFFEIDs,
+			Upstream: cfg.Upstream, AllowedGatewaySPIFFEIDs: cfg.AllowedGatewaySPIFFEIDs,
 			Identity: cfg.Identity, ManifestID: cfg.ManifestID,
 			ProviderImageDigest: cfg.ProviderImageDigest, ProxyImageDigest: cfg.ProxyImageDigest,
 			MaxRequestBytes: cfg.MaxRequestBytes,

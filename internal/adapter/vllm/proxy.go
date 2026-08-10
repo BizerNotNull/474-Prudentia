@@ -166,17 +166,6 @@ func verifyAllowedGateway(state tls.ConnectionState, allowed map[string]struct{}
 	return nil
 }
 
-func allowedProxyRoute(method, path string) bool {
-	switch path {
-	case "/v1/chat/completions", "/v1/prudentia/terminate":
-		return method == http.MethodPost
-	case "/health", "/metrics", "/v1/models":
-		return method == http.MethodGet
-	default:
-		return false
-	}
-}
-
 func (p *IdentityProxy) Handler() http.Handler  { return p.handler }
 func (p *IdentityProxy) TLSConfig() *tls.Config { return p.tlsConfig.Clone() }
 func ProxyMaxHeaderBytes() int                  { return maxProxyHeaderBytes }
