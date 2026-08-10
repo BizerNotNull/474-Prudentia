@@ -48,6 +48,10 @@ func TestAuthoritativeLedgerCutover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	replicaStore, err := postgresadapter.NewSchedulerStore(pool, []byte(testCapabilityKey))
+	if err != nil {
+		t.Fatal(err)
+	}
 	actor := sha256.Sum256([]byte("functional-ledger"))
 	if _, err := pool.Exec(ctx, `INSERT INTO system_admission_state(
 		cluster_id,recovery_epoch,admission_state,dispatch_state,schema_write_version,
@@ -105,6 +109,52 @@ func TestAuthoritativeLedgerCutover(t *testing.T) {
 		}
 	}
 
+	t.Run("observation freshness uses database time", func(t *testing.T) {
+		reset(t)
+		generation, err := store.AcquireControllerWriterGeneration(ctx, "cluster-a", "controller-clock-test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		identity := testIdentity(t, "pod-clock-skew", 1)
+		stamp, err := domain.NewSourceStamp(domain.SourceRuntimeHealth, generation, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		health, err := domain.NewRuntimeHealthFact(domain.HealthReady, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reportedAt := time.Now().UTC().Add(24 * 365 * time.Hour)
+		observation, err := domain.NewObservation(domain.ObservationParams{
+			Stamp: stamp, Identity: identity, TTLClass: domain.TTLRuntimeHealth,
+			RuntimeHealth: health, SourceReportedAt: reportedAt, HasSourceReportedAt: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var before, after time.Time
+		if err := pool.QueryRow(ctx, `SELECT transaction_timestamp()`).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
+		stored, accepted, err := store.RecordObservation(ctx, generation, observation)
+		if err != nil || !accepted {
+			t.Fatalf("record observation: accepted=%v err=%v", accepted, err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT transaction_timestamp()`).Scan(&after); err != nil {
+			t.Fatal(err)
+		}
+		if stored.AcceptedAt().Before(before) || stored.AcceptedAt().After(after) {
+			t.Fatalf("accepted_at is not database bounded: before=%v accepted=%v after=%v",
+				before, stored.AcceptedAt(), after)
+		}
+		if stored.ExpiresAt().Sub(stored.AcceptedAt()) != 30*time.Second {
+			t.Fatalf("runtime health TTL = %v", stored.ExpiresAt().Sub(stored.AcceptedAt()))
+		}
+		if stored.AcceptedAt().Equal(reportedAt) || stored.ExpiresAt().After(reportedAt) {
+			t.Fatal("observer clock altered authoritative freshness")
+		}
+	})
+
 	t.Run("same-attempt capability recovery and last slot", func(t *testing.T) {
 		reset(t)
 		id := testIdentity(t, "pod-last", 1)
@@ -114,13 +164,72 @@ func TestAuthoritativeLedgerCutover(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		recovered, found, err := store.LookupReservation(ctx, cmd)
+		recovered, found, err := replicaStore.LookupReservation(ctx, cmd)
 		if err != nil || !found || recovered.Ref().ID() != reservation.Ref().ID() ||
 			!bytes.Equal(recovered.Ref().Capability(), reservation.Ref().Capability()) {
 			t.Fatalf("same-attempt recovery mismatch: found=%v err=%v", found, err)
 		}
 		if _, err := store.TryReserve(ctx, testScheduleCommand(t, "request-loser", "attempt-loser", "tenant-a"), id); !errors.Is(err, domain.ErrNoCapacity) {
 			t.Fatalf("last-slot loser: %v", err)
+		}
+	})
+
+	t.Run("concurrent last slot commits exactly once", func(t *testing.T) {
+		reset(t)
+		id := testIdentity(t, "pod-concurrent-last", 1)
+		seed(t, id)
+		commands := []domain.ScheduleCommand{
+			testScheduleCommand(t, "request-concurrent-a", "attempt-concurrent-a", "tenant-a"),
+			testScheduleCommand(t, "request-concurrent-b", "attempt-concurrent-b", "tenant-a"),
+		}
+		type reserveResult struct {
+			reservation domain.Reservation
+			err         error
+		}
+		start := make(chan struct{})
+		results := make(chan reserveResult, len(commands))
+		for index, command := range commands {
+			targetStore := store
+			if index == 1 {
+				targetStore = replicaStore
+			}
+			go func(command domain.ScheduleCommand) {
+				<-start
+				reservation, err := targetStore.TryReserve(ctx, command, id)
+				results <- reserveResult{reservation: reservation, err: err}
+			}(command)
+		}
+		close(start)
+		var committed, rejected int
+		for range commands {
+			result := <-results
+			switch {
+			case result.err == nil:
+				committed++
+			case errors.Is(result.err, domain.ErrNoCapacity):
+				rejected++
+			default:
+				t.Fatalf("concurrent reserve returned unexpected error: %v", result.err)
+			}
+		}
+		if committed != 1 || rejected != 1 {
+			t.Fatalf("concurrent reserve outcomes: committed=%d rejected=%d", committed, rejected)
+		}
+		var reservedSlots, activeGrants int
+		if err := pool.QueryRow(ctx, `SELECT reserved_slots FROM instance_capacity
+			WHERE cluster_id=$1 AND namespace=$2 AND logical_engine=$3 AND pod_uid=$4
+			  AND endpoint_epoch=$5 AND recovery_epoch=$6`,
+			id.Cluster(), id.Namespace(), id.LogicalEngine(), id.PodUID(),
+			id.EndpointEpoch(), id.RecoveryEpoch()).Scan(&reservedSlots); err != nil {
+			t.Fatal(err)
+		}
+		tenantHash := sha256.Sum256([]byte("tenant-a"))
+		if err := pool.QueryRow(ctx, `SELECT active_grants FROM tenant_counters
+			WHERE tenant_hash=$1`, tenantHash[:]).Scan(&activeGrants); err != nil {
+			t.Fatal(err)
+		}
+		if reservedSlots != 2 || activeGrants != 2 {
+			t.Fatalf("authoritative counters: reserved=%d active_grants=%d", reservedSlots, activeGrants)
 		}
 	})
 
@@ -141,6 +250,53 @@ func TestAuthoritativeLedgerCutover(t *testing.T) {
 		}
 	})
 
+	t.Run("drain activation serializes with blocked reserve", func(t *testing.T) {
+		reset(t)
+		id := testIdentity(t, "pod-drain-race", 1)
+		seed(t, id)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		var cluster string
+		if err := tx.QueryRow(ctx, `SELECT cluster_id FROM system_admission_state
+			WHERE cluster_id=$1 FOR UPDATE`, id.Cluster()).Scan(&cluster); err != nil {
+			t.Fatal(err)
+		}
+		var reserved int
+		if err := tx.QueryRow(ctx, `SELECT reserved_slots FROM instance_capacity
+			WHERE cluster_id=$1 AND namespace=$2 AND logical_engine=$3 AND pod_uid=$4
+			  AND endpoint_epoch=$5 AND recovery_epoch=$6 FOR UPDATE`,
+			id.Cluster(), id.Namespace(), id.LogicalEngine(), id.PodUID(),
+			id.EndpointEpoch(), id.RecoveryEpoch()).Scan(&reserved); err != nil {
+			t.Fatal(err)
+		}
+		command := testScheduleCommand(t, "request-drain-race", "attempt-drain-race", "tenant-a")
+		started := make(chan struct{})
+		reserveResult := make(chan error, 1)
+		go func() {
+			close(started)
+			_, err := replicaStore.TryReserve(ctx, command, id)
+			reserveResult <- err
+		}()
+		<-started
+		if _, err := tx.Exec(ctx, `INSERT INTO drain_intents(
+			drain_id,cluster_id,namespace,logical_engine,pod_uid,endpoint_epoch,recovery_epoch,
+			scope_kind,state,reason,writer_generation)
+			VALUES('drain-race-functional',$1,$2,$3,$4,$5,$6,'exact_identity','active','test',1)`,
+			id.Cluster(), id.Namespace(), id.LogicalEngine(), id.PodUID(),
+			id.EndpointEpoch(), id.RecoveryEpoch()); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-reserveResult; !errors.Is(err, domain.ErrNoCapacity) {
+			t.Fatalf("reserve crossed concurrent drain activation: %v", err)
+		}
+	})
+
 	t.Run("retained grant give-up and sweep", func(t *testing.T) {
 		reset(t)
 		id := testIdentity(t, "pod-retained", 1)
@@ -153,7 +309,9 @@ func TestAuthoritativeLedgerCutover(t *testing.T) {
 		if err := store.AbandonBeforeDispatch(ctx, reservation.Ref(), domain.RerankStaleTarget); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := pool.Exec(ctx, `UPDATE request_records SET classification_after=transaction_timestamp()-interval '1 second'
+		if _, err := pool.Exec(ctx, `UPDATE request_records
+			SET execution_deadline=transaction_timestamp()-interval '2 seconds',
+			    classification_after=transaction_timestamp()-interval '1 second'
 			WHERE request_id=$1`, cmd.RequestID()); err != nil {
 			t.Fatal(err)
 		}
@@ -221,7 +379,7 @@ func TestAuthoritativeLedgerCutover(t *testing.T) {
 		cmd, err := domain.NewScheduleCommand(domain.ScheduleParams{
 			RequestID: "request-rotation", AttemptID: "attempt-rotation", Tenant: "tenant-a",
 			DigestCandidates: []domain.RequestDigestCandidate{digest1, digest2}, DigestWriteVersion: 2,
-			Model: "model-a", SlotCost: 2, ExecutionBudget: time.Minute,
+			Model: "model-a", SlotCost: 2, Features: domain.EmptyFeatureSet(), ExecutionBudget: time.Minute,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -440,7 +598,7 @@ func testScheduleCommand(t *testing.T, requestID, attemptID, tenant string) doma
 	command, err := domain.NewScheduleCommand(domain.ScheduleParams{
 		RequestID: requestID, AttemptID: attemptID, Tenant: tenant,
 		DigestCandidates: []domain.RequestDigestCandidate{digest}, DigestWriteVersion: 1,
-		Model: "model-a", SlotCost: 2, ExecutionBudget: 5 * time.Minute,
+		Model: "model-a", SlotCost: 2, Features: domain.EmptyFeatureSet(), ExecutionBudget: 5 * time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("create schedule command: %v", err)
@@ -464,7 +622,7 @@ func testIdempotentScheduleCommand(t *testing.T, requestID, attemptID, tenant st
 		RequestID: requestID, AttemptID: attemptID, Tenant: tenant,
 		IdempotencyCandidates: []domain.IdempotencyLookupCandidate{lookup}, LookupWriteVersion: 1,
 		DigestCandidates: []domain.RequestDigestCandidate{digest}, DigestWriteVersion: 1,
-		Model: "model-a", SlotCost: 2, ExecutionBudget: 5 * time.Minute,
+		Model: "model-a", SlotCost: 2, Features: domain.EmptyFeatureSet(), ExecutionBudget: 5 * time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("create idempotent schedule command: %v", err)
