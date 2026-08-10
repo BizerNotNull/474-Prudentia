@@ -36,6 +36,12 @@ func (*barrierCatalog) AcquireControllerWriterGeneration(context.Context, string
 func (*barrierCatalog) ReplaceResourceProjection(context.Context, domain.WriterGeneration, domain.ResourceState) error {
 	return nil
 }
+func (*barrierCatalog) RecordObservation(context.Context, domain.WriterGeneration, domain.Observation) (domain.StoredSourceStamp, bool, error) {
+	return domain.StoredSourceStamp{}, true, nil
+}
+func (*barrierCatalog) SyncCapacityProjection(context.Context, domain.WriterGeneration, domain.ProjectionUpdate) (domain.ProjectionVersion, error) {
+	return domain.ProjectionVersion(1), nil
+}
 func (c *barrierCatalog) ListIncompleteWorkloadOperations(context.Context, domain.WriterGeneration) ([]domain.WorkloadOperation, error) {
 	return []domain.WorkloadOperation{c.op}, nil
 }
@@ -62,7 +68,7 @@ func (c *barrierCatalog) RecordWorkloadVictims(context.Context, domain.WriterGen
 	c.victimsRecorded = true
 	return nil
 }
-func (c *barrierCatalog) CompleteWorkloadOperationAndReopen(context.Context, domain.WriterGeneration, domain.WorkloadOperationRef) error {
+func (c *barrierCatalog) CompleteWorkloadOperationAndReopen(context.Context, domain.WriterGeneration, domain.WorkloadCompletionProof) error {
 	c.event("reopen")
 	if !c.admissionClosed || !c.proofRecorded || !c.victimsRecorded {
 		return errors.New("incomplete handoff proof")
@@ -75,6 +81,9 @@ func (c *barrierCatalog) BeginFleetRecovery(context.Context, domain.WriterGenera
 	c.admissionClosed = true
 	c.reopened = false
 	return nil
+}
+func (c *barrierCatalog) ObserveFleetRebuild(ctx context.Context, generation domain.WriterGeneration, epoch domain.RecoveryEpoch) (domain.FleetRebuildProof, error) {
+	return c.control.ObserveFleetRebuild(ctx, generation, epoch)
 }
 func (c *barrierCatalog) CompleteFleetRecovery(_ context.Context, _ domain.WriterGeneration, proof domain.FleetRebuildProof) error {
 	c.event("recovery-reopen")
@@ -106,6 +115,15 @@ func (*barrierControl) ListKeys(context.Context) ([]domain.ResourceKey, error) {
 func (*barrierControl) Reconcile(context.Context, domain.ResourceKey) (domain.ResourceState, error) {
 	return domain.ResourceState{}, nil
 }
+func (*barrierControl) ReadDesired(context.Context, domain.ResourceKey) (domain.DesiredModel, error) {
+	return domain.DesiredModel{}, nil
+}
+func (*barrierControl) ReconcileDiscovery(context.Context, domain.ResourceKey, domain.WriterGeneration) ([]domain.Observation, error) {
+	return nil, nil
+}
+func (*barrierControl) ApplyDesired(context.Context, domain.DesiredModel) (domain.ApplyResult, error) {
+	return domain.ApplyResult{}, nil
+}
 func (c *barrierControl) InstallWorkloadOperationBarrier(context.Context, domain.WorkloadOperation, domain.WorkloadRef, []domain.PodRef) (domain.WorkloadBarrierProof, error) {
 	c.mu.Lock()
 	c.currentToken = c.proof.Operation().Token()
@@ -114,6 +132,9 @@ func (c *barrierControl) InstallWorkloadOperationBarrier(context.Context, domain
 }
 func (c *barrierControl) ObserveWorkloadVictims(context.Context, domain.WorkloadOperationRef, domain.PodUIDSet) (domain.WorkloadVictimObservation, error) {
 	return c.victims, nil
+}
+func (c *barrierControl) BuildWorkloadCompletionProof(context.Context, domain.WorkloadBarrierProof, domain.WorkloadVictimObservation) (domain.WorkloadCompletionProof, error) {
+	return domain.NewWorkloadCompletionProof(domain.WorkloadCompletionProofParams{Barrier: c.proof, Victims: c.victims, Current: c.workload, CurrentPods: []domain.PodRef{c.pod}, DesiredReplicas: c.workload.Replicas(), CompletedAt: time.Unix(103, 0).UTC()})
 }
 func (c *barrierControl) RollManagedFleet(context.Context, domain.RecoveryEpoch) error {
 	c.rollSeen = true
@@ -148,6 +169,17 @@ type noopReadiness struct{}
 
 func (noopReadiness) SetReady(bool) {}
 
+type noopProvider struct{}
+
+func (noopProvider) ProbeTarget(context.Context, domain.BackendProjection) (domain.ProbeTarget, error) {
+	return domain.ProbeTarget{}, nil
+}
+func (noopProvider) Probe(context.Context, domain.ProbeTarget) (domain.RuntimeHealthObservation, error) {
+	return domain.RuntimeHealthObservation{}, nil
+}
+func (noopProvider) ScrapeLoad(context.Context, domain.ProbeTarget) (domain.LoadObservation, error) {
+	return domain.LoadObservation{}, nil
+}
 func controllerFixture(t *testing.T) (*controllerapp.Controller, *barrierCatalog, *barrierControl, domain.WriterGeneration, domain.WorkloadRef) {
 	t.Helper()
 	resource, err := domain.NewResourceRef(domain.ResourceRefParams{Cluster: "cluster", Namespace: "models", Name: "engine", UID: "workload-uid", ResourceVersion: "10"})
@@ -170,7 +202,7 @@ func controllerFixture(t *testing.T) (*controllerapp.Controller, *barrierCatalog
 	victims, _ := domain.NewWorkloadVictimObservation(domain.WorkloadVictimObservationParams{Operation: op.Ref(), Workload: workload, Before: before, Terminating: empty, Disappeared: empty, Surviving: before, ObservedAt: time.Unix(102, 0).UTC()})
 	control := &barrierControl{workload: workload, pod: pod, proof: proof, victims: victims, currentToken: "old-token", releaseOld: make(chan struct{}), oldResult: make(chan error, 1)}
 	catalog := &barrierCatalog{op: op, control: control}
-	controller, err := controllerapp.New("cluster", "holder", 1, 4, catalog, control, noopElector{}, noopReadiness{})
+	controller, err := controllerapp.New("cluster", "holder", 1, 4, catalog, control, noopElector{}, noopReadiness{}, noopProvider{})
 	if err != nil {
 		t.Fatal(err)
 	}

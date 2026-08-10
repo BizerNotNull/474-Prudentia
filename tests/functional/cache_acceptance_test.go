@@ -11,11 +11,11 @@ import (
 	"github.com/BizerNotNull/474-Prudentia/internal/domain"
 )
 
-func cacheParams(tenant string, version uint32, hmacByte byte) domain.CacheIdentityParams {
+func cacheParams(tenant string, version uint32, hmacByte byte, manifest domain.CapabilityManifest) domain.CacheIdentityParams {
 	return domain.CacheIdentityParams{
 		Tenant: tenant, HMACVersion: version, TenantHMAC: []byte(strings.Repeat(string(hmacByte), 32)),
 		ProviderImageDigest: "sha256:" + strings.Repeat("a", 64), ProxyDigest: "sha256:" + strings.Repeat("b", 64), ManifestID: "manifest-v1",
-		ConnectorManifestDigest: "sha256:" + strings.Repeat("c", 64), ManifestSchemaVersion: 1, CapabilityVersion: 1,
+		ProviderManifestDigest: manifest.PayloadDigestString(), ConnectorManifestDigest: "sha256:" + strings.Repeat("c", 64), ManifestSchemaVersion: 1, CapabilityVersion: 1,
 		ModelFingerprint: "sha256:" + strings.Repeat("d", 64), TokenizerFingerprint: "sha256:" + strings.Repeat("e", 64), ModelConfigDigest: "sha256:" + strings.Repeat("f", 64),
 		CacheFormatVersion: 1, CacheContentVersion: 1, AttentionBackend: "flash", DType: "bf16", Quantization: "none", TensorParallel: 1, DataParallel: 1,
 		GPUArchitecture: "sm90", DriverVersion: "550", CacheLayout: "paged", BlockSize: 16,
@@ -52,11 +52,12 @@ func TestCacheCompatibilityAndRotationFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	manifest := cacheManifest(t, now)
 	source := cacheWorkload(t, "pod-a")
-	v1 := cacheIdentity(t, cacheParams("tenant-a", 1, 'a'))
-	v2 := cacheIdentity(t, cacheParams("tenant-a", 2, 'b'))
-	otherTenant := cacheIdentity(t, cacheParams("tenant-b", 2, 'b'))
-	if err := metadata.RecordVerified(v1, source, cacheManifest(t, now), now.Add(time.Minute)); err != nil {
+	v1 := cacheIdentity(t, cacheParams("tenant-a", 1, 'a', manifest))
+	v2 := cacheIdentity(t, cacheParams("tenant-a", 2, 'b', manifest))
+	otherTenant := cacheIdentity(t, cacheParams("tenant-b", 2, 'b', manifest))
+	if err := metadata.RecordVerified(v1, source, manifest, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if hit, err := metadata.Lookup(context.Background(), v1); err != nil || !hit.IsHit() {
@@ -65,7 +66,7 @@ func TestCacheCompatibilityAndRotationFailClosed(t *testing.T) {
 	if hit, err := metadata.Lookup(context.Background(), v2); err != nil || hit.IsHit() {
 		t.Fatalf("unrecorded v2 lookup = hit:%v err:%v", hit.IsHit(), err)
 	}
-	if err := metadata.RecordVerified(v2, source, cacheManifest(t, now), now.Add(time.Minute)); err != nil {
+	if err := metadata.RecordVerified(v2, source, manifest, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if hit, err := metadata.Lookup(context.Background(), v2); err != nil || !hit.IsHit() {
@@ -82,9 +83,10 @@ func TestCacheCompatibilityAndRotationFailClosed(t *testing.T) {
 
 func TestCacheOutageFallsBackColdUnlessCompatibilityRequired(t *testing.T) {
 	now := time.Unix(2000, 0).UTC()
-	identity := cacheIdentity(t, cacheParams("tenant-a", 1, 'a'))
+	manifest := cacheManifest(t, now)
+	identity := cacheIdentity(t, cacheParams("tenant-a", 1, 'a', manifest))
 	targetIdentity := cacheWorkload(t, "pod-target")
-	target, err := domain.NewReservedTarget("tenant-a", targetIdentity, cacheManifest(t, now), identity)
+	target, err := domain.NewReservedTarget("tenant-a", targetIdentity, manifest, identity)
 	if err != nil {
 		t.Fatal(err)
 	}
