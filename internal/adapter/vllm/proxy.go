@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -68,9 +69,10 @@ func loadProxyCertPool(path string) (*x509.CertPool, error) {
 }
 
 func NewIdentityProxy(config IdentityProxyConfig) (*IdentityProxy, error) {
-	if config.Upstream == nil || config.Upstream.Scheme != "http" || config.Upstream.User != nil || config.Upstream.RawQuery != "" || config.Upstream.Fragment != "" || config.Upstream.Path != "" || config.MaxRequestBytes < 1 || config.MaxRequestBytes > 16<<20 || config.ServerRoots == nil || config.GatewayClientRoots == nil || len(config.Certificate.Certificate) == 0 || len(config.AllowedGatewaySPIFFEIDs) == 0 {
+	if !validIdentityProxyUpstream(config.Upstream) || config.MaxRequestBytes < 1 || config.MaxRequestBytes > 16<<20 || config.ServerRoots == nil || config.GatewayClientRoots == nil || len(config.Certificate.Certificate) == 0 || len(config.AllowedGatewaySPIFFEIDs) == 0 {
 		return nil, errors.New("invalid identity proxy configuration")
 	}
+	upstream := *config.Upstream
 	allowed := make(map[string]struct{}, len(config.AllowedGatewaySPIFFEIDs))
 	for _, raw := range config.AllowedGatewaySPIFFEIDs {
 		identity, err := url.Parse(raw)
@@ -92,8 +94,8 @@ func NewIdentityProxy(config IdentityProxyConfig) (*IdentityProxy, error) {
 	}
 	reverse := &httputil.ReverseProxy{
 		Rewrite: func(request *httputil.ProxyRequest) {
-			request.SetURL(config.Upstream)
-			request.Out.Host = config.Upstream.Host
+			request.SetURL(&upstream)
+			request.Out.Host = upstream.Host
 			request.Out.Header.Del("Forwarded")
 			request.Out.Header.Del("X-Forwarded-For")
 			request.Out.Header.Del("X-Forwarded-Host")
@@ -130,6 +132,21 @@ func NewIdentityProxy(config IdentityProxyConfig) (*IdentityProxy, error) {
 		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13,
 		VerifyConnection: func(state tls.ConnectionState) error { return verifyAllowedGateway(state, allowed) },
 	}}, nil
+}
+
+func validIdentityProxyUpstream(upstream *url.URL) bool {
+	if upstream == nil || upstream.Scheme != "http" || upstream.User != nil || upstream.RawQuery != "" || upstream.Fragment != "" || upstream.Path != "" || upstream.Opaque != "" {
+		return false
+	}
+	host := upstream.Hostname()
+	if host == "" || upstream.Port() == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	address := net.ParseIP(host)
+	return address != nil && address.IsLoopback()
 }
 
 func verifyConfiguredProxyCertificate(certificate tls.Certificate, roots *x509.CertPool) (*x509.Certificate, [][]*x509.Certificate, error) {

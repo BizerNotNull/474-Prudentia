@@ -43,6 +43,7 @@ func TestIdentityProxyForwardsOnlyBoundedAllowlistedRequests(t *testing.T) {
 	defer upstream.Close()
 	upstreamURL, _ := url.Parse(upstream.URL)
 	proxy, _ := identityProxyFixture(t, upstreamURL)
+	upstreamURL.Host = "127.0.0.1:1"
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
 	response := httptest.NewRecorder()
@@ -69,6 +70,13 @@ func TestIdentityProxyForwardsOnlyBoundedAllowlistedRequests(t *testing.T) {
 func TestIdentityProxyRejectsManifestAndGatewayIdentityMismatch(t *testing.T) {
 	upstreamURL, _ := url.Parse("http://127.0.0.1:8000")
 	_, config := identityProxyFixture(t, upstreamURL)
+	for _, raw := range []string{"http://example.com:8000", "http://127.0.0.1", "https://127.0.0.1:8000"} {
+		config.Upstream, _ = url.Parse(raw)
+		if _, err := NewIdentityProxy(config); err == nil {
+			t.Fatalf("proxy accepted unsafe upstream %q", raw)
+		}
+	}
+	config.Upstream = upstreamURL
 	config.ManifestID = "other"
 	if _, err := NewIdentityProxy(config); err == nil {
 		t.Fatal("proxy accepted certificate for another manifest")
