@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/BizerNotNull/474-Prudentia/internal/auth"
 	"github.com/BizerNotNull/474-Prudentia/internal/domain"
 	requestapp "github.com/BizerNotNull/474-Prudentia/internal/request"
 )
@@ -17,6 +18,7 @@ type Gateway struct {
 	APIKey              string
 	Tenant              string
 	Models              []string
+	OIDCIssuers         []auth.OIDCConfig
 	SchedulerAddress    string
 	SchedulerServerName string
 	SchedulerCAFile     string
@@ -33,6 +35,21 @@ func LoadGatewayFromEnv() (Gateway, error) {
 		ListenAddress: strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_LISTEN")),
 		APIKey:        os.Getenv("PRUDENTIA_GATEWAY_API_KEY"),
 		Tenant:        strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_TENANT")),
+	}
+	oidcIssuer := strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_OIDC_ISSUER"))
+	oidcAudience := strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_OIDC_AUDIENCE"))
+	oidcJWKSURL := strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_OIDC_JWKS_URL"))
+	oidcTenantClaim := strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_OIDC_TENANT_CLAIM"))
+	oidcModelsClaim := strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_OIDC_MODELS_CLAIM"))
+	oidcConfigured := oidcIssuer != "" || oidcAudience != "" || oidcJWKSURL != "" || oidcTenantClaim != "" || oidcModelsClaim != ""
+	if oidcConfigured {
+		if oidcIssuer == "" || oidcAudience == "" || oidcJWKSURL == "" {
+			return Gateway{}, errors.New("gateway OIDC issuer, audience, and JWKS URL must be configured together")
+		}
+		cfg.OIDCIssuers = []auth.OIDCConfig{{
+			Issuer: oidcIssuer, Audience: oidcAudience, JWKSURL: oidcJWKSURL,
+			TenantClaim: oidcTenantClaim, ModelsClaim: oidcModelsClaim,
+		}}
 	}
 	cfg.SchedulerAddress = strings.TrimSpace(os.Getenv("PRUDENTIA_SCHEDULER_ADDRESS"))
 	cfg.SchedulerServerName = strings.TrimSpace(os.Getenv("PRUDENTIA_SCHEDULER_SERVER_NAME"))
@@ -81,11 +98,18 @@ func LoadGatewayFromEnv() (Gateway, error) {
 	if _, _, err := net.SplitHostPort(cfg.SchedulerAddress); err != nil {
 		return Gateway{}, errors.New("invalid scheduler address")
 	}
-	if len(cfg.APIKey) < 16 || len(cfg.APIKey) > 512 {
-		return Gateway{}, errors.New("gateway API key must contain 16 to 512 bytes")
+	if cfg.APIKey != "" {
+		if len(cfg.APIKey) < 16 || len(cfg.APIKey) > 512 {
+			return Gateway{}, errors.New("gateway API key must contain 16 to 512 bytes")
+		}
+		if cfg.Tenant == "" || len(cfg.Models) == 0 {
+			return Gateway{}, errors.New("gateway tenant and model allowlist are required with an API key")
+		}
+	} else if cfg.Tenant != "" || len(cfg.Models) != 0 {
+		return Gateway{}, errors.New("gateway tenant and model allowlist require an API key")
 	}
-	if cfg.Tenant == "" || len(cfg.Models) == 0 {
-		return Gateway{}, errors.New("gateway tenant and model allowlist are required")
+	if cfg.APIKey == "" && len(cfg.OIDCIssuers) == 0 {
+		return Gateway{}, errors.New("gateway API key or OIDC configuration is required")
 	}
 	if cfg.SchedulerServerName == "" || cfg.SchedulerCAFile == "" || cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" || cfg.ProviderCAFile == "" || cfg.ProviderTrustDomain == "" {
 		return Gateway{}, errors.New("gateway scheduler and provider TLS configuration is required")

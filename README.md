@@ -68,6 +68,14 @@ Gateway configuration:
 PRUDENTIA_GATEWAY_API_KEY=<at-least-16-byte-secret>
 PRUDENTIA_GATEWAY_TENANT=<tenant>
 PRUDENTIA_GATEWAY_MODELS=<comma-separated-model-allowlist>
+
+# Alternatively, omit the three API-key variables above and configure OIDC:
+PRUDENTIA_GATEWAY_OIDC_ISSUER=https://issuer.example/realms/prudentia
+PRUDENTIA_GATEWAY_OIDC_AUDIENCE=prudentia-gateway
+PRUDENTIA_GATEWAY_OIDC_JWKS_URL=https://issuer.example/realms/prudentia/keys
+# Optional claim names; defaults are "tenant" and "models":
+PRUDENTIA_GATEWAY_OIDC_TENANT_CLAIM=organization
+PRUDENTIA_GATEWAY_OIDC_MODELS_CLAIM=allowed_models
 PRUDENTIA_GATEWAY_LISTEN=127.0.0.1:8080
 PRUDENTIA_SCHEDULER_ADDRESS=127.0.0.1:9090
 PRUDENTIA_SCHEDULER_SERVER_NAME=<scheduler-certificate-dns-name>
@@ -82,6 +90,12 @@ PRUDENTIA_GATEWAY_REQUEST_DIGEST_KEYS=1:<base64-encoded-32-byte-key>
 PRUDENTIA_GATEWAY_REQUEST_DIGEST_WRITE_VERSION=1
 go run ./cmd/gateway
 ```
+
+The gateway accepts a static API key, OIDC bearer tokens, or both. OIDC issuer,
+audience, and JWKS URL must be configured together and must use authenticated
+HTTPS endpoints. Each accepted token must carry a nonempty tenant claim and a
+bounded, nonempty model allowlist claim; the gateway maps those claims into the
+same authorization policy used for API keys.
 
 Keyrings are comma-separated `version:base64-key` entries with at most four
 retained versions. The configured write versions must be present and must
