@@ -8,11 +8,13 @@ The repository is currently an architecture-first Go scaffold. Do not invent com
 
 ## Project
 
-Prudentia is a single-cluster inference control layer for Kubernetes-hosted vLLM. It has three continuously running binaries:
+Prudentia has three continuously running control-plane binaries:
 
 - `cmd/gateway`: public HTTP ingress and synchronous response owner.
 - `cmd/scheduler`: internal scheduling gRPC service and separately addressed privileged admin service.
 - `cmd/controller`: Kubernetes observer and level reconciler.
+
+The repository also ships `cmd/identity-proxy`, a per-Pod data-plane sidecar that terminates exact-workload mTLS and forwards only allowlisted requests to loopback vLLM. It is not a control-plane service or transactional authority.
 
 PostgreSQL is the authoritative transactional ledger. Kubernetes observations, process memory, telemetry, and provider metrics are not transactional authority.
 

@@ -55,7 +55,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	authenticator, err := auth.NewAuthenticator([]auth.APIKey{{Token: cfg.APIKey, Tenant: cfg.Tenant, Models: cfg.Models}})
+	var apiKeys []auth.APIKey
+	if cfg.APIKey != "" {
+		apiKeys = []auth.APIKey{{Token: cfg.APIKey, Tenant: cfg.Tenant, Models: cfg.Models}}
+	}
+	authenticator, err := auth.NewAuthenticatorWithOIDC(apiKeys, cfg.OIDCIssuers)
 	if err != nil {
 		return err
 	}

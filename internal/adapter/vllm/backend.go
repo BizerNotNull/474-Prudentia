@@ -55,7 +55,7 @@ type ExactManifestProber struct {
 
 func NewExactManifestProber(backend *Backend, manifest domain.CapabilityManifest) (*ExactManifestProber, error) {
 	if backend == nil || !manifest.ValidAt(backend.config.Now()) ||
-		!contains(manifest.Routes(), "/health") || !contains(manifest.Routes(), "/metrics") ||
+		!contains(manifest.Routes(), healthPath) || !contains(manifest.Routes(), metricsPath) ||
 		!manifest.Supports(domain.CapabilityMetrics) ||
 		!contains(manifest.Metrics(), "vllm:num_requests_running") ||
 		!contains(manifest.Metrics(), "vllm:num_requests_waiting") {
@@ -117,14 +117,14 @@ func exactManifest(left, right domain.CapabilityManifest) bool {
 }
 
 func (b *Backend) Infer(ctx context.Context, call domain.BackendCall, sink publichttp.StreamSink) (domain.TerminalProof, error) {
-	if sink == nil || !call.Manifest().ValidAt(b.config.Now()) || !contains(call.Manifest().Routes(), "/v1/chat/completions") {
+	if sink == nil || !call.Manifest().ValidAt(b.config.Now()) || !contains(call.Manifest().Routes(), chatCompletionsPath) {
 		return 0, errors.New("invalid or expired inference capability")
 	}
 	payload, err := encodeBoundRequest(call)
 	if err != nil {
 		return 0, err
 	}
-	response, err := b.do(ctx, http.MethodPost, call.Target(), call.Manifest(), "/v1/chat/completions", bytes.NewReader(payload), int64(len(payload)), "application/json", "text/event-stream, application/json")
+	response, err := b.do(ctx, chatCompletionsMethod, call.Target(), call.Manifest(), chatCompletionsPath, bytes.NewReader(payload), int64(len(payload)), "application/json", "text/event-stream, application/json")
 	if err != nil {
 		return 0, err
 	}
@@ -310,10 +310,10 @@ func (b *Backend) decodeJSON(ctx context.Context, body io.Reader, sink publichtt
 }
 
 func (b *Backend) Probe(ctx context.Context, target domain.ProbeTarget) (domain.RuntimeHealthObservation, error) {
-	if !target.Manifest().ValidAt(b.config.Now()) || !contains(target.Manifest().Routes(), "/health") {
+	if !target.Manifest().ValidAt(b.config.Now()) || !contains(target.Manifest().Routes(), healthPath) {
 		return domain.RuntimeHealthObservation{}, ErrUnsupported
 	}
-	response, err := b.do(ctx, http.MethodGet, target.Target(), target.Manifest(), "/health", nil, 0, "", "application/json")
+	response, err := b.do(ctx, healthMethod, target.Target(), target.Manifest(), healthPath, nil, 0, "", "application/json")
 	if err != nil {
 		return domain.RuntimeHealthObservation{}, err
 	}
@@ -338,10 +338,10 @@ func (b *Backend) Probe(ctx context.Context, target domain.ProbeTarget) (domain.
 
 func (b *Backend) ScrapeLoad(ctx context.Context, target domain.ProbeTarget) (domain.LoadObservation, error) {
 	manifest := target.Manifest()
-	if !manifest.ValidAt(b.config.Now()) || !manifest.Supports(domain.CapabilityMetrics) || !contains(manifest.Routes(), "/metrics") {
+	if !manifest.ValidAt(b.config.Now()) || !manifest.Supports(domain.CapabilityMetrics) || !contains(manifest.Routes(), metricsPath) {
 		return domain.LoadObservation{}, ErrUnsupported
 	}
-	response, err := b.do(ctx, http.MethodGet, target.Target(), manifest, "/metrics", nil, 0, "", "text/plain")
+	response, err := b.do(ctx, metricsMethod, target.Target(), manifest, metricsPath, nil, 0, "", "text/plain")
 	if err != nil {
 		return domain.LoadObservation{}, err
 	}
@@ -387,9 +387,8 @@ func parseLoad(data []byte, identity domain.WorkloadIdentity, allowed []string, 
 
 func (b *Backend) Terminate(ctx context.Context, req domain.ProviderRequestRef) (domain.ProviderTerminationProof, error) {
 	manifest := req.Manifest()
-	const route = "/v1/prudentia/terminate"
 	now := b.config.Now()
-	if b.config.ResolveEndpoint == nil || !manifest.ValidAt(now) || !manifest.Supports(domain.CapabilityTermination) || !contains(manifest.Routes(), route) || !now.Before(req.ExpiresAt()) {
+	if b.config.ResolveEndpoint == nil || !manifest.ValidAt(now) || !manifest.Supports(domain.CapabilityTermination) || !contains(manifest.Routes(), terminationPath) || !now.Before(req.ExpiresAt()) {
 		return domain.ProviderTerminationProof{}, ErrUnsupported
 	}
 	endpoint, err := b.config.ResolveEndpoint(req.Target())
@@ -411,7 +410,7 @@ func (b *Backend) Terminate(ctx context.Context, req domain.ProviderRequestRef) 
 	if err != nil {
 		return domain.ProviderTerminationProof{}, err
 	}
-	response, err := b.do(ctx, http.MethodPost, target, manifest, route, bytes.NewReader(payload), int64(len(payload)), "application/json", "application/json")
+	response, err := b.do(ctx, terminationMethod, target, manifest, terminationPath, bytes.NewReader(payload), int64(len(payload)), "application/json", "application/json")
 	if err != nil {
 		return domain.ProviderTerminationProof{}, err
 	}
