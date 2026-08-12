@@ -394,7 +394,7 @@ type InstanceSnapshot struct {
 }
 
 func NewInstanceSnapshot(p SnapshotParams) (InstanceSnapshot, error) {
-	if !p.Identity.valid() || p.Endpoint.value == "" || p.Model.model.value == "" || !p.Capabilities.Valid() || !p.HealthState.valid() || !p.DrainState.valid() || p.ConfiguredSlots == 0 || uint64(p.ReservedSlots)+uint64(p.OrphanedSlots) > uint64(p.ConfiguredSlots) || p.ProjectionVersion == 0 || p.CatalogAsOf.IsZero() || p.CatalogAsOf.After(time.Now()) {
+	if !p.Identity.valid() || p.Endpoint.value == "" || p.Model.model.value == "" || !p.Capabilities.Valid() || !p.HealthState.valid() || !p.DrainState.valid() || p.ConfiguredSlots == 0 || uint64(p.ReservedSlots)+uint64(p.OrphanedSlots) > uint64(p.ConfiguredSlots) || p.ProjectionVersion == 0 || p.CatalogAsOf.IsZero() {
 		return InstanceSnapshot{}, fmt.Errorf("invalid instance snapshot")
 	}
 	if p.Structural.source.kind != SourceStructural || p.Health.source.kind != SourceRuntimeHealth || (p.HasLoadStamp && p.Load.source.kind != SourceLoad) || !p.Structural.validAt(p.Identity, p.CatalogAsOf) || !p.Health.validAt(p.Identity, p.CatalogAsOf) || (p.HasLoadStamp && !p.Load.validAt(p.Identity, p.CatalogAsOf)) || p.HasAdvisoryLoad != p.HasLoadStamp {
@@ -439,7 +439,7 @@ type CandidateCatalog struct {
 }
 
 func NewCandidateCatalog(candidates []InstanceSnapshot, asOf time.Time) (CandidateCatalog, error) {
-	if asOf.IsZero() || asOf.After(time.Now()) || len(candidates) > MaxCatalogCandidates {
+	if asOf.IsZero() || len(candidates) > MaxCatalogCandidates {
 		return CandidateCatalog{}, fmt.Errorf("invalid candidate catalog")
 	}
 	cloned := append([]InstanceSnapshot(nil), candidates...)

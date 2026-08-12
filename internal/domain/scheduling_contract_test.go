@@ -98,3 +98,26 @@ func TestSnapshotAndCatalogCopyCacheHints(t *testing.T) {
 		t.Fatal("catalog changed through nested alias")
 	}
 }
+
+func TestSnapshotAcceptsDatabaseTimeAheadOfProcessClock(t *testing.T) {
+	asOf := time.Now().Add(time.Minute).UTC()
+	identity, _ := NewWorkloadIdentity(WorkloadIdentityParams{Cluster: "cluster", Namespace: "ns", LogicalEngine: "engine", PodUID: "pod", EndpointEpoch: 1, RecoveryEpoch: 1})
+	endpoint, _ := NewEndpointRef("https://engine.test")
+	model, _ := NewModelKey("model")
+	fingerprint, _ := NewModelFingerprint(model, "revision")
+	structuralSource, _ := NewSourceStamp(SourceStructural, 1, 1)
+	healthSource, _ := NewSourceStamp(SourceRuntimeHealth, 1, 1)
+	structural, _ := NewStoredSourceStamp(StoredSourceStampParams{Source: structuralSource, Identity: identity, Version: 1, AcceptedAt: asOf.Add(-time.Second), ExpiresAt: asOf.Add(time.Minute)})
+	health, _ := NewStoredSourceStamp(StoredSourceStampParams{Source: healthSource, Identity: identity, Version: 1, AcceptedAt: asOf.Add(-time.Second), ExpiresAt: asOf.Add(time.Minute)})
+	snapshot, err := NewInstanceSnapshot(SnapshotParams{
+		Identity: identity, Endpoint: endpoint, Model: fingerprint, Capabilities: EmptyFeatureSet(),
+		Structural: structural, Health: health, HealthState: HealthStateHealthy, DrainState: DrainStateReady,
+		ConfiguredSlots: 1, ProjectionVersion: 1, CatalogAsOf: asOf,
+	})
+	if err != nil {
+		t.Fatalf("database-authoritative catalog time was compared with process clock: %v", err)
+	}
+	if _, err := NewCandidateCatalog([]InstanceSnapshot{snapshot}, asOf); err != nil {
+		t.Fatalf("database-authoritative catalog time was compared with process clock: %v", err)
+	}
+}
