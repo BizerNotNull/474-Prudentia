@@ -4,6 +4,7 @@ package integration_test
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -34,8 +35,8 @@ func TestColdInferenceThroughExactIdentityProxy(t *testing.T) {
 		"POD_NAMESPACE":                              coldNamespace,
 		"PRUDENTIA_LOGICAL_ENGINE":                   coldEngine,
 		"POD_UID":                                    coldPodUID,
-		"PRUDENTIA_ENDPOINT_EPOCH":                   "1",
-		"PRUDENTIA_RECOVERY_EPOCH":                   "1",
+		"PRUDENTIA_ENDPOINT_EPOCH":                   strconv.FormatUint(coldEndpointEpoch, 10),
+		"PRUDENTIA_RECOVERY_EPOCH":                   strconv.FormatUint(coldRecoveryEpoch, 10),
 	})
 	waitForTCP(t, "identity-proxy", proxyAddress, proxy)
 	seedColdBackend(t, pool, addressURL("https", proxyAddress), manifest)
@@ -71,10 +72,10 @@ func TestColdInferenceThroughExactIdentityProxy(t *testing.T) {
 		"PRUDENTIA_PROVIDER_MANIFEST_ID":                     coldManifestID,
 		"PRUDENTIA_PROVIDER_MANIFEST_PUBLIC_KEY":             manifest.publicKeyBase64,
 		"PRUDENTIA_PROVIDER_MANIFEST_PIN":                    manifest.pin,
-		"PRUDENTIA_GATEWAY_IDEMPOTENCY_LOOKUP_KEYS":          "1:" + base64Key(0x21),
-		"PRUDENTIA_GATEWAY_IDEMPOTENCY_LOOKUP_WRITE_VERSION": "1",
-		"PRUDENTIA_GATEWAY_REQUEST_DIGEST_KEYS":              "1:" + base64Key(0x31),
-		"PRUDENTIA_GATEWAY_REQUEST_DIGEST_WRITE_VERSION":     "1",
+		"PRUDENTIA_GATEWAY_IDEMPOTENCY_LOOKUP_KEYS":          strconv.Itoa(coldVersions.lookupWrite) + ":" + base64Key(0x21),
+		"PRUDENTIA_GATEWAY_IDEMPOTENCY_LOOKUP_WRITE_VERSION": strconv.Itoa(coldVersions.lookupWrite),
+		"PRUDENTIA_GATEWAY_REQUEST_DIGEST_KEYS":              strconv.Itoa(coldVersions.digestWrite) + ":" + base64Key(0x31),
+		"PRUDENTIA_GATEWAY_REQUEST_DIGEST_WRITE_VERSION":     strconv.Itoa(coldVersions.digestWrite),
 	})
 	publicClient := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: 30 * time.Second}
 	gatewayURL := addressURL("http", gatewayAddress)
