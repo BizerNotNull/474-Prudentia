@@ -13,8 +13,18 @@ Pinned development and test versions live in `.github/versions.env`:
   pinned image through the Go test harness. Tests must wait for readiness and
   register container cleanup with `testing.T`; Docker Compose is not part of
   the test path.
+- The cold-inference integration test uses the digest-pinned
+  `llm-d-inference-sim` image in `.github/versions.env`, in deterministic echo
+  mode with a dummy model and no GPU or model download.
 
 CI rejects unformatted Go files, then runs `go test ./...` and `go vet ./...`.
+Its separate cold-path job starts PostgreSQL and `llm-d-inference-sim`, builds
+the real gateway, scheduler, and identity-proxy binaries, and exercises
+streaming and bounded nonstreaming requests with the official OpenAI Go client:
+
+```text
+go test -tags=integration ./tests/integration -run '^TestColdInferenceThroughExactIdentityProxy$' -count=1 -timeout=12m
+```
 
 Regenerate the scheduler protobuf bindings with:
 

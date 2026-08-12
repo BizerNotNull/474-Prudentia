@@ -76,6 +76,31 @@ func projectInTx(ctx context.Context, tx pgx.Tx, id domain.WorkloadIdentity, asO
 	if err != nil {
 		return domain.InstanceSnapshot{}, err
 	}
+	var chat, streaming, usage bool
+	if err := tx.QueryRow(ctx, `SELECT
+			m.supported_routes ? '/v1/chat/completions',
+			m.supported_fields ? 'stream',
+			m.supported_fields ? 'stream_options'
+		FROM instance_projections p
+		JOIN capability_manifests m
+		  ON m.manifest_id=p.capability_manifest_id
+		 AND m.manifest_version=p.capability_manifest_version
+		WHERE p.cluster_id=$1 AND p.namespace=$2 AND p.logical_engine=$3
+		  AND p.pod_uid=$4 AND p.endpoint_epoch=$5 AND p.recovery_epoch=$6`,
+		identityArgs(id)...).Scan(&chat, &streaming, &usage); err != nil {
+		return domain.InstanceSnapshot{}, fmt.Errorf("read projected capabilities: %w", err)
+	}
+	var featureBits uint64
+	if chat && streaming {
+		featureBits |= 1 << domain.FeatureStreaming
+	}
+	if chat && streaming && usage {
+		featureBits |= 1 << domain.FeatureUsage
+	}
+	capabilities, err := domain.NewFeatureSet(domain.FeatureVersion1, featureBits)
+	if err != nil {
+		return domain.InstanceSnapshot{}, err
+	}
 	structuralStamp, err := storedStamp(structural, domain.SourceStructural, id)
 	if err != nil {
 		return domain.InstanceSnapshot{}, err
@@ -84,7 +109,7 @@ func projectInTx(ctx context.Context, tx pgx.Tx, id domain.WorkloadIdentity, asO
 	if err != nil {
 		return domain.InstanceSnapshot{}, err
 	}
-	params := domain.SnapshotParams{Identity: id, Endpoint: endpoint, Model: model, Capabilities: domain.EmptyFeatureSet(), Structural: structuralStamp, Health: healthStamp, HealthState: domain.HealthState(healthPayload.State), DrainState: domain.DrainReady, ConfiguredSlots: physical, ReservedSlots: reserved, OrphanedSlots: orphaned, ProjectionVersion: version, CatalogAsOf: asOf}
+	params := domain.SnapshotParams{Identity: id, Endpoint: endpoint, Model: model, Capabilities: capabilities, Structural: structuralStamp, Health: healthStamp, HealthState: domain.HealthState(healthPayload.State), DrainState: domain.DrainReady, ConfiguredSlots: physical, ReservedSlots: reserved, OrphanedSlots: orphaned, ProjectionVersion: version, CatalogAsOf: asOf}
 	var drain bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM drain_intents WHERE cluster_id=$1 AND namespace=$2 AND logical_engine=$3 AND pod_uid=$4 AND endpoint_epoch=$5 AND recovery_epoch=$6 AND state<>'cleared')`, identityArgs(id)...).Scan(&drain); err != nil {
 		return domain.InstanceSnapshot{}, err
