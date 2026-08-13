@@ -3,6 +3,7 @@ package kubernetes
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -176,4 +177,43 @@ func TestExactRemovalCarriesUIDAndTokenBoundResourceVersion(t *testing.T) {
 
 func eligiblePod(uid, ip string) *corev1.Pod {
 	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "pod-" + uid, UID: types.UID(uid), ResourceVersion: "pod-rv-" + uid, Labels: map[string]string{"app": "engine"}, Annotations: map[string]string{annotationModel: "engine", annotationEngine: "engine", annotationEndpointEpoch: "1", annotationRecoveryEpoch: "1", annotationSlots: "2"}}, Status: corev1.PodStatus{PodIP: ip, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
+}
+
+func TestRecoveryRollIsUIDResourceVersionFencedAndClosesAdmission(t *testing.T) {
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "models", Name: "engine", UID: "workload-uid", ResourceVersion: "19",
+			Labels: map[string]string{"prudentia.io/managed": "true"},
+		},
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{"existing": "kept"}}}},
+	}
+	client := fake.NewClientset(deployment)
+	var patch []byte
+	client.PrependReactor("patch", "deployments", func(action ktesting.Action) (bool, runtime.Object, error) {
+		patch = append([]byte(nil), action.(ktesting.PatchAction).GetPatch()...)
+		return true, deployment.DeepCopy(), nil
+	})
+	adapter := &Adapter{client: client, config: Config{
+		Namespace: "models", LabelSelector: "prudentia.io/managed=true", MutationCallLifetime: time.Second,
+	}}
+	epoch, _ := domain.NewRecoveryEpoch(7)
+	if err := adapter.RollManagedFleet(context.Background(), epoch); err != nil {
+		t.Fatal(err)
+	}
+	var operations []map[string]any
+	if err := json.Unmarshal(patch, &operations); err != nil {
+		t.Fatal(err)
+	}
+	encoded := string(patch)
+	for _, required := range []string{
+		`"path":"/metadata/uid","value":"workload-uid"`,
+		`"path":"/metadata/resourceVersion","value":"19"`,
+		`"prudentia.io/recovery-epoch":"7"`,
+		`"prudentia.io/admission-closed":"true"`,
+		`"existing":"kept"`,
+	} {
+		if !strings.Contains(encoded, required) {
+			t.Fatalf("recovery patch lacks %s: %s", required, encoded)
+		}
+	}
 }

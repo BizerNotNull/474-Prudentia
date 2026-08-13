@@ -446,16 +446,149 @@ func (c *Catalog) ReopenAfterFleetRebuild(ctx context.Context, proof domain.Flee
 	if epoch != uint64(proof.Epoch()) || admission != "fenced" || dispatch != "fenced" {
 		return domain.ErrInvalidState
 	}
-	var incomplete int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM instance_capacity WHERE recovery_epoch<>$1 AND NOT retired`, epoch).Scan(&incomplete); err != nil {
+	rows, err := tx.Query(ctx, `SELECT c.pod_uid,p.projection_version,
+		count(DISTINCT o.source_kind) FILTER (
+			WHERE o.expires_at>transaction_timestamp() AND o.source_kind IN ('structural','runtime_health','load')
+		)
+		FROM instance_capacity c
+		JOIN instance_projections p USING(cluster_id,namespace,logical_engine,pod_uid,endpoint_epoch,recovery_epoch)
+		JOIN capability_manifests m ON m.manifest_id=p.capability_manifest_id AND m.manifest_version=p.capability_manifest_version
+		LEFT JOIN source_observations o USING(cluster_id,namespace,logical_engine,pod_uid,endpoint_epoch,recovery_epoch)
+		WHERE c.recovery_epoch=$1 AND NOT c.retired
+		  AND m.valid_from<=transaction_timestamp() AND m.valid_until>transaction_timestamp()
+		GROUP BY c.pod_uid,p.projection_version
+		ORDER BY c.pod_uid`, epoch)
+	if err != nil {
 		return err
 	}
-	if incomplete != 0 {
+	defer rows.Close()
+	actualUIDs := make(map[string]struct{})
+	actualVersions := make(map[domain.ProjectionVersion]int)
+	for rows.Next() {
+		var uid string
+		var version domain.ProjectionVersion
+		var sourceCount int
+		if err := rows.Scan(&uid, &version, &sourceCount); err != nil {
+			return err
+		}
+		if sourceCount != 3 || version == 0 {
+			return domain.ErrInvalidState
+		}
+		actualUIDs[uid] = struct{}{}
+		actualVersions[version]++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	proofUIDs := proof.CurrentPodUIDs().Values()
+	if len(actualUIDs) == 0 || len(actualUIDs) != len(proofUIDs) {
 		return domain.ErrInvalidState
+	}
+	for _, uid := range proofUIDs {
+		if _, ok := actualUIDs[uid]; !ok {
+			return domain.ErrInvalidState
+		}
+	}
+	for _, version := range proof.ProjectionVersions() {
+		if actualVersions[version] == 0 {
+			return domain.ErrInvalidState
+		}
+		actualVersions[version]--
+	}
+	for _, count := range actualVersions {
+		if count != 0 {
+			return domain.ErrInvalidState
+		}
 	}
 	_, err = tx.Exec(ctx, `UPDATE system_admission_state SET admission_state='open',dispatch_state='open',fenced_at=NULL,fenced_by_hash=NULL,fence_reason=NULL,reopened_at=transaction_timestamp(),changed_at=transaction_timestamp()`)
 	if err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (c *Catalog) BeginFleetRecovery(ctx context.Context, generation domain.WriterGeneration, epoch domain.RecoveryEpoch) error {
+	var cluster string
+	if err := c.pool.QueryRow(ctx, `SELECT cluster FROM controller_writer_generations WHERE current_generation=$1`, generation).Scan(&cluster); err != nil {
+		return domain.ErrStaleWriterGeneration
+	}
+	if err := c.BeginRecoveryFence(ctx, epoch, fmt.Sprintf("controller:%s:%d", cluster, generation)); err != nil {
+		return err
+	}
+	_, err := c.pool.Exec(ctx, `INSERT INTO recovery_fleet_members(recovery_epoch,pod_uid)
+		SELECT $1,pod_uid FROM instance_capacity WHERE NOT retired
+		ON CONFLICT DO NOTHING`, epoch)
+	return err
+}
+
+func (c *Catalog) ObserveFleetRebuild(ctx context.Context, generation domain.WriterGeneration, epoch domain.RecoveryEpoch) (domain.FleetRebuildProof, error) {
+	var exists bool
+	if err := c.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM controller_writer_generations WHERE current_generation=$1)`, generation).Scan(&exists); err != nil || !exists {
+		return domain.FleetRebuildProof{}, domain.ErrStaleWriterGeneration
+	}
+	var unsafeOld int
+	if err := c.pool.QueryRow(ctx, `SELECT count(*) FROM recovery_fleet_members r
+		LEFT JOIN instance_capacity c ON c.pod_uid=r.pod_uid
+		WHERE r.recovery_epoch=$1 AND c.pod_uid IS NOT NULL
+		  AND (NOT c.retired OR c.reserved_slots<>0 OR c.orphaned_slots<>0)`, epoch).Scan(&unsafeOld); err != nil {
+		return domain.FleetRebuildProof{}, err
+	}
+	if unsafeOld != 0 {
+		return domain.FleetRebuildProof{}, domain.ErrInvalidState
+	}
+	rows, err := c.pool.Query(ctx, `SELECT c.pod_uid,p.projection_version,
+		count(DISTINCT o.source_kind) FILTER (
+			WHERE o.expires_at>transaction_timestamp() AND o.source_kind IN ('structural','runtime_health','load')
+		)
+		FROM instance_capacity c
+		JOIN instance_projections p USING(cluster_id,namespace,logical_engine,pod_uid,endpoint_epoch,recovery_epoch)
+		JOIN capability_manifests m ON m.manifest_id=p.capability_manifest_id AND m.manifest_version=p.capability_manifest_version
+		LEFT JOIN source_observations o USING(cluster_id,namespace,logical_engine,pod_uid,endpoint_epoch,recovery_epoch)
+		WHERE c.recovery_epoch=$1 AND NOT c.retired
+		  AND m.valid_from<=transaction_timestamp() AND m.valid_until>transaction_timestamp()
+		GROUP BY c.pod_uid,p.projection_version
+		ORDER BY c.pod_uid`, epoch)
+	if err != nil {
+		return domain.FleetRebuildProof{}, err
+	}
+	defer rows.Close()
+	var uids []string
+	var versions []domain.ProjectionVersion
+	for rows.Next() {
+		var uid string
+		var version domain.ProjectionVersion
+		var sources int
+		if err := rows.Scan(&uid, &version, &sources); err != nil {
+			return domain.FleetRebuildProof{}, err
+		}
+		if sources != 3 || version == 0 {
+			return domain.FleetRebuildProof{}, domain.ErrInvalidState
+		}
+		uids = append(uids, uid)
+		versions = append(versions, version)
+	}
+	if err := rows.Err(); err != nil {
+		return domain.FleetRebuildProof{}, err
+	}
+	current, err := domain.NewPodUIDSet(uids)
+	if err != nil {
+		return domain.FleetRebuildProof{}, err
+	}
+	old, _ := domain.NewPodUIDSet(nil)
+	var observedAt time.Time
+	if err := c.pool.QueryRow(ctx, `SELECT transaction_timestamp()`).Scan(&observedAt); err != nil {
+		return domain.FleetRebuildProof{}, err
+	}
+	return domain.NewFleetRebuildProof(domain.FleetRebuildProofParams{
+		Epoch: epoch, OldPodUIDs: old, CurrentPodUIDs: current,
+		ProjectionVersions: versions, ObservedAt: observedAt,
+	})
+}
+
+func (c *Catalog) CompleteFleetRecovery(ctx context.Context, generation domain.WriterGeneration, proof domain.FleetRebuildProof) error {
+	var exists bool
+	if err := c.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM controller_writer_generations WHERE current_generation=$1)`, generation).Scan(&exists); err != nil || !exists {
+		return domain.ErrStaleWriterGeneration
+	}
+	return c.ReopenAfterFleetRebuild(ctx, proof)
 }

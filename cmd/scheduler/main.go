@@ -8,24 +8,26 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	adminv1 "github.com/BizerNotNull/474-Prudentia/api/admin/v1"
 	schedulerv1 "github.com/BizerNotNull/474-Prudentia/api/scheduler/v1"
 	postgresadapter "github.com/BizerNotNull/474-Prudentia/internal/adapter/postgres"
 	"github.com/BizerNotNull/474-Prudentia/internal/config"
+	"github.com/BizerNotNull/474-Prudentia/internal/domain"
+	apphealth "github.com/BizerNotNull/474-Prudentia/internal/health"
 	"github.com/BizerNotNull/474-Prudentia/internal/scheduling"
+	admintransport "github.com/BizerNotNull/474-Prudentia/internal/transport/admingrpc"
 	transport "github.com/BizerNotNull/474-Prudentia/internal/transport/schedulergrpc"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/health"
+	grpchealth "google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
-	"google.golang.org/grpc/peer"
-	"google.golang.org/grpc/status"
 )
 
 func main() {
@@ -49,20 +51,25 @@ func run() error {
 	}
 	defer pool.Close()
 	pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
-	defer cancelPing()
 	if err := pool.Ping(pingCtx); err != nil {
+		cancelPing()
 		return fmt.Errorf("connect PostgreSQL: %w", err)
 	}
-	var ledgerTable, cryptoVersionTable *string
-	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.scheduler_reservations')::text,
-		to_regclass('public.scheduler_crypto_versions')::text`).Scan(&ledgerTable, &cryptoVersionTable); err != nil || ledgerTable == nil || cryptoVersionTable == nil {
-		return errors.New("scheduler database migrations are not applied")
+	cancelPing()
+	var systemTable, reservationsTable *string
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.system_admission_state')::text,
+		to_regclass('public.reservations')::text`).Scan(&systemTable, &reservationsTable); err != nil || systemTable == nil || reservationsTable == nil {
+		return errors.New("authoritative scheduler database migrations are not applied")
 	}
-
-	store, err := postgresadapter.NewSchedulerStore(pool, cfg.CapabilityKey)
+	keyring, err := postgresadapter.NewLocalCapabilityKeyring(cfg.CapabilityKEKs, cfg.CapabilityComparisons)
 	if err != nil {
 		return err
 	}
+	catalog, err := postgresadapter.NewCatalog(pool, keyring)
+	if err != nil {
+		return err
+	}
+	store := catalog.SchedulerStore()
 	service, err := scheduling.NewService(store, 3)
 	if err != nil {
 		return err
@@ -71,26 +78,71 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	tlsConfig, err := serverTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ClientCAFile)
+	requestTLS, err := serverTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ClientCAFile)
 	if err != nil {
 		return err
 	}
-
-	grpcServer := grpc.NewServer(
-		grpc.Creds(credentials.NewTLS(tlsConfig)),
-		grpc.MaxRecvMsgSize(64<<10), grpc.MaxSendMsgSize(64<<10),
-		grpc.UnaryInterceptor(requireSPIFFEID(cfg.GatewaySPIFFEID)),
-	)
-	schedulerv1.RegisterSchedulerServiceServer(grpcServer, rpcService)
-	healthServer := health.NewServer()
-	healthpb.RegisterHealthServer(grpcServer, healthServer)
-	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
-	listener, err := net.Listen("tcp", cfg.ListenAddress)
+	requestInterceptor, err := transport.NewGatewayUnaryInterceptor(transport.GatewayInterceptorConfig{
+		AllowedSPIFFEIDs: []string{cfg.GatewaySPIFFEID}, MaxDeadline: 30 * time.Minute, MaxMessageBytes: 64 << 10,
+	})
 	if err != nil {
-		return fmt.Errorf("listen for scheduler: %w", err)
+		return err
 	}
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- grpcServer.Serve(listener) }()
+	requestServer := grpc.NewServer(
+		grpc.Creds(credentials.NewTLS(requestTLS)),
+		grpc.MaxRecvMsgSize(64<<10), grpc.MaxSendMsgSize(64<<10),
+		grpc.UnaryInterceptor(requestInterceptor),
+	)
+	schedulerv1.RegisterSchedulerServiceServer(requestServer, rpcService)
+	healthServer := grpchealth.NewServer()
+	healthpb.RegisterHealthServer(requestServer, healthServer)
+	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
+
+	adminTLS, err := serverTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.AdminClientCAFile)
+	if err != nil {
+		return err
+	}
+	adminApp, err := admintransport.NewAdminServer(
+		&admintransport.AdminAuthenticator{TrustDomain: cfg.AdminTrustDomain, AllowedPathPrefixes: cfg.AdminPathPrefixes},
+		&admintransport.AdminAuthorizer{Policy: configuredAdminPolicy{}},
+		admintransport.AdminCodec{Resolver: catalog},
+		catalog,
+	)
+	if err != nil {
+		return err
+	}
+	adminServer := grpc.NewServer(
+		grpc.Creds(credentials.NewTLS(adminTLS)),
+		grpc.MaxRecvMsgSize(16<<10), grpc.MaxSendMsgSize(16<<10),
+	)
+	adminv1.RegisterCapacityDebtAdminServiceServer(adminServer, adminApp)
+	state := &apphealth.State{}
+	state.SetStarted(true)
+	healthHTTP := &http.Server{
+		Addr: cfg.HealthAddress, Handler: apphealth.NewHandler(state),
+		ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 5 * time.Second,
+		IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8 << 10,
+	}
+
+	requestListener, err := net.Listen("tcp", cfg.ListenAddress)
+	if err != nil {
+		return fmt.Errorf("listen for scheduler request service: %w", err)
+	}
+	adminListener, err := net.Listen("tcp", cfg.AdminListenAddress)
+	if err != nil {
+		requestListener.Close()
+		return fmt.Errorf("listen for scheduler admin service: %w", err)
+	}
+	healthListener, err := net.Listen("tcp", cfg.HealthAddress)
+	if err != nil {
+		requestListener.Close()
+		adminListener.Close()
+		return fmt.Errorf("listen for scheduler health service: %w", err)
+	}
+	serveErr := make(chan error, 3)
+	go func() { serveErr <- requestServer.Serve(requestListener) }()
+	go func() { serveErr <- adminServer.Serve(adminListener) }()
+	go func() { serveErr <- healthHTTP.Serve(healthListener) }()
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
@@ -100,32 +152,36 @@ func run() error {
 				return
 			case <-ticker.C:
 				sweepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				_, err := store.ClassifyExpired(sweepCtx, 100)
+				_, sweepErr := store.ClassifyExpired(sweepCtx, 100)
+				ready := sweepErr == nil && schedulerReady(sweepCtx, pool)
 				cancel()
-				if err != nil {
+				if ready {
+					healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+					state.SetReady(true)
+				} else {
 					healthServer.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
-					log.Printf("scheduler classification failed")
-					continue
+					state.SetReady(false)
 				}
-				healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 			}
 		}
 	}()
 
 	select {
 	case err := <-serveErr:
+		stop()
 		return err
 	case <-ctx.Done():
 		healthServer.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
-		stopped := make(chan struct{})
-		go func() { grpcServer.GracefulStop(); close(stopped) }()
-		select {
-		case <-stopped:
-		case <-time.After(10 * time.Second):
-			grpcServer.Stop()
-		}
-		if err := <-serveErr; err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-			return err
+		state.SetDraining(true)
+		gracefulStop(requestServer, 10*time.Second)
+		gracefulStop(adminServer, 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = healthHTTP.Shutdown(shutdownCtx)
+		cancel()
+		for i := 0; i < 3; i++ {
+			if err := <-serveErr; err != nil && !errors.Is(err, grpc.ErrServerStopped) && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
 		}
 		return nil
 	}
@@ -155,21 +211,29 @@ func loadCertPool(path string) (*x509.CertPool, error) {
 	return pool, nil
 }
 
-func requireSPIFFEID(expected string) grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, request any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		connection, ok := peer.FromContext(ctx)
-		if !ok {
-			return nil, status.Error(codes.Unauthenticated, "unauthenticated caller")
-		}
-		tlsInfo, ok := connection.AuthInfo.(credentials.TLSInfo)
-		if !ok || len(tlsInfo.State.PeerCertificates) == 0 {
-			return nil, status.Error(codes.Unauthenticated, "unauthenticated caller")
-		}
-		for _, identity := range tlsInfo.State.PeerCertificates[0].URIs {
-			if identity.String() == expected {
-				return handler(ctx, request)
-			}
-		}
-		return nil, status.Error(codes.PermissionDenied, "unauthorized caller")
+type configuredAdminPolicy struct{}
+
+func (configuredAdminPolicy) Allows(_ context.Context, _ domain.AdminPrincipal, action domain.AdminAction, target admintransport.DebtTarget) bool {
+	return action == domain.AdminActionCapacityDebtUnsafeOverride &&
+		target.DebtID != "" && target.PodUID != "" && target.EndpointEpoch != 0
+}
+
+func schedulerReady(ctx context.Context, pool *pgxpool.Pool) bool {
+	var admission, dispatch string
+	err := pool.QueryRow(ctx, `SELECT admission_state,dispatch_state
+		FROM system_admission_state WHERE cluster_id='default'`).Scan(&admission, &dispatch)
+	return err == nil && admission == "open" && dispatch == "open"
+}
+
+func gracefulStop(server *grpc.Server, timeout time.Duration) {
+	stopped := make(chan struct{})
+	go func() {
+		server.GracefulStop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(timeout):
+		server.Stop()
 	}
 }

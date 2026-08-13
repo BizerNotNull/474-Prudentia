@@ -14,19 +14,27 @@ import (
 )
 
 type Gateway struct {
-	ListenAddress       string
-	APIKey              string
-	Tenant              string
-	Models              []string
-	OIDCIssuers         []auth.OIDCConfig
-	SchedulerAddress    string
-	SchedulerServerName string
-	SchedulerCAFile     string
-	TLSCertFile         string
-	TLSKeyFile          string
-	ProviderCAFile      string
-	ProviderTrustDomain string
-	IdempotencyConfig   requestapp.IdempotencyConfig
+	ListenAddress         string
+	PublicTLSCertFile     string
+	PublicTLSKeyFile      string
+	APIKey                string
+	Tenant                string
+	Models                []string
+	OIDCIssuers           []auth.OIDCConfig
+	SchedulerAddress      string
+	SchedulerServerName   string
+	SchedulerCAFile       string
+	TLSCertFile           string
+	TLSKeyFile            string
+	ProviderCAFile        string
+	ProviderTrustDomain   string
+	ManifestPayloadFile   string
+	ManifestSignatureFile string
+	ManifestKeyID         string
+	ManifestID            string
+	ManifestPublicKey     string
+	ManifestPin           string
+	IdempotencyConfig     requestapp.IdempotencyConfig
 }
 
 func LoadGatewayFromEnv() (Gateway, error) {
@@ -51,6 +59,8 @@ func LoadGatewayFromEnv() (Gateway, error) {
 			TenantClaim: oidcTenantClaim, ModelsClaim: oidcModelsClaim,
 		}}
 	}
+	cfg.PublicTLSCertFile = strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_PUBLIC_TLS_CERT"))
+	cfg.PublicTLSKeyFile = strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_PUBLIC_TLS_KEY"))
 	cfg.SchedulerAddress = strings.TrimSpace(os.Getenv("PRUDENTIA_SCHEDULER_ADDRESS"))
 	cfg.SchedulerServerName = strings.TrimSpace(os.Getenv("PRUDENTIA_SCHEDULER_SERVER_NAME"))
 	cfg.SchedulerCAFile = strings.TrimSpace(os.Getenv("PRUDENTIA_SCHEDULER_CA"))
@@ -58,6 +68,12 @@ func LoadGatewayFromEnv() (Gateway, error) {
 	cfg.TLSKeyFile = strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_TLS_KEY"))
 	cfg.ProviderCAFile = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_CA"))
 	cfg.ProviderTrustDomain = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_TRUST_DOMAIN"))
+	cfg.ManifestPayloadFile = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_MANIFEST_PAYLOAD"))
+	cfg.ManifestSignatureFile = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_MANIFEST_SIGNATURE"))
+	cfg.ManifestKeyID = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_MANIFEST_KEY_ID"))
+	cfg.ManifestID = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_MANIFEST_ID"))
+	cfg.ManifestPublicKey = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_MANIFEST_PUBLIC_KEY"))
+	cfg.ManifestPin = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_MANIFEST_PIN"))
 	lookupKeys, lookupWriteVersion, err := loadVersionedKeys(
 		"PRUDENTIA_GATEWAY_IDEMPOTENCY_LOOKUP_KEYS",
 		"PRUDENTIA_GATEWAY_IDEMPOTENCY_LOOKUP_WRITE_VERSION",
@@ -111,8 +127,11 @@ func LoadGatewayFromEnv() (Gateway, error) {
 	if cfg.APIKey == "" && len(cfg.OIDCIssuers) == 0 {
 		return Gateway{}, errors.New("gateway API key or OIDC configuration is required")
 	}
-	if cfg.SchedulerServerName == "" || cfg.SchedulerCAFile == "" || cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" || cfg.ProviderCAFile == "" || cfg.ProviderTrustDomain == "" {
-		return Gateway{}, errors.New("gateway scheduler and provider TLS configuration is required")
+	if cfg.PublicTLSCertFile == "" || cfg.PublicTLSKeyFile == "" || cfg.SchedulerServerName == "" || cfg.SchedulerCAFile == "" || cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" || cfg.ProviderCAFile == "" || cfg.ProviderTrustDomain == "" {
+		return Gateway{}, errors.New("gateway public, scheduler, and provider TLS configuration is required")
+	}
+	if cfg.ManifestPayloadFile == "" || cfg.ManifestSignatureFile == "" || cfg.ManifestKeyID == "" || cfg.ManifestID == "" || cfg.ManifestPublicKey == "" || cfg.ManifestPin == "" {
+		return Gateway{}, errors.New("signed pinned provider manifest configuration is required")
 	}
 	return cfg, nil
 }

@@ -553,3 +553,73 @@ func (a *Adapter) listOwnedPods(ctx context.Context, workloadUID, namespace stri
 	sort.Slice(owned, func(i, j int) bool { return string(owned[i].UID) < string(owned[j].UID) })
 	return owned, nil
 }
+
+func recoveryRollPatch(object metav1.Object, templateAnnotations map[string]string, epoch domain.RecoveryEpoch) ([]byte, error) {
+	metadataAnnotations := make(map[string]string, len(object.GetAnnotations())+2)
+	for key, value := range object.GetAnnotations() {
+		metadataAnnotations[key] = value
+	}
+	template := make(map[string]string, len(templateAnnotations)+2)
+	for key, value := range templateAnnotations {
+		template[key] = value
+	}
+	epochText := strconv.FormatUint(epoch.Uint64(), 10)
+	metadataAnnotations[annotationRecoveryEpoch] = epochText
+	metadataAnnotations[annotationAdmissionClosed] = "true"
+	template[annotationRecoveryEpoch] = epochText
+	template[annotationAdmissionClosed] = "true"
+	metadataOp := "replace"
+	if object.GetAnnotations() == nil {
+		metadataOp = "add"
+	}
+	templateOp := "replace"
+	if templateAnnotations == nil {
+		templateOp = "add"
+	}
+	return json.Marshal([]map[string]any{
+		{"op": "test", "path": "/metadata/uid", "value": string(object.GetUID())},
+		{"op": "test", "path": "/metadata/resourceVersion", "value": object.GetResourceVersion()},
+		{"op": metadataOp, "path": "/metadata/annotations", "value": metadataAnnotations},
+		{"op": templateOp, "path": "/spec/template/metadata/annotations", "value": template},
+	})
+}
+
+func (a *Adapter) RollManagedFleet(ctx context.Context, epoch domain.RecoveryEpoch) error {
+	if epoch == 0 {
+		return domain.ErrInvalidState
+	}
+	callCtx, cancel := a.mutationContext(ctx)
+	defer cancel()
+	deployments, err := a.client.AppsV1().Deployments(a.config.Namespace).List(callCtx, metav1.ListOptions{LabelSelector: a.config.LabelSelector})
+	if err != nil {
+		return fmt.Errorf("list managed Deployments for recovery: %w", err)
+	}
+	statefulSets, err := a.client.AppsV1().StatefulSets(a.config.Namespace).List(callCtx, metav1.ListOptions{LabelSelector: a.config.LabelSelector})
+	if err != nil {
+		return fmt.Errorf("list managed StatefulSets for recovery: %w", err)
+	}
+	if len(deployments.Items)+len(statefulSets.Items) == 0 {
+		return errors.New("no managed workload available for recovery")
+	}
+	for i := range deployments.Items {
+		object := &deployments.Items[i]
+		patch, err := recoveryRollPatch(object, object.Spec.Template.Annotations, epoch)
+		if err != nil {
+			return err
+		}
+		if _, err := a.client.AppsV1().Deployments(object.Namespace).Patch(callCtx, object.Name, types.JSONPatchType, patch, metav1.PatchOptions{}); err != nil {
+			return fmt.Errorf("roll Deployment recovery epoch: %w", err)
+		}
+	}
+	for i := range statefulSets.Items {
+		object := &statefulSets.Items[i]
+		patch, err := recoveryRollPatch(object, object.Spec.Template.Annotations, epoch)
+		if err != nil {
+			return err
+		}
+		if _, err := a.client.AppsV1().StatefulSets(object.Namespace).Patch(callCtx, object.Name, types.JSONPatchType, patch, metav1.PatchOptions{}); err != nil {
+			return fmt.Errorf("roll StatefulSet recovery epoch: %w", err)
+		}
+	}
+	return nil
+}

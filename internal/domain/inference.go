@@ -308,6 +308,14 @@ func (r InferenceRequest) IdempotencyKey() (SecretString, bool) {
 	return SecretString{value: r.idempotencyKey.Bytes()}, !r.idempotencyKey.IsZero()
 }
 
+func (r InferenceRequest) WithRequestID(id RequestID) (InferenceRequest, error) {
+	if id.value == "" {
+		return InferenceRequest{}, NewPublicError(ErrorInvalidRequest)
+	}
+	r.requestID = id
+	return r, nil
+}
+
 type PrincipalParams struct {
 	Subject       string
 	Tenant        TenantScope

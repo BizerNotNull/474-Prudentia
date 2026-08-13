@@ -191,6 +191,24 @@ func (c *Catalog) ResolveCapacityDebt(ctx context.Context, cmd domain.DebtResolu
 	return tx.Commit(ctx)
 }
 
+func (c *Catalog) ResolveDebtIdentity(ctx context.Context, debtID, podUID string, endpointEpoch uint64) (domain.WorkloadIdentity, error) {
+	if debtID == "" || podUID == "" || endpointEpoch == 0 {
+		return domain.WorkloadIdentity{}, domain.ErrCapacityDebtNotFound
+	}
+	var params domain.WorkloadIdentityParams
+	err := c.pool.QueryRow(ctx, `SELECT cluster_id,namespace,logical_engine,pod_uid,endpoint_epoch,recovery_epoch
+		FROM orphaned_capacity_debts
+		WHERE debt_id=$1 AND pod_uid=$2 AND endpoint_epoch=$3`, debtID, podUID, endpointEpoch).
+		Scan(&params.Cluster, &params.Namespace, &params.LogicalEngine, &params.PodUID, &params.EndpointEpoch, &params.RecoveryEpoch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.WorkloadIdentity{}, domain.ErrCapacityDebtNotFound
+	}
+	if err != nil {
+		return domain.WorkloadIdentity{}, err
+	}
+	return domain.NewWorkloadIdentity(params)
+}
+
 func (c *Catalog) UnsafeOverrideCapacityDebt(ctx context.Context, cmd domain.UnsafeDebtOverride) error {
 	if cmd.Confirmation() != domain.UnsafeDebtOverrideDangerPhrase {
 		return domain.ErrInvalidUnsafeDebtOverride

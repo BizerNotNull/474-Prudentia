@@ -60,12 +60,12 @@ type DrainMutationControl interface {
 // closed fence, workload roll, observation, and transactional reopen without Kubernetes DTOs.
 type RecoveryCatalog interface {
 	BeginFleetRecovery(context.Context, domain.WriterGeneration, domain.RecoveryEpoch) error
+	ObserveFleetRebuild(context.Context, domain.WriterGeneration, domain.RecoveryEpoch) (domain.FleetRebuildProof, error)
 	CompleteFleetRecovery(context.Context, domain.WriterGeneration, domain.FleetRebuildProof) error
 }
 
 type RecoveryControl interface {
 	RollManagedFleet(context.Context, domain.RecoveryEpoch) error
-	ObserveFleetRebuild(context.Context, domain.WriterGeneration, domain.RecoveryEpoch) (domain.FleetRebuildProof, error)
 }
 
 func (c *Controller) operationPorts() (OperationCatalog, WorkloadControl, bool) {
@@ -211,7 +211,7 @@ func (c *Controller) RecoverAfterLedgerRestore(ctx context.Context, gen domain.W
 	if err := control.RollManagedFleet(ctx, epoch); err != nil {
 		return fmt.Errorf("roll managed fleet recovery epoch: %w", err)
 	}
-	proof, err := control.ObserveFleetRebuild(ctx, gen, epoch)
+	proof, err := ledger.ObserveFleetRebuild(ctx, gen, epoch)
 	if err != nil {
 		return fmt.Errorf("observe fleet rebuild: %w", err)
 	}

@@ -44,7 +44,7 @@ func NewGatewayUnaryInterceptor(config GatewayInterceptorConfig) (grpc.UnaryServ
 		allowed[u.String()] = struct{}{}
 	}
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		if info == nil || !strings.HasPrefix(info.FullMethod, schedulerServicePrefix) {
+		if info == nil || (!strings.HasPrefix(info.FullMethod, schedulerServicePrefix) && info.FullMethod != "/grpc.health.v1.Health/Check") {
 			return nil, status.Error(codes.PermissionDenied, "method denied")
 		}
 		identity, err := authenticatedSPIFFE(ctx)
