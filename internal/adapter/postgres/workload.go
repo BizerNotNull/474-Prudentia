@@ -14,7 +14,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const maxKubernetesMutationCallLifetime = 30 * time.Second
+const (
+	maxKubernetesMutationCallLifetime = 30 * time.Second
+	maxWorkloadPollInterval           = 5 * time.Second
+)
 
 func operationIntentName(intent domain.WorkloadOperationIntent) (string, error) {
 	switch intent {
@@ -353,8 +356,12 @@ func (c *Catalog) RecordWorkloadVictims(ctx context.Context, generation domain.W
 }
 
 func (c *Catalog) WaitForOldCallsQuiescent(ctx context.Context, generation domain.WriterGeneration, ref domain.WorkloadOperationRef) error {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	delay := 100 * time.Millisecond
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
 	for {
 		var elapsed bool
 		err := c.pool.QueryRow(ctx, `SELECT transaction_timestamp() >= w.old_calls_quiescent_after
@@ -368,10 +375,12 @@ func (c *Catalog) WaitForOldCallsQuiescent(ctx context.Context, generation domai
 		if elapsed {
 			return nil
 		}
+		timer.Reset(delay)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
+		case <-timer.C:
+			delay = min(delay*2, maxWorkloadPollInterval)
 		}
 	}
 }
@@ -385,8 +394,12 @@ func (c *Catalog) PrepareDrainOperation(ctx context.Context, generation domain.W
 }
 
 func (c *Catalog) WaitForDrainQuiescence(ctx context.Context, generation domain.WriterGeneration, ref domain.WorkloadOperationRef) error {
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
+	delay := 250 * time.Millisecond
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
 	for {
 		var active int64
 		err := c.pool.QueryRow(ctx, `SELECT COALESCE(sum(c.reserved_slots+c.orphaned_slots),0)
@@ -404,10 +417,12 @@ func (c *Catalog) WaitForDrainQuiescence(ctx context.Context, generation domain.
 		if active == 0 {
 			return nil
 		}
+		timer.Reset(delay)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
+		case <-timer.C:
+			delay = min(delay*2, maxWorkloadPollInterval)
 		}
 	}
 }

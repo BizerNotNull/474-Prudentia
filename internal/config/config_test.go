@@ -42,6 +42,39 @@ func TestSchedulerRequiresSeparateAdminIdentityPolicyAndRetainedKeys(t *testing.
 	}
 }
 
+func TestLoadCapabilityKeysRejectsInvalidEncodings(t *testing.T) {
+	const name = "PRUDENTIA_TEST_CAPABILITY_KEYS"
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "missing colon", raw: encodedGatewayTestKey('a')},
+		{name: "non-numeric version", raw: "x:" + encodedGatewayTestKey('a')},
+		{name: "invalid base64", raw: "1:not-base64"},
+		{name: "wrong key length", raw: "1:MQ=="},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(name, test.raw)
+			if _, err := loadCapabilityKeys(name); err == nil {
+				t.Fatal("loadCapabilityKeys accepted an invalid keyring")
+			}
+		})
+	}
+}
+
+func TestLoadCapabilityKeysRejectsDuplicateVersions(t *testing.T) {
+	const name = "PRUDENTIA_TEST_CAPABILITY_KEYS"
+	t.Setenv(name, "1:"+encodedGatewayTestKey('a')+",1:"+encodedGatewayTestKey('b'))
+	_, err := loadCapabilityKeys(name)
+	if err == nil {
+		t.Fatal("loadCapabilityKeys accepted duplicate versions")
+	}
+	if !strings.Contains(err.Error(), "duplicate scheduler capability key version") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestControllerRequiresExactProviderEvidenceConfiguration(t *testing.T) {
 	values := map[string]string{
 		"PRUDENTIA_DATABASE_URL": "postgres://controller.invalid/db", "PRUDENTIA_CLUSTER": "cluster-a",

@@ -80,25 +80,23 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	providerTLS, err := clientTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ProviderCAFile, "")
+	providerSecurity, err := vllm.LoadProviderSecurity(vllm.ProviderSecurityFiles{
+		CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile, CAFile: cfg.ProviderCAFile,
+		ManifestPayloadFile: cfg.ManifestPayloadFile, ManifestSignatureFile: cfg.ManifestSignatureFile,
+		ManifestKeyID: cfg.ManifestKeyID, ManifestID: cfg.ManifestID,
+		ManifestPublicKey: cfg.ManifestPublicKey, ManifestPin: cfg.ManifestPin,
+	}, time.Now)
 	if err != nil {
 		return err
 	}
-	manifest, err := vllm.LoadVerifiedManifest(
-		cfg.ManifestPayloadFile, cfg.ManifestSignatureFile, cfg.ManifestKeyID, cfg.ManifestID,
-		cfg.ManifestPublicKey, cfg.ManifestPin, time.Now,
-	)
-	if err != nil {
-		return fmt.Errorf("load pinned provider manifest: %w", err)
-	}
 	backend, err := vllm.NewBackend(vllm.BackendConfig{
-		TLSConfig: providerTLS, ResponseHeaderTimeout: 15 * time.Second, DialTimeout: 5 * time.Second,
+		TLSConfig: providerSecurity.TLSConfig, ResponseHeaderTimeout: 15 * time.Second, DialTimeout: 5 * time.Second,
 		MaxEventBytes: 1 << 20, MaxEvents: 65536, MaxResponseBytes: 8 << 20, Now: time.Now,
 	})
 	if err != nil {
 		return err
 	}
-	provider, err := vllm.NewPinnedProvider(backend, manifest)
+	provider, err := vllm.NewPinnedProvider(backend, providerSecurity.Manifest)
 	if err != nil {
 		return err
 	}

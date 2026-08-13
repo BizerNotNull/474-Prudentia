@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
@@ -57,25 +55,23 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	providerTLS, err := controllerTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ProviderCAFile)
+	providerSecurity, err := vllmadapter.LoadProviderSecurity(vllmadapter.ProviderSecurityFiles{
+		CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile, CAFile: cfg.ProviderCAFile,
+		ManifestPayloadFile: cfg.ManifestPayloadFile, ManifestSignatureFile: cfg.ManifestSignatureFile,
+		ManifestKeyID: cfg.ManifestKeyID, ManifestID: cfg.ManifestID,
+		ManifestPublicKey: cfg.ManifestPublicKey, ManifestPin: cfg.ManifestPin,
+	}, time.Now)
 	if err != nil {
 		return err
 	}
-	manifest, err := vllmadapter.LoadVerifiedManifest(
-		cfg.ManifestPayloadFile, cfg.ManifestSignatureFile, cfg.ManifestKeyID, cfg.ManifestID,
-		cfg.ManifestPublicKey, cfg.ManifestPin, time.Now,
-	)
-	if err != nil {
-		return fmt.Errorf("load pinned provider manifest: %w", err)
-	}
 	backend, err := vllmadapter.NewBackend(vllmadapter.BackendConfig{
-		TLSConfig: providerTLS, ResponseHeaderTimeout: 10 * time.Second, DialTimeout: 5 * time.Second,
+		TLSConfig: providerSecurity.TLSConfig, ResponseHeaderTimeout: 10 * time.Second, DialTimeout: 5 * time.Second,
 		MaxEventBytes: 1 << 20, MaxEvents: 1024, MaxResponseBytes: 2 << 20, Now: time.Now,
 	})
 	if err != nil {
 		return err
 	}
-	prober, err := vllmadapter.NewExactManifestProber(backend, manifest)
+	prober, err := vllmadapter.NewExactManifestProber(backend, providerSecurity.Manifest)
 	if err != nil {
 		return err
 	}
@@ -129,23 +125,4 @@ func run() error {
 		result = err
 	}
 	return result
-}
-
-func controllerTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
-	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("load controller TLS identity: %w", err)
-	}
-	data, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, fmt.Errorf("load provider CA: %w", err)
-	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(data) {
-		return nil, errors.New("provider CA file contains no certificate")
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{certificate}, RootCAs: roots,
-		MinVersion: tls.VersionTLS13,
-	}, nil
 }
