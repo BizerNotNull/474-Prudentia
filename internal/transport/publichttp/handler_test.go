@@ -284,3 +284,34 @@ func TestChatRejectsMultipleIdempotencyKeys(t *testing.T) {
 		t.Fatalf("status = %d, calls = %d, body = %s", response.Code, inferer.calls, response.Body.String())
 	}
 }
+
+func TestChatValidatesReturnsAndConsumesCallerRequestID(t *testing.T) {
+	inferer := &fakeInferer{}
+	handler := newTestHandler(t, inferer)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	request.Header.Set("X-Request-Id", "caller.req:17")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || inferer.requestID != "caller.req:17" || response.Header().Get("X-Request-Id") != "caller.req:17" {
+		t.Fatalf("status=%d infererID=%q responseID=%q", response.Code, inferer.requestID, response.Header().Get("X-Request-Id"))
+	}
+	if request.Header.Get("X-Request-Id") != "" {
+		t.Fatal("caller request ID remained on the provider-bound request")
+	}
+}
+
+func TestChatRejectsInvalidCallerRequestIDBeforeAuthentication(t *testing.T) {
+	inferer := &fakeInferer{}
+	handler := newTestHandler(t, inferer)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	request.Header.Set("X-Request-Id", "contains a space")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || inferer.calls != 0 || response.Header().Get("X-Request-Id") == "" {
+		t.Fatalf("status=%d calls=%d responseID=%q", response.Code, inferer.calls, response.Header().Get("X-Request-Id"))
+	}
+}

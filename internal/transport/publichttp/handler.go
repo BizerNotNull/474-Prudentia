@@ -42,9 +42,9 @@ func (h *Handler) Routes(health http.Handler) http.Handler {
 }
 
 func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
-	id, err := newRequestID()
+	id, err := takeRequestID(r)
 	if err != nil {
-		WritePublicError(w, "", domain.NewPublicError(domain.ErrorInternal))
+		WritePublicError(w, id, err)
 		return
 	}
 	defer r.Body.Close()
@@ -140,6 +140,34 @@ func takeIdempotencyKey(r *http.Request) ([]byte, error) {
 		}
 	}
 	return key, nil
+}
+
+func takeRequestID(r *http.Request) (string, error) {
+	values := r.Header.Values("X-Request-Id")
+	r.Header.Del("X-Request-Id")
+	if len(values) == 0 {
+		return newRequestID()
+	}
+	if len(values) != 1 {
+		id, _ := newRequestID()
+		return id, domain.NewPublicError(domain.ErrorInvalidRequest)
+	}
+	value := values[0]
+	if len(value) == 0 || len(value) > 128 {
+		id, _ := newRequestID()
+		return id, domain.NewPublicError(domain.ErrorInvalidRequest)
+	}
+	for _, char := range []byte(value) {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_' || char == '.' || char == ':') {
+			id, _ := newRequestID()
+			return id, domain.NewPublicError(domain.ErrorInvalidRequest)
+		}
+	}
+	if _, err := domain.NewRequestID(value); err != nil {
+		id, _ := newRequestID()
+		return id, domain.NewPublicError(domain.ErrorInvalidRequest)
+	}
+	return value, nil
 }
 
 func newRequestID() (string, error) {

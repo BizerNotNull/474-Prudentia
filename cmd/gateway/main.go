@@ -80,11 +80,25 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	providerTLS, err := clientTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ProviderCAFile, "provider.invalid")
+	providerTLS, err := clientTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ProviderCAFile, "")
 	if err != nil {
 		return err
 	}
-	provider, err := vllm.NewClient(providerTLS, cfg.ProviderTrustDomain, 15*time.Second, 1<<20, 65536)
+	manifest, err := vllm.LoadVerifiedManifest(
+		cfg.ManifestPayloadFile, cfg.ManifestSignatureFile, cfg.ManifestKeyID, cfg.ManifestID,
+		cfg.ManifestPublicKey, cfg.ManifestPin, time.Now,
+	)
+	if err != nil {
+		return fmt.Errorf("load pinned provider manifest: %w", err)
+	}
+	backend, err := vllm.NewBackend(vllm.BackendConfig{
+		TLSConfig: providerTLS, ResponseHeaderTimeout: 15 * time.Second, DialTimeout: 5 * time.Second,
+		MaxEventBytes: 1 << 20, MaxEvents: 65536, MaxResponseBytes: 8 << 20, Now: time.Now,
+	})
+	if err != nil {
+		return err
+	}
+	provider, err := vllm.NewPinnedProvider(backend, manifest)
 	if err != nil {
 		return err
 	}
@@ -121,7 +135,7 @@ func run() error {
 	defer stop()
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- server.Serve(listener)
+		serveErr <- server.ServeTLS(listener, cfg.PublicTLSCertFile, cfg.PublicTLSKeyFile)
 	}()
 
 	select {
