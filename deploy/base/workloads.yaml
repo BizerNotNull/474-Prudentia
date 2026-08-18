@@ -26,7 +26,9 @@ kind: Service
 metadata: {name: gateway, namespace: prudentia-system, labels: {app.kubernetes.io/name: gateway}}
 spec:
   selector: {app.kubernetes.io/name: gateway}
-  ports: [{name: https, port: 8443, targetPort: https}]
+  ports:
+  - {name: https, port: 8443, targetPort: https}
+  - {name: metrics, port: 9091, targetPort: metrics}
 ---
 apiVersion: v1
 kind: Service
@@ -65,9 +67,12 @@ spec:
       - name: gateway
         image: ghcr.io/example/prudentia-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000
         imagePullPolicy: IfNotPresent
-        ports: [{name: https, containerPort: 8443}]
+        ports:
+        - {name: https, containerPort: 8443}
+        - {name: metrics, containerPort: 9091}
         env:
         - {name: PRUDENTIA_GATEWAY_LISTEN, value: "0.0.0.0:8443"}
+        - {name: PRUDENTIA_GATEWAY_METRICS_LISTEN, value: "0.0.0.0:9091"}
         - {name: PRUDENTIA_SCHEDULER_ADDRESS, value: "scheduler.prudentia-system.svc:9443"}
         - {name: PRUDENTIA_SCHEDULER_SERVER_NAME, value: "scheduler.prudentia-system.svc"}
         - {name: PRUDENTIA_GATEWAY_PUBLIC_TLS_CERT, value: /var/run/prudentia/public/tls.crt}

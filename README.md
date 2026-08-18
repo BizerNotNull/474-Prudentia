@@ -77,6 +77,7 @@ PRUDENTIA_GATEWAY_OIDC_JWKS_URL=https://issuer.example/realms/prudentia/keys
 PRUDENTIA_GATEWAY_OIDC_TENANT_CLAIM=organization
 PRUDENTIA_GATEWAY_OIDC_MODELS_CLAIM=allowed_models
 PRUDENTIA_GATEWAY_LISTEN=127.0.0.1:8080
+PRUDENTIA_GATEWAY_METRICS_LISTEN=127.0.0.1:9091
 PRUDENTIA_SCHEDULER_ADDRESS=127.0.0.1:9090
 PRUDENTIA_SCHEDULER_SERVER_NAME=<scheduler-certificate-dns-name>
 PRUDENTIA_SCHEDULER_CA=<scheduler-server-ca.pem>
@@ -96,6 +97,12 @@ audience, and JWKS URL must be configured together and must use authenticated
 HTTPS endpoints. Each accepted token must carry a nonempty tenant claim and a
 bounded, nonempty model allowlist claim; the gateway maps those claims into the
 same authorization policy used for API keys.
+
+The gateway exposes Prometheus request count and duration metrics at `/metrics`
+on the separately addressed metrics listener. The listener uses an isolated
+registry and emits only fixed, low-cardinality labels; it does not expose Go
+runtime/process collectors, tenants, request IDs, or request content. Keep this
+listener reachable only from the telemetry network.
 
 Keyrings are comma-separated `version:base64-key` entries with at most four
 retained versions. The configured write versions must be present and must

@@ -186,7 +186,7 @@ func TestGatewayCompletesRequestThroughSchedulerGRPC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := publichttp.NewHandler(authenticator, auth.Authorizer{}, inference, publichttp.DefaultLimits()).Routes(http.NotFoundHandler())
+	handler := publichttp.NewHandler(authenticator, auth.Authorizer{}, inference, newFunctionalObserver(t), publichttp.DefaultLimits()).Routes(http.NotFoundHandler())
 
 	makeRequest := func(body string) *httptest.ResponseRecorder {
 		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
