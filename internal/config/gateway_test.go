@@ -11,6 +11,8 @@ import (
 func setGatewayRequiredEnv(t *testing.T) {
 	t.Helper()
 	values := map[string]string{
+		"PRUDENTIA_GATEWAY_LISTEN":                           "",
+		"PRUDENTIA_GATEWAY_METRICS_LISTEN":                   "",
 		"PRUDENTIA_GATEWAY_API_KEY":                          "0123456789abcdef",
 		"PRUDENTIA_GATEWAY_TENANT":                           "tenant-a",
 		"PRUDENTIA_GATEWAY_MODELS":                           "model-a",
@@ -94,5 +96,25 @@ func TestLoadGatewayRequiresCredentialSource(t *testing.T) {
 
 	if _, err := LoadGatewayFromEnv(); err == nil {
 		t.Fatal("gateway accepted missing credential sources")
+	}
+}
+
+func TestLoadGatewayConfiguresSeparateMetricsListener(t *testing.T) {
+	setGatewayRequiredEnv(t)
+	cfg, err := LoadGatewayFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MetricsListenAddress != "127.0.0.1:9091" {
+		t.Fatalf("metrics listen address = %q", cfg.MetricsListenAddress)
+	}
+
+	t.Setenv("PRUDENTIA_GATEWAY_METRICS_LISTEN", cfg.ListenAddress)
+	if _, err := LoadGatewayFromEnv(); err == nil {
+		t.Fatal("gateway accepted the public address for its metrics listener")
+	}
+	t.Setenv("PRUDENTIA_GATEWAY_METRICS_LISTEN", "not-an-address")
+	if _, err := LoadGatewayFromEnv(); err == nil {
+		t.Fatal("gateway accepted an invalid metrics listen address")
 	}
 }

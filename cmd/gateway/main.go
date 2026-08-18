@@ -20,6 +20,7 @@ import (
 	"github.com/BizerNotNull/474-Prudentia/internal/auth"
 	"github.com/BizerNotNull/474-Prudentia/internal/config"
 	"github.com/BizerNotNull/474-Prudentia/internal/health"
+	"github.com/BizerNotNull/474-Prudentia/internal/observability"
 	requestapp "github.com/BizerNotNull/474-Prudentia/internal/request"
 	"github.com/BizerNotNull/474-Prudentia/internal/transport/publichttp"
 	"google.golang.org/grpc"
@@ -105,6 +106,14 @@ func run() error {
 		return err
 	}
 
+	metricsSink, err := observability.NewPrometheusSink()
+	if err != nil {
+		return err
+	}
+	observer, err := observability.NewObserver(metricsSink)
+	if err != nil {
+		return err
+	}
 	state := &health.State{}
 	healthClient := healthpb.NewHealthClient(connection)
 	healthCtx, cancelHealth := context.WithTimeout(context.Background(), 5*time.Second)
@@ -113,7 +122,7 @@ func run() error {
 	if err != nil || healthResponse.Status != healthpb.HealthCheckResponse_SERVING {
 		return errors.New("scheduler is not ready")
 	}
-	handler := publichttp.NewHandler(authenticator, auth.Authorizer{}, inference, publichttp.DefaultLimits())
+	handler := publichttp.NewHandler(authenticator, auth.Authorizer{}, inference, observer, publichttp.DefaultLimits())
 	server := &http.Server{
 		Addr:              cfg.ListenAddress,
 		Handler:           handler.Routes(health.NewHandler(state)),
@@ -122,8 +131,23 @@ func run() error {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    32 << 10,
 	}
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("GET /metrics", metricsSink.Handler())
+	metricsServer := &http.Server{
+		Addr:              cfg.MetricsListenAddress,
+		Handler:           metricsMux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    8 << 10,
+	}
 	listener, err := net.Listen("tcp", cfg.ListenAddress)
 	if err != nil {
+		return err
+	}
+	metricsListener, err := net.Listen("tcp", cfg.MetricsListenAddress)
+	if err != nil {
+		_ = listener.Close()
 		return err
 	}
 	state.SetStarted(true)
@@ -131,13 +155,20 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	serveErr := make(chan error, 1)
+	serveErr := make(chan error, 2)
 	go func() {
 		serveErr <- server.ServeTLS(listener, cfg.PublicTLSCertFile, cfg.PublicTLSKeyFile)
+	}()
+	go func() {
+		serveErr <- metricsServer.Serve(metricsListener)
 	}()
 
 	select {
 	case err := <-serveErr:
+		state.SetDraining(true)
+		_ = server.Close()
+		_ = metricsServer.Close()
+		<-serveErr
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
@@ -146,13 +177,22 @@ func run() error {
 		state.SetDraining(true)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
+		publicErr := server.Shutdown(shutdownCtx)
+		metricsErr := metricsServer.Shutdown(shutdownCtx)
+		if publicErr != nil {
 			_ = server.Close()
-			return err
 		}
-		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
+		if metricsErr != nil {
+			_ = metricsServer.Close()
 		}
-		return nil
+		for range 2 {
+			if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+		}
+		if publicErr != nil {
+			return publicErr
+		}
+		return metricsErr
 	}
 }

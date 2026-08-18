@@ -10,6 +10,7 @@ import (
 
 	"github.com/BizerNotNull/474-Prudentia/internal/auth"
 	"github.com/BizerNotNull/474-Prudentia/internal/domain"
+	"github.com/BizerNotNull/474-Prudentia/internal/observability"
 	"github.com/BizerNotNull/474-Prudentia/internal/transport/publichttp"
 )
 
@@ -19,6 +20,18 @@ func (i *countingInferer) Infer(context.Context, string, []byte, domain.Authoriz
 	i.calls++
 	return errors.New("unexpected inference")
 }
+func newFunctionalObserver(t *testing.T) *observability.Observer {
+	t.Helper()
+	sink, err := observability.NewMemorySink(128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer, err := observability.NewObserver(sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return observer
+}
 
 func TestPublicDenialStopsBeforeScheduling(t *testing.T) {
 	authenticator, err := auth.NewAuthenticator([]auth.APIKey{{Token: "0123456789abcdef0123456789abcdef", Tenant: "tenant-a", Models: []string{"model-a"}}})
@@ -26,7 +39,7 @@ func TestPublicDenialStopsBeforeScheduling(t *testing.T) {
 		t.Fatal(err)
 	}
 	inferer := &countingInferer{}
-	handler := publichttp.NewHandler(authenticator, auth.Authorizer{}, inferer, publichttp.DefaultLimits()).Routes(http.NotFoundHandler())
+	handler := publichttp.NewHandler(authenticator, auth.Authorizer{}, inferer, newFunctionalObserver(t), publichttp.DefaultLimits()).Routes(http.NotFoundHandler())
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[{"role":"user","content":"secret prompt"}]}`))
 	request.Header.Set("Authorization", "Bearer wrong-credential-with-valid-length")
 	request.Header.Set("Content-Type", "application/json")

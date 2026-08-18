@@ -15,6 +15,7 @@ import (
 
 type Gateway struct {
 	ListenAddress         string
+	MetricsListenAddress  string
 	PublicTLSCertFile     string
 	PublicTLSKeyFile      string
 	APIKey                string
@@ -40,9 +41,10 @@ type Gateway struct {
 func LoadGatewayFromEnv() (Gateway, error) {
 	var err error
 	cfg := Gateway{
-		ListenAddress: strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_LISTEN")),
-		APIKey:        os.Getenv("PRUDENTIA_GATEWAY_API_KEY"),
-		Tenant:        strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_TENANT")),
+		ListenAddress:        strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_LISTEN")),
+		MetricsListenAddress: strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_METRICS_LISTEN")),
+		APIKey:               os.Getenv("PRUDENTIA_GATEWAY_API_KEY"),
+		Tenant:               strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_TENANT")),
 	}
 	oidcIssuer := strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_OIDC_ISSUER"))
 	oidcAudience := strings.TrimSpace(os.Getenv("PRUDENTIA_GATEWAY_OIDC_AUDIENCE"))
@@ -100,6 +102,9 @@ func LoadGatewayFromEnv() (Gateway, error) {
 	if cfg.ListenAddress == "" {
 		cfg.ListenAddress = "127.0.0.1:8080"
 	}
+	if cfg.MetricsListenAddress == "" {
+		cfg.MetricsListenAddress = "127.0.0.1:9091"
+	}
 	if cfg.SchedulerAddress == "" {
 		cfg.SchedulerAddress = "127.0.0.1:9090"
 	}
@@ -110,6 +115,12 @@ func LoadGatewayFromEnv() (Gateway, error) {
 	}
 	if _, _, err := net.SplitHostPort(cfg.ListenAddress); err != nil {
 		return Gateway{}, errors.New("invalid gateway listen address")
+	}
+	if _, _, err := net.SplitHostPort(cfg.MetricsListenAddress); err != nil {
+		return Gateway{}, errors.New("invalid gateway metrics listen address")
+	}
+	if cfg.MetricsListenAddress == cfg.ListenAddress {
+		return Gateway{}, errors.New("gateway public and metrics listen addresses must differ")
 	}
 	if _, _, err := net.SplitHostPort(cfg.SchedulerAddress); err != nil {
 		return Gateway{}, errors.New("invalid scheduler address")
