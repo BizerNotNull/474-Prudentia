@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/BizerNotNull/474-Prudentia/internal/domain"
+	"github.com/BizerNotNull/474-Prudentia/internal/observability"
 )
 
 type Authenticator interface {
@@ -25,11 +26,12 @@ type Handler struct {
 	authenticator Authenticator
 	authorizer    Authorizer
 	inferer       Inferer
+	observer      *observability.Observer
 	limits        Limits
 }
 
-func NewHandler(authenticator Authenticator, authorizer Authorizer, inferer Inferer, limits Limits) *Handler {
-	return &Handler{authenticator: authenticator, authorizer: authorizer, inferer: inferer, limits: limits}
+func NewHandler(authenticator Authenticator, authorizer Authorizer, inferer Inferer, observer *observability.Observer, limits Limits) *Handler {
+	return &Handler{authenticator: authenticator, authorizer: authorizer, inferer: inferer, observer: observer, limits: limits}
 }
 
 func (h *Handler) Routes(health http.Handler) http.Handler {
@@ -42,9 +44,15 @@ func (h *Handler) Routes(health http.Handler) http.Handler {
 }
 
 func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
-	id, err := newRequestID()
+	ctx, finish := h.observer.Inference(r.Context(), observability.RequestAttrs{Route: "chat_completions", Method: r.Method})
+	r = r.WithContext(ctx)
+	outcome := observability.OutcomeError
+	defer func() { finish(outcome) }()
+
+	id, err := takeRequestID(r)
 	if err != nil {
-		WritePublicError(w, "", domain.NewPublicError(domain.ErrorInternal))
+		outcome = observability.OutcomeRejected
+		WritePublicError(w, id, err)
 		return
 	}
 	defer r.Body.Close()
@@ -52,59 +60,78 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	principal, err := h.authenticator.Authenticate(r.Context(), r)
 	if err != nil {
+		outcome = observability.OutcomeRejected
 		WritePublicError(w, id, err)
 		return
 	}
 	request, mode, err := DecodeChat(r, h.limits)
 	if err != nil {
+		outcome = observability.OutcomeRejected
 		WritePublicError(w, id, err)
 		return
 	}
 	authorized, err := h.authorizer.Authorize(r.Context(), principal, request)
 	if err != nil {
+		outcome = observability.OutcomeRejected
 		WritePublicError(w, id, err)
 		return
 	}
 	idempotencyKey, err := takeIdempotencyKey(r)
 	if err != nil {
+		outcome = observability.OutcomeRejected
 		WritePublicError(w, id, err)
 		return
 	}
 	defer clear(idempotencyKey)
 
 	if mode == domain.ResponseModeStreaming {
-		h.serveStreaming(w, r, id, idempotencyKey, authorized)
+		outcome = h.serveStreaming(w, r, id, idempotencyKey, authorized)
 		return
 	}
-	h.serveNonStreaming(w, r, id, idempotencyKey, authorized)
+	outcome = h.serveNonStreaming(w, r, id, idempotencyKey, authorized)
 }
 
-func (h *Handler) serveStreaming(w http.ResponseWriter, r *http.Request, id string, idempotencyKey []byte, request domain.AuthorizedRequest) {
+func (h *Handler) serveStreaming(w http.ResponseWriter, r *http.Request, id string, idempotencyKey []byte, request domain.AuthorizedRequest) observability.Outcome {
 	sink, err := NewSSESink(w, id, request.Request().Model())
 	if err != nil {
 		WritePublicError(w, id, err)
-		return
+		return requestOutcome(r.Context(), err, false)
 	}
 	err = h.inferer.Infer(r.Context(), id, idempotencyKey, request, domain.ResponseModeStreaming, filterUsage(sink, request.Request().Features()))
 	if err != nil && !sink.Started() {
 		WritePublicError(w, id, err)
 	}
+	return requestOutcome(r.Context(), err, err != nil && sink.Started())
 }
 
-func (h *Handler) serveNonStreaming(w http.ResponseWriter, r *http.Request, id string, idempotencyKey []byte, request domain.AuthorizedRequest) {
+func (h *Handler) serveNonStreaming(w http.ResponseWriter, r *http.Request, id string, idempotencyKey []byte, request domain.AuthorizedRequest) observability.Outcome {
 	collector := NewNonStreamingCollector(h.limits.MaxOutputBytes, h.limits.MaxStreamEvents)
 	if err := h.inferer.Infer(r.Context(), id, idempotencyKey, request, domain.ResponseModeNonStreaming, filterUsage(collector, request.Request().Features())); err != nil {
 		WritePublicError(w, id, err)
-		return
+		return requestOutcome(r.Context(), err, false)
 	}
 	result, err := collector.Result()
 	if err != nil {
 		WritePublicError(w, id, err)
-		return
+		return requestOutcome(r.Context(), err, false)
 	}
 	if err := EncodeNonStreaming(w, id, request.Request().Model(), result); err != nil {
-		return
+		return requestOutcome(r.Context(), err, false)
 	}
+	return observability.OutcomeSuccess
+}
+
+func requestOutcome(ctx context.Context, err error, possiblyDispatched bool) observability.Outcome {
+	if err == nil {
+		return observability.OutcomeSuccess
+	}
+	if ctx.Err() != nil {
+		return observability.OutcomeCancelled
+	}
+	if possiblyDispatched {
+		return observability.OutcomeAmbiguous
+	}
+	return observability.OutcomeError
 }
 
 type usageFilter struct {
@@ -140,6 +167,34 @@ func takeIdempotencyKey(r *http.Request) ([]byte, error) {
 		}
 	}
 	return key, nil
+}
+
+func takeRequestID(r *http.Request) (string, error) {
+	values := r.Header.Values("X-Request-Id")
+	r.Header.Del("X-Request-Id")
+	if len(values) == 0 {
+		return newRequestID()
+	}
+	if len(values) != 1 {
+		id, _ := newRequestID()
+		return id, domain.NewPublicError(domain.ErrorInvalidRequest)
+	}
+	value := values[0]
+	if len(value) == 0 || len(value) > 128 {
+		id, _ := newRequestID()
+		return id, domain.NewPublicError(domain.ErrorInvalidRequest)
+	}
+	for _, char := range []byte(value) {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_' || char == '.' || char == ':') {
+			id, _ := newRequestID()
+			return id, domain.NewPublicError(domain.ErrorInvalidRequest)
+		}
+	}
+	if _, err := domain.NewRequestID(value); err != nil {
+		id, _ := newRequestID()
+		return id, domain.NewPublicError(domain.ErrorInvalidRequest)
+	}
+	return value, nil
 }
 
 func newRequestID() (string, error) {

@@ -10,22 +10,32 @@ import (
 )
 
 type Controller struct {
-	DatabaseURL    string
-	HealthAddress  string
-	Cluster        string
-	Namespace      string
-	LabelSelector  string
-	ProxyPort      uint16
-	ObservationTTL time.Duration
-	ResyncPeriod   time.Duration
-	LeaseNamespace string
-	LeaseName      string
-	Holder         string
-	LeaseDuration  time.Duration
-	RenewDeadline  time.Duration
-	RetryPeriod    time.Duration
-	Workers        int
-	QueueSize      int
+	DatabaseURL           string
+	HealthAddress         string
+	Cluster               string
+	Namespace             string
+	LabelSelector         string
+	ProxyPort             uint16
+	ObservationTTL        time.Duration
+	ResyncPeriod          time.Duration
+	LeaseNamespace        string
+	LeaseName             string
+	Holder                string
+	LeaseDuration         time.Duration
+	RenewDeadline         time.Duration
+	RetryPeriod           time.Duration
+	Workers               int
+	QueueSize             int
+	TLSCertFile           string
+	TLSKeyFile            string
+	ProviderCAFile        string
+	ProviderTrustDomain   string
+	ManifestPayloadFile   string
+	ManifestSignatureFile string
+	ManifestKeyID         string
+	ManifestID            string
+	ManifestPublicKey     string
+	ManifestPin           string
 }
 
 func LoadControllerFromEnv() (Controller, error) {
@@ -46,6 +56,16 @@ func LoadControllerFromEnv() (Controller, error) {
 		Workers:        2,
 		QueueSize:      1024,
 	}
+	cfg.TLSCertFile = strings.TrimSpace(os.Getenv("PRUDENTIA_CONTROLLER_TLS_CERT"))
+	cfg.TLSKeyFile = strings.TrimSpace(os.Getenv("PRUDENTIA_CONTROLLER_TLS_KEY"))
+	cfg.ProviderCAFile = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_CA"))
+	cfg.ProviderTrustDomain = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_TRUST_DOMAIN"))
+	cfg.ManifestPayloadFile = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_MANIFEST_PAYLOAD"))
+	cfg.ManifestSignatureFile = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_MANIFEST_SIGNATURE"))
+	cfg.ManifestKeyID = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_MANIFEST_KEY_ID"))
+	cfg.ManifestID = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_MANIFEST_ID"))
+	cfg.ManifestPublicKey = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_MANIFEST_PUBLIC_KEY"))
+	cfg.ManifestPin = strings.TrimSpace(os.Getenv("PRUDENTIA_PROVIDER_MANIFEST_PIN"))
 	if cfg.LeaseNamespace == "" {
 		cfg.LeaseNamespace = cfg.Namespace
 	}
@@ -62,6 +82,10 @@ func LoadControllerFromEnv() (Controller, error) {
 	}
 	if len(cfg.Cluster) > 128 || len(cfg.Namespace) > 253 || len(cfg.LeaseNamespace) > 253 || len(cfg.LeaseName) > 253 || len(cfg.Holder) > 256 || len(cfg.LabelSelector) > 1024 {
 		return Controller{}, errors.New("controller configuration exceeds bounds")
+	}
+	if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" || cfg.ProviderCAFile == "" || cfg.ProviderTrustDomain == "" ||
+		cfg.ManifestPayloadFile == "" || cfg.ManifestSignatureFile == "" || cfg.ManifestKeyID == "" || cfg.ManifestID == "" || cfg.ManifestPublicKey == "" || cfg.ManifestPin == "" {
+		return Controller{}, errors.New("controller provider TLS and signed manifest configuration is required")
 	}
 	return cfg, nil
 }

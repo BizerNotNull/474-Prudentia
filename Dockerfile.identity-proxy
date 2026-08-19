@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:1.12
+FROM golang:1.26.1-trixie@sha256:1d414b0376b53ec94b9a2493229adb81df8b90af014b18619732f1ceaaf7234a AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY api ./api
+COPY cmd/identity-proxy ./cmd/identity-proxy
+COPY internal ./internal
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/identity-proxy ./cmd/identity-proxy
+
+FROM scratch
+USER 65532:65532
+COPY --from=build /out/identity-proxy /identity-proxy
+EXPOSE 9443
+ENTRYPOINT ["/identity-proxy"]

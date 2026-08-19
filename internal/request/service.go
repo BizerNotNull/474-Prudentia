@@ -93,6 +93,15 @@ func (s *Service) Infer(ctx context.Context, requestID string, idempotencyKey []
 	}
 	inferCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+	requestIDValue, err := domain.NewRequestID(requestID)
+	if err != nil {
+		return domain.NewPublicError(domain.ErrorInternal)
+	}
+	boundRequest, err := request.Request().WithRequestID(requestIDValue)
+	if err != nil {
+		return domain.NewPublicError(domain.ErrorInternal)
+	}
+	request = domain.NewAuthorizedRequest(request.Principal(), boundRequest)
 
 	lookupCandidates, digestCandidates, err := s.idempotency.derive(request, idempotencyKey)
 	if err != nil {

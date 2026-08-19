@@ -26,7 +26,9 @@ kind: Service
 metadata: {name: gateway, namespace: prudentia-system, labels: {app.kubernetes.io/name: gateway}}
 spec:
   selector: {app.kubernetes.io/name: gateway}
-  ports: [{name: https, port: 8443, targetPort: https}]
+  ports:
+  - {name: https, port: 8443, targetPort: https}
+  - {name: metrics, port: 9091, targetPort: metrics}
 ---
 apiVersion: v1
 kind: Service
@@ -65,12 +67,40 @@ spec:
       - name: gateway
         image: ghcr.io/example/prudentia-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000
         imagePullPolicy: IfNotPresent
-        ports: [{name: https, containerPort: 8443}]
+        ports:
+        - {name: https, containerPort: 8443}
+        - {name: metrics, containerPort: 9091}
+        env:
+        - {name: PRUDENTIA_GATEWAY_LISTEN, value: "0.0.0.0:8443"}
+        - {name: PRUDENTIA_GATEWAY_METRICS_LISTEN, value: "0.0.0.0:9091"}
+        - {name: PRUDENTIA_SCHEDULER_ADDRESS, value: "scheduler.prudentia-system.svc:9443"}
+        - {name: PRUDENTIA_SCHEDULER_SERVER_NAME, value: "scheduler.prudentia-system.svc"}
+        - {name: PRUDENTIA_GATEWAY_PUBLIC_TLS_CERT, value: /var/run/prudentia/public/tls.crt}
+        - {name: PRUDENTIA_GATEWAY_PUBLIC_TLS_KEY, value: /var/run/prudentia/public/tls.key}
+        - {name: PRUDENTIA_GATEWAY_TLS_CERT, value: /var/run/prudentia/scheduler/tls.crt}
+        - {name: PRUDENTIA_GATEWAY_TLS_KEY, value: /var/run/prudentia/scheduler/tls.key}
+        - {name: PRUDENTIA_SCHEDULER_CA, value: /var/run/prudentia/scheduler/ca.crt}
+        - {name: PRUDENTIA_PROVIDER_CA, value: /var/run/prudentia/provider/ca.crt}
+        - {name: PRUDENTIA_PROVIDER_MANIFEST_PAYLOAD, value: /var/run/prudentia/manifest/manifest.json}
+        - {name: PRUDENTIA_PROVIDER_MANIFEST_SIGNATURE, value: /var/run/prudentia/manifest/manifest.sig}
+        envFrom:
+        - {secretRef: {name: gateway-runtime}}
+        - {secretRef: {name: provider-manifest-verification}}
+        volumeMounts:
+        - {name: public-tls, mountPath: /var/run/prudentia/public, readOnly: true}
+        - {name: scheduler-tls, mountPath: /var/run/prudentia/scheduler, readOnly: true}
+        - {name: provider-ca, mountPath: /var/run/prudentia/provider, readOnly: true}
+        - {name: provider-manifest, mountPath: /var/run/prudentia/manifest, readOnly: true}
         readinessProbe: {httpGet: {path: /readyz, port: https, scheme: HTTPS}, periodSeconds: 5}
         startupProbe: {httpGet: {path: /startupz, port: https, scheme: HTTPS}, failureThreshold: 30, periodSeconds: 2}
         livenessProbe: {httpGet: {path: /livez, port: https, scheme: HTTPS}, periodSeconds: 10}
         resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: "1", memory: 512Mi}}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      volumes:
+      - {name: public-tls, secret: {secretName: gateway-public-tls}}
+      - {name: scheduler-tls, secret: {secretName: gateway-scheduler-mtls}}
+      - {name: provider-ca, secret: {secretName: provider-trust-bundle}}
+      - {name: provider-manifest, projected: {sources: [{configMap: {name: provider-capability-manifest, items: [{key: manifest.json, path: manifest.json}]}}, {secret: {name: provider-capability-signature, items: [{key: manifest.sig, path: manifest.sig}]}}]}}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -92,12 +122,26 @@ spec:
         image: ghcr.io/example/prudentia-scheduler@sha256:0000000000000000000000000000000000000000000000000000000000000000
         ports: [{name: grpc, containerPort: 9443}, {name: admin-grpc, containerPort: 9444}, {name: health, containerPort: 8080}]
         env:
-        - {name: POSTGRES_DSN, valueFrom: {secretKeyRef: {name: scheduler-postgres, key: dsn}}}
+        - {name: PRUDENTIA_SCHEDULER_LISTEN, value: "0.0.0.0:9443"}
+        - {name: PRUDENTIA_SCHEDULER_ADMIN_LISTEN, value: "0.0.0.0:9444"}
+        - {name: PRUDENTIA_SCHEDULER_HEALTH_LISTEN, value: "0.0.0.0:8080"}
+        - {name: PRUDENTIA_SCHEDULER_TLS_CERT, value: /var/run/prudentia/request/tls.crt}
+        - {name: PRUDENTIA_SCHEDULER_TLS_KEY, value: /var/run/prudentia/request/tls.key}
+        - {name: PRUDENTIA_SCHEDULER_CLIENT_CA, value: /var/run/prudentia/request/ca.crt}
+        - {name: PRUDENTIA_SCHEDULER_ADMIN_CLIENT_CA, value: /var/run/prudentia/admin/ca.crt}
+        envFrom:
+        - {secretRef: {name: scheduler-runtime}}
+        volumeMounts:
+        - {name: request-tls, mountPath: /var/run/prudentia/request, readOnly: true}
+        - {name: admin-ca, mountPath: /var/run/prudentia/admin, readOnly: true}
         readinessProbe: {httpGet: {path: /readyz, port: health}, periodSeconds: 5}
         startupProbe: {httpGet: {path: /startupz, port: health}, failureThreshold: 30, periodSeconds: 2}
         livenessProbe: {httpGet: {path: /livez, port: health}, periodSeconds: 10}
         resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {cpu: "2", memory: 1Gi}}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      volumes:
+      - {name: request-tls, secret: {secretName: scheduler-request-mtls}}
+      - {name: admin-ca, secret: {secretName: scheduler-admin-trust}}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -118,12 +162,26 @@ spec:
         image: ghcr.io/example/prudentia-controller@sha256:0000000000000000000000000000000000000000000000000000000000000000
         ports: [{name: health, containerPort: 8080}]
         env:
-        - {name: POSTGRES_DSN, valueFrom: {secretKeyRef: {name: controller-postgres, key: dsn}}}
+        - {name: PRUDENTIA_CONTROLLER_HEALTH_LISTEN, value: "0.0.0.0:8080"}
+        - {name: PRUDENTIA_CONTROLLER_TLS_CERT, value: /var/run/prudentia/provider/tls.crt}
+        - {name: PRUDENTIA_CONTROLLER_TLS_KEY, value: /var/run/prudentia/provider/tls.key}
+        - {name: PRUDENTIA_PROVIDER_CA, value: /var/run/prudentia/provider/ca.crt}
+        - {name: PRUDENTIA_PROVIDER_MANIFEST_PAYLOAD, value: /var/run/prudentia/manifest/manifest.json}
+        - {name: PRUDENTIA_PROVIDER_MANIFEST_SIGNATURE, value: /var/run/prudentia/manifest/manifest.sig}
+        envFrom:
+        - {secretRef: {name: controller-runtime}}
+        - {secretRef: {name: provider-manifest-verification}}
+        volumeMounts:
+        - {name: provider-tls, mountPath: /var/run/prudentia/provider, readOnly: true}
+        - {name: provider-manifest, mountPath: /var/run/prudentia/manifest, readOnly: true}
         readinessProbe: {httpGet: {path: /readyz, port: health}, periodSeconds: 5}
         startupProbe: {httpGet: {path: /startupz, port: health}, failureThreshold: 30, periodSeconds: 2}
         livenessProbe: {httpGet: {path: /livez, port: health}, periodSeconds: 10}
         resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {cpu: "2", memory: 1Gi}}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      volumes:
+      - {name: provider-tls, secret: {secretName: controller-provider-mtls}}
+      - {name: provider-manifest, projected: {sources: [{configMap: {name: provider-capability-manifest, items: [{key: manifest.json, path: manifest.json}]}}, {secret: {name: provider-capability-signature, items: [{key: manifest.sig, path: manifest.sig}]}}]}}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

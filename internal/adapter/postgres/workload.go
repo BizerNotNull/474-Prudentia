@@ -14,7 +14,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const maxKubernetesMutationCallLifetime = 30 * time.Second
+const (
+	maxKubernetesMutationCallLifetime = 30 * time.Second
+	maxWorkloadPollInterval           = 5 * time.Second
+)
 
 func operationIntentName(intent domain.WorkloadOperationIntent) (string, error) {
 	switch intent {
@@ -33,10 +36,25 @@ func operationIntentName(intent domain.WorkloadOperationIntent) (string, error) 
 	}
 }
 
+func workloadKindName(kind domain.WorkloadKind) (string, error) {
+	switch kind {
+	case domain.WorkloadDeployment:
+		return "deployment", nil
+	case domain.WorkloadStatefulSet:
+		return "statefulset", nil
+	default:
+		return "", domain.ErrInvalidState
+	}
+}
+
 // AdvanceWorkloadOperationFence closes admission before issuing a new durable
 // generation/token. Every affected capacity row is locked before its drain row.
 func (c *Catalog) AdvanceWorkloadOperationFence(ctx context.Context, generation domain.WriterGeneration, scope domain.WorkloadRef, intent domain.WorkloadOperationIntent) (domain.WorkloadOperation, error) {
 	intentName, err := operationIntentName(intent)
+	if err != nil {
+		return domain.WorkloadOperation{}, err
+	}
+	kindName, err := workloadKindName(scope.Kind())
 	if err != nil {
 		return domain.WorkloadOperation{}, err
 	}
@@ -104,8 +122,8 @@ func (c *Catalog) AdvanceWorkloadOperationFence(ctx context.Context, generation 
 		return domain.WorkloadOperation{}, err
 	}
 	quiescent := now.Add(maxKubernetesMutationCallLifetime)
-	_, err = tx.Exec(ctx, `INSERT INTO workload_operations(cluster_id,workload_uid,operation_generation,operation_token,writer_generation,intent,desired_replicas,phase,prior_workload_resource_version,old_calls_quiescent_after)
-		VALUES($1,$2,$3,$4,$5,$6,$7,'barrier_pending',$8,$9)`, scope.Cluster(), scope.UID(), newGeneration, token, generation, intentName, scope.Replicas(), scope.ResourceVersion(), quiescent)
+	_, err = tx.Exec(ctx, `INSERT INTO workload_operations(cluster_id,workload_uid,operation_generation,operation_token,writer_generation,intent,desired_replicas,phase,prior_workload_resource_version,old_calls_quiescent_after,workload_namespace,workload_name,workload_kind,workload_uid_observed,workload_replicas)
+		VALUES($1,$2,$3,$4,$5,$6,$7,'barrier_pending',$8,$9,$10,$11,$12,$2,$7)`, scope.Cluster(), scope.UID(), newGeneration, token, generation, intentName, scope.Replicas(), scope.ResourceVersion(), quiescent, scope.Namespace(), scope.Name(), kindName)
 	if err != nil {
 		return domain.WorkloadOperation{}, fmt.Errorf("insert workload operation: %w", err)
 	}
@@ -254,4 +272,157 @@ func (c *Catalog) CompleteWorkloadOperationAndReopen(ctx context.Context, genera
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (c *Catalog) ListIncompleteWorkloadOperations(ctx context.Context, generation domain.WriterGeneration) ([]domain.WorkloadOperation, error) {
+	rows, err := c.pool.Query(ctx, `SELECT w.cluster_id,w.workload_namespace,w.workload_name,w.workload_uid,
+		COALESCE(w.current_workload_resource_version,w.prior_workload_resource_version),
+		w.workload_kind,w.workload_replicas,w.intent,w.phase,w.operation_generation,w.operation_token,w.old_calls_quiescent_after
+		FROM workload_operations w
+		JOIN controller_writer_generations g ON g.cluster=w.cluster_id
+		WHERE g.current_generation=$1 AND w.is_current AND w.phase NOT IN ('completed','failed')
+		ORDER BY w.cluster_id,w.workload_uid`, generation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var operations []domain.WorkloadOperation
+	for rows.Next() {
+		var cluster, namespace, name, uid, resourceVersion, kindName, intentName, phaseName, token string
+		var replicas int32
+		var operationGeneration uint64
+		var quiescent time.Time
+		if err := rows.Scan(&cluster, &namespace, &name, &uid, &resourceVersion, &kindName, &replicas, &intentName, &phaseName, &operationGeneration, &token, &quiescent); err != nil {
+			return nil, fmt.Errorf("read incomplete workload operation: %w", err)
+		}
+		resource, err := domain.NewResourceRef(domain.ResourceRefParams{Cluster: cluster, Namespace: namespace, Name: name, UID: uid, ResourceVersion: resourceVersion})
+		if err != nil {
+			return nil, fmt.Errorf("incomplete workload operation lacks reconstructable scope: %w", err)
+		}
+		kind := domain.WorkloadDeployment
+		if kindName == "statefulset" {
+			kind = domain.WorkloadStatefulSet
+		} else if kindName != "deployment" {
+			return nil, domain.ErrInvalidState
+		}
+		scope, err := domain.NewWorkloadRef(kind, resource, replicas)
+		if err != nil {
+			return nil, err
+		}
+		intent := domain.OperationHandoff
+		switch intentName {
+		case "drain":
+			intent = domain.OperationDrain
+		case "scale":
+			intent = domain.OperationScaleDown
+		case "delete", "evict":
+			intent = domain.OperationExactRemoval
+		case "handoff_recovery":
+			intent = domain.OperationHandoff
+		default:
+			return nil, domain.ErrInvalidState
+		}
+		phase := domain.OperationBarrierPending
+		switch phaseName {
+		case "barrier_pending":
+			phase = domain.OperationBarrierPending
+		case "barrier_observed":
+			phase = domain.OperationBarrierObserved
+		case "mutation_pending":
+			phase = domain.OperationMutating
+		case "observing_victims":
+			phase = domain.OperationObservingVictims
+		default:
+			return nil, domain.ErrInvalidState
+		}
+		operation, err := domain.NewWorkloadOperation(domain.WorkloadOperationParams{
+			Scope: scope, Intent: intent, Phase: phase, Generation: operationGeneration,
+			Token: token, OldCallsQuiescentAfter: quiescent,
+		})
+		if err != nil {
+			return nil, err
+		}
+		operations = append(operations, operation)
+	}
+	return operations, rows.Err()
+}
+
+func (c *Catalog) RecordWorkloadBarrier(ctx context.Context, generation domain.WriterGeneration, proof domain.WorkloadBarrierProof) error {
+	return c.RecordWorkloadBarrierObserved(ctx, generation, proof)
+}
+
+func (c *Catalog) RecordWorkloadVictims(ctx context.Context, generation domain.WriterGeneration, observation domain.WorkloadVictimObservation) error {
+	return c.ObserveWorkloadVictims(ctx, generation, observation)
+}
+
+func (c *Catalog) WaitForOldCallsQuiescent(ctx context.Context, generation domain.WriterGeneration, ref domain.WorkloadOperationRef) error {
+	delay := 100 * time.Millisecond
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+	for {
+		var elapsed bool
+		err := c.pool.QueryRow(ctx, `SELECT transaction_timestamp() >= w.old_calls_quiescent_after
+			FROM workload_operations w
+			JOIN controller_writer_generations g ON g.cluster=w.cluster_id
+			WHERE g.current_generation=$1 AND w.workload_uid=$2 AND w.operation_generation=$3 AND w.operation_token=$4 AND w.is_current`,
+			generation, ref.WorkloadUID(), ref.Generation(), ref.Token()).Scan(&elapsed)
+		if err != nil {
+			return err
+		}
+		if elapsed {
+			return nil
+		}
+		timer.Reset(delay)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			delay = min(delay*2, maxWorkloadPollInterval)
+		}
+	}
+}
+
+func (c *Catalog) PrepareDrainOperation(ctx context.Context, generation domain.WriterGeneration, scope domain.DrainScope) (domain.WorkloadOperation, error) {
+	workload, ok := scope.Workload()
+	if !ok {
+		return domain.WorkloadOperation{}, domain.ErrInvalidState
+	}
+	return c.AdvanceWorkloadOperationFence(ctx, generation, workload, domain.OperationDrain)
+}
+
+func (c *Catalog) WaitForDrainQuiescence(ctx context.Context, generation domain.WriterGeneration, ref domain.WorkloadOperationRef) error {
+	delay := 250 * time.Millisecond
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+	for {
+		var active int64
+		err := c.pool.QueryRow(ctx, `SELECT COALESCE(sum(c.reserved_slots+c.orphaned_slots),0)
+			FROM workload_operations w
+			JOIN controller_writer_generations g ON g.cluster=w.cluster_id
+			LEFT JOIN source_observations o ON o.cluster_id=w.cluster_id
+				AND o.source_kind='structural' AND o.normalized_payload->>'workload_uid'=w.workload_uid
+			LEFT JOIN instance_capacity c USING(cluster_id,namespace,logical_engine,pod_uid,endpoint_epoch,recovery_epoch)
+			WHERE g.current_generation=$1 AND w.workload_uid=$2 AND w.operation_generation=$3
+			  AND w.operation_token=$4 AND w.is_current`,
+			generation, ref.WorkloadUID(), ref.Generation(), ref.Token()).Scan(&active)
+		if err != nil {
+			return err
+		}
+		if active == 0 {
+			return nil
+		}
+		timer.Reset(delay)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			delay = min(delay*2, maxWorkloadPollInterval)
+		}
+	}
 }

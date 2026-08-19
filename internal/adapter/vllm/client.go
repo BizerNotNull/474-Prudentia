@@ -37,7 +37,7 @@ func NewClient(tlsConfig *tls.Config, trustDomain string, responseHeader time.Du
 }
 
 func (c *Client) Infer(ctx context.Context, target domain.DispatchTarget, authorized domain.AuthorizedRequest, sink publichttp.StreamSink) error {
-	endpoint, err := url.Parse(target.Endpoint() + "/v1/chat/completions")
+	endpoint, err := url.Parse(target.Endpoint() + chatCompletionsPath)
 	if err != nil {
 		return requestapp.NewNotSentError(errors.New("invalid dispatch endpoint"))
 	}
@@ -72,7 +72,7 @@ func (c *Client) Infer(ctx context.Context, target domain.DispatchTarget, author
 		return requestapp.NewNotSentError(err)
 	}
 	tracked := &trackingReader{reader: bytes.NewReader(payload)}
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), io.NopCloser(tracked))
+	httpRequest, err := http.NewRequestWithContext(ctx, chatCompletionsMethod, endpoint.String(), io.NopCloser(tracked))
 	if err != nil {
 		return requestapp.NewNotSentError(err)
 	}

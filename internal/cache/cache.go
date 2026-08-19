@@ -215,6 +215,16 @@ func NewCoordinator(mover Mover, resolver ManifestResolver, connector domain.Con
 	return &Coordinator{mover: mover, resolver: resolver, connector: connector, now: now, poll: poll, maxBytes: maxBytes}, nil
 }
 
+// NewColdCoordinator constructs the fail-closed baseline used when no signed
+// mover capability is configured. Prepare still honors local verified hits,
+// but never attempts a transfer.
+func NewColdCoordinator(now func() time.Time) (*Coordinator, error) {
+	if now == nil {
+		return nil, errors.New("invalid cache coordinator configuration")
+	}
+	return &Coordinator{now: now}, nil
+}
+
 func (c *Coordinator) Prepare(ctx context.Context, req domain.CacheRequest, target domain.ReservedTarget) (domain.CachePreparation, error) {
 	cold := func() (domain.CachePreparation, error) {
 		if req.Requirement() == domain.RequireCompatible {
@@ -232,7 +242,7 @@ func (c *Coordinator) Prepare(ctx context.Context, req domain.CacheRequest, targ
 		}
 	}
 	source, ok := req.Hint().Source()
-	if !ok || !req.Hint().ValidFor(req.Identity(), now) || !target.Manifest().Supports(domain.CapabilityMover) || !c.connector.ValidAt(now) {
+	if !ok || !req.Hint().ValidFor(req.Identity(), now) || c.mover == nil || c.resolver == nil || !target.Manifest().Supports(domain.CapabilityMover) || !c.connector.ValidAt(now) {
 		return cold()
 	}
 	deadline := now.Add(req.Budget())

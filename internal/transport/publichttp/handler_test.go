@@ -12,6 +12,7 @@ import (
 	"github.com/BizerNotNull/474-Prudentia/internal/auth"
 	"github.com/BizerNotNull/474-Prudentia/internal/domain"
 	"github.com/BizerNotNull/474-Prudentia/internal/health"
+	"github.com/BizerNotNull/474-Prudentia/internal/observability"
 	"github.com/BizerNotNull/474-Prudentia/internal/transport/publichttp"
 )
 
@@ -52,10 +53,18 @@ func newTestHandler(t *testing.T, inferer publichttp.Inferer) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sink, err := observability.NewMemorySink(128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer, err := observability.NewObserver(sink)
+	if err != nil {
+		t.Fatal(err)
+	}
 	state := &health.State{}
 	state.SetStarted(true)
 	state.SetReady(true)
-	return publichttp.NewHandler(authenticator, auth.Authorizer{}, inferer, publichttp.DefaultLimits()).Routes(health.NewHandler(state))
+	return publichttp.NewHandler(authenticator, auth.Authorizer{}, inferer, observer, publichttp.DefaultLimits()).Routes(health.NewHandler(state))
 }
 
 func chatRequest(t *testing.T, handler http.Handler, token, body string) *httptest.ResponseRecorder {
@@ -282,5 +291,83 @@ func TestChatRejectsMultipleIdempotencyKeys(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest || inferer.calls != 0 {
 		t.Fatalf("status = %d, calls = %d, body = %s", response.Code, inferer.calls, response.Body.String())
+	}
+}
+
+func TestChatValidatesReturnsAndConsumesCallerRequestID(t *testing.T) {
+	inferer := &fakeInferer{}
+	handler := newTestHandler(t, inferer)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	request.Header.Set("X-Request-Id", "caller.req:17")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || inferer.requestID != "caller.req:17" || response.Header().Get("X-Request-Id") != "caller.req:17" {
+		t.Fatalf("status=%d infererID=%q responseID=%q", response.Code, inferer.requestID, response.Header().Get("X-Request-Id"))
+	}
+	if request.Header.Get("X-Request-Id") != "" {
+		t.Fatal("caller request ID remained on the provider-bound request")
+	}
+}
+
+func TestChatRejectsInvalidCallerRequestIDBeforeAuthentication(t *testing.T) {
+	inferer := &fakeInferer{}
+	handler := newTestHandler(t, inferer)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	request.Header.Set("X-Request-Id", "contains a space")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || inferer.calls != 0 || response.Header().Get("X-Request-Id") == "" {
+		t.Fatalf("status=%d calls=%d responseID=%q", response.Code, inferer.calls, response.Header().Get("X-Request-Id"))
+	}
+}
+
+func TestChatRecordsOneTerminalMetricPerRequest(t *testing.T) {
+	authenticator, err := auth.NewAuthenticator([]auth.APIKey{{
+		Token: testToken, Tenant: "tenant-secret", Models: []string{"model-a"},
+		Features: []domain.Feature{domain.FeatureStreaming, domain.FeatureUsage},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, err := observability.NewMemorySink(16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer, err := observability.NewObserver(sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inferer := &fakeInferer{}
+	handler := publichttp.NewHandler(authenticator, auth.Authorizer{}, inferer, observer, publichttp.DefaultLimits()).Routes(http.NotFoundHandler())
+
+	denied := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[{"role":"user","content":"secret"}]}`))
+	denied.Header.Set("Content-Type", "application/json")
+	deniedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(deniedResponse, denied)
+
+	accepted := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[{"role":"user","content":"secret"}]}`))
+	accepted.Header.Set("Content-Type", "application/json")
+	accepted.Header.Set("Authorization", "Bearer "+testToken)
+	acceptedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(acceptedResponse, accepted)
+
+	var outcomes []string
+	for _, point := range sink.Points() {
+		if point.Name != observability.MetricRequestTotal {
+			continue
+		}
+		outcomes = append(outcomes, point.Labels["outcome"])
+		for _, value := range point.Labels {
+			if strings.Contains(value, "tenant-secret") {
+				t.Fatal("request metric leaked tenant label")
+			}
+		}
+	}
+	if len(outcomes) != 2 || outcomes[0] != "rejected" || outcomes[1] != "success" {
+		t.Fatalf("request outcomes = %v, want [rejected success]", outcomes)
 	}
 }

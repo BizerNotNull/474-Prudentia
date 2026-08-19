@@ -14,6 +14,7 @@ import (
 
 	kubernetesadapter "github.com/BizerNotNull/474-Prudentia/internal/adapter/kubernetes"
 	postgresadapter "github.com/BizerNotNull/474-Prudentia/internal/adapter/postgres"
+	vllmadapter "github.com/BizerNotNull/474-Prudentia/internal/adapter/vllm"
 	"github.com/BizerNotNull/474-Prudentia/internal/config"
 	controllerapp "github.com/BizerNotNull/474-Prudentia/internal/controller"
 	"github.com/BizerNotNull/474-Prudentia/internal/health"
@@ -54,17 +55,38 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	providerSecurity, err := vllmadapter.LoadProviderSecurity(vllmadapter.ProviderSecurityFiles{
+		CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile, CAFile: cfg.ProviderCAFile,
+		ManifestPayloadFile: cfg.ManifestPayloadFile, ManifestSignatureFile: cfg.ManifestSignatureFile,
+		ManifestKeyID: cfg.ManifestKeyID, ManifestID: cfg.ManifestID,
+		ManifestPublicKey: cfg.ManifestPublicKey, ManifestPin: cfg.ManifestPin,
+	}, time.Now)
+	if err != nil {
+		return err
+	}
+	backend, err := vllmadapter.NewBackend(vllmadapter.BackendConfig{
+		TLSConfig: providerSecurity.TLSConfig, ResponseHeaderTimeout: 10 * time.Second, DialTimeout: 5 * time.Second,
+		MaxEventBytes: 1 << 20, MaxEvents: 1024, MaxResponseBytes: 2 << 20, Now: time.Now,
+	})
+	if err != nil {
+		return err
+	}
+	prober, err := vllmadapter.NewExactManifestProber(backend, providerSecurity.Manifest)
+	if err != nil {
+		return err
+	}
 	adapter, err := kubernetesadapter.NewInCluster(kubernetesadapter.Config{
 		Cluster: cfg.Cluster, Namespace: cfg.Namespace, LabelSelector: cfg.LabelSelector,
 		ProxyPort: cfg.ProxyPort, ObservationTTL: cfg.ObservationTTL, ResyncPeriod: cfg.ResyncPeriod,
 		LeaseNamespace: cfg.LeaseNamespace, LeaseName: cfg.LeaseName, Holder: cfg.Holder,
 		LeaseDuration: cfg.LeaseDuration, RenewDeadline: cfg.RenewDeadline, RetryPeriod: cfg.RetryPeriod,
+		IdentityRegistry: prober,
 	})
 	if err != nil {
 		return err
 	}
 	state := &health.State{}
-	controller, err := controllerapp.New(cfg.Cluster, cfg.Holder, cfg.Workers, cfg.QueueSize, catalog, adapter, adapter, state)
+	controller, err := controllerapp.New(cfg.Cluster, cfg.Holder, cfg.Workers, cfg.QueueSize, catalog, adapter, adapter, state, prober)
 	if err != nil {
 		return err
 	}
